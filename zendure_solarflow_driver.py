@@ -43,6 +43,35 @@ class RelayDirection(Enum):
 
 
 @dataclass
+class AdaptiveLockout:
+    """Scales relay settle time inversely with power magnitude.
+
+    At ``full_power_w`` or above the base lockout applies unchanged.
+    Below that the lockout grows proportionally:
+
+        effective = base × (full_power_w / |power|)
+
+    Examples with full_power_w=200 and base=30 s:
+        200 W → 30 s,  100 W → 60 s,  50 W → 120 s
+
+    Capped at ``max_multiplier × base`` so the lockout stays finite
+    even when power is near zero.
+    """
+
+    full_power_w: float = 200.0
+    max_multiplier: float = 10.0
+
+    def effective_lockout_s(self, base_s: float, power_w: float) -> float:
+        """Return scaled lockout duration based on power magnitude."""
+        magnitude = abs(power_w)
+        if magnitude < 1.0:
+            return base_s * self.max_multiplier
+        ratio = self.full_power_w / magnitude
+        multiplier = min(max(1.0, ratio), self.max_multiplier)
+        return base_s * multiplier
+
+
+@dataclass
 class Config:
     desired_power_sensor: str
     output_entity: str
@@ -51,8 +80,13 @@ class Config:
     interval_s: int = 2
     direction_lockout_s: float = 5.0
     relay_filter_enabled: bool = True
+    adaptive_lockout: AdaptiveLockout = None  # type: ignore[assignment]
     dry_run: bool = True
     sensor_prefix: str = "sensor.zfi"
+
+    def __post_init__(self):
+        if self.adaptive_lockout is None:
+            self.adaptive_lockout = AdaptiveLockout()
 
     @classmethod
     def from_args(cls, args: dict) -> Config:
@@ -67,6 +101,10 @@ class Config:
             ),
             relay_filter_enabled=bool(
                 args.get("relay_filter_enabled", cls.relay_filter_enabled)
+            ),
+            adaptive_lockout=AdaptiveLockout(
+                full_power_w=float(args.get("adaptive_lockout_ref_w", 200.0)),
+                max_multiplier=float(args.get("adaptive_lockout_max_mult", 10.0)),
             ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
@@ -91,6 +129,10 @@ class DriverState:
     last_set_relay: RelayDirection = RelayDirection.IDLE
     """Track what WE last commanded — the HA entity gets overwritten
     by MQTT device reports and cannot be trusted for lockout."""
+    last_desired_dir: RelayDirection = RelayDirection.IDLE
+    """Last desired direction seen by `_is_relay_locked`.  When this
+    changes the Phase 2 settle timer is restarted so the relay only
+    switches after the controller has committed to one direction."""
 
 
 class ZendureSolarFlowDriver(hass.Hass):
@@ -107,6 +149,8 @@ class ZendureSolarFlowDriver(hass.Hass):
             f"Started | desired_power={self.cfg.desired_power_sensor} "
             f"relay_filter={self.cfg.relay_filter_enabled} "
             f"lockout={self.cfg.direction_lockout_s}s "
+            f"adaptive_ref={self.cfg.adaptive_lockout.full_power_w}W "
+            f"adaptive_max={self.cfg.adaptive_lockout.max_multiplier}x "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -169,10 +213,13 @@ class ZendureSolarFlowDriver(hass.Hass):
 
             elapsed = time.monotonic() - self.driver_state.last_relay_change_t
             device_mode = self.get_state(self.cfg.ac_mode_entity)
+            eff_lockout = self.cfg.adaptive_lockout.effective_lockout_s(
+                self.cfg.direction_lockout_s, original
+            )
             self.log(
                 f"Locked | wanted={original:.0f}W clamped={desired:.0f}W "
                 f"relay={self.driver_state.last_set_relay.name} "
-                f"device={device_mode} ({elapsed:.1f}s)"
+                f"device={device_mode} ({elapsed:.1f}s lockout={eff_lockout:.0f}s)"
             )
 
         # Round to device step
@@ -222,18 +269,27 @@ class ZendureSolarFlowDriver(hass.Hass):
         Two-phase lockout:
           1. Wait for the device to *confirm* the commanded direction
              (HA entity must match last_set_relay).
-          2. Once confirmed, hold for an additional direction_lockout_s
-             seconds so the grid can stabilise.
+          2. Once confirmed, hold for an adaptive settle time that
+             scales inversely with power magnitude (see AdaptiveLockout).
+             Low surplus → longer wait → avoids relay chatter for
+             marginal gains.
 
         A 60 s safety timeout prevents infinite lockout if the device
         never confirms (e.g. lost MQTT command).
         """
         desired_dir = self._classify_relay(desired)
         if desired_dir == self.driver_state.last_set_relay or desired_dir == RelayDirection.IDLE:
+            self.driver_state.last_desired_dir = desired_dir
             return False
 
         now = time.monotonic()
         elapsed = now - self.driver_state.last_relay_change_t
+
+        # Desired direction changed while locked → restart Phase 2
+        if desired_dir != self.driver_state.last_desired_dir:
+            self.driver_state.last_desired_dir = desired_dir
+            # Reset confirmed timestamp so Phase 2 must re-qualify
+            self.driver_state.relay_confirmed_t = 0.0
 
         # Safety: never lock longer than 60 s
         if elapsed >= RELAY_SAFETY_TIMEOUT_S:
@@ -248,9 +304,12 @@ class ZendureSolarFlowDriver(hass.Hass):
         if self.driver_state.relay_confirmed_t <= self.driver_state.last_relay_change_t:
             self.driver_state.relay_confirmed_t = now
 
-        # Hold for settle time after confirmation
+        # Hold for adaptive settle time: high power → short, low power → long
+        effective_lockout = self.cfg.adaptive_lockout.effective_lockout_s(
+            self.cfg.direction_lockout_s, desired
+        )
         settled = now - self.driver_state.relay_confirmed_t
-        return settled < self.cfg.direction_lockout_s
+        return settled < effective_lockout
 
     @staticmethod
     def _classify_relay(limit: float) -> RelayDirection:

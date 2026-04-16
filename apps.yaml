@@ -45,10 +45,10 @@ zero_feed_in_controller:
   mode_hysteresis: 50          # Schmitt trigger band (W)
   charge_confirm: 20           # seconds surplus must hold before CHARGING
   kp_up: 0.4
-  kp_down: 0.8
+  kp_down: 0.45
   ki_up: 0.04
-  ki_down: 0.08
-  deadband: 25
+  ki_down: 0.05
+  deadband: 35
   interval: 5
 
   # ── Power limits ────────────────────────────────────────
@@ -82,8 +82,10 @@ zendure_solarflow_driver:
 
   # ── Driver settings ────────────────────────────────────
   interval: 2                  # poll interval (s) — faster than controller
-  direction_lockout: 30        # relay lockout (s)
+  direction_lockout: 30        # base relay lockout (s)
   relay_filter_enabled: true   # set false to disable lockout
+  adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
+  adaptive_lockout_max_mult: 10 # max lockout multiplier for tiny surplus
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false

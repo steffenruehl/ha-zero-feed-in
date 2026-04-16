@@ -183,15 +183,30 @@ Re-send after 30 s if the intent persists (`AC_MODE_RETRY_S`).
 
 Power limits (outputLimit, inputLimit) are sent whenever their values change. No gating on device mode confirmation — the device is responsible for applying limits in the correct mode.
 
-### 3. Relay Lockout (two-phase, confirmation-aware)
+### 3. Relay Lockout (two-phase, adaptive, direction-aware)
 
 Tracks the driver's own intent (`last_set_relay`) — NOT the HA entity.
 
 **Phase 1 — Wait for device confirmation:** After commanding a direction change, the driver stays locked until the HA entity actually reflects the new direction (the physical relay has switched, typically 10-15 s).
 
-**Phase 2 — Settle time:** Once confirmed, the lock holds for an additional `direction_lockout_s` seconds so the grid can stabilise.
+**Phase 2 — Adaptive settle time:** Once confirmed, the lock holds for a duration that scales inversely with the magnitude of the desired power (`AdaptiveLockout` class):
 
-A 60 s safety timeout prevents infinite lockout if the device never confirms.
+```
+effective_lockout = base_lockout × (reference_power / |desired_power|)
+```
+
+| |desired_power| | Lockout (base=30s, ref=200W) | Rationale |
+| --- | --- | --- |
+| 200 W+ | 30 s (1×) | High surplus — worth switching |
+| 100 W | 60 s (2×) | Moderate — wait longer |
+| 50 W | 120 s (4×) | Marginal — probably not worth the relay wear |
+| <20 W | 300 s (10× cap) | Negligible — idle instead |
+
+Capped at `max_multiplier × base` (default 10×) so the lockout stays finite.
+
+**Direction-change reset:** If the *desired* direction flips while the lockout is active (e.g. controller oscillates between CHARGE and DISCHARGE during marginal surplus), the Phase 2 settle timer restarts from zero. This ensures the relay only switches after the controller has committed to one direction long enough — preventing relay chatter during ambiguous conditions.
+
+A 60 s safety timeout prevents infinite lockout if the device never confirms (e.g. lost MQTT command).
 
 During lockout, power is **clamped** to the current direction (ramping towards zero) instead of freezing at stale values. This keeps the device responsive while preventing relay chatter.
 
@@ -208,9 +223,9 @@ During lockout, power is **clamped** to the current direction (ramping towards z
 
 Direct curtailment: output reduced by (excess + 50 W margin). Integral reset.
 
-### 2. Direction Lockout (confirmation + settle)
+### 2. Direction Lockout (adaptive, direction-aware)
 
-Two-phase relay protection: first waits for device to confirm the commanded direction, then holds for `direction_lockout_s` settle time. During lockout: power clamped to current direction (ramps toward zero), preventing stale limits.
+Two-phase relay protection: first waits for device to confirm the commanded direction, then holds for an adaptive settle time that scales inversely with power magnitude (high surplus → short lockout, low surplus → long lockout). If the desired direction flips during lockout, the settle timer resets — the relay only switches after sustained commitment to one direction. During lockout: power clamped to current direction (ramps toward zero), preventing stale limits.
 
 ### 3. SOC Protection
 
@@ -679,8 +694,9 @@ PI wants to charge → guard: SOC ≥ max → idle
 | Output oscillates | Reduce kp_up (try 0.2), increase deadband |
 | Persistent offset | Increase ki_up (try 0.05) |
 | Sluggish on load changes | Increase kp_up (try 0.5), reduce interval |
-| Relay clicks frequently | Increase direction_lockout (10 s), increase deadband |
+| Relay clicks frequently | Increase direction_lockout (30+ s), lower adaptive_lockout_ref_w (100 W), increase deadband |
 | Mode flaps | Increase mode_hysteresis (80–100 W), increase charge_confirm (25 s) |
+| Relay switches on marginal surplus | Lower adaptive_lockout_ref_w, increase adaptive_lockout_max_mult |
 | Charges from grid briefly | Check surplus in logs, increase hysteresis |
 
 ---
