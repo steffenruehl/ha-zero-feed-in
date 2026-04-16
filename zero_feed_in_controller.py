@@ -51,6 +51,14 @@ class Config:
     battery_power_sensor: str
     """Sensor reporting battery power with sign: +discharge/-charge."""
 
+    # Battery sensor mode: "signed" or "unsigned"
+    #   signed   – sensor already has correct sign (+discharge/-charge)
+    #   unsigned – sensor is always positive; sign derived from ac_mode_entity
+    battery_sensor_mode: str = "signed"
+    ac_mode_entity: str | None = None
+    """Required when battery_sensor_mode='unsigned'. AC mode select entity
+    whose state ('Input mode'/'Output mode') determines charge/discharge sign."""
+
     # Optional switches (input_boolean) to enable/disable directions
     charge_switch: str | None = None
     discharge_switch: str | None = None
@@ -89,6 +97,10 @@ class Config:
             grid_sensor=args["grid_power_sensor"],
             soc_sensor=args["soc_sensor"],
             battery_power_sensor=args["battery_power_sensor"],
+            battery_sensor_mode=args.get(
+                "battery_sensor_mode", cls.battery_sensor_mode
+            ),
+            ac_mode_entity=args.get("ac_mode_entity"),
             charge_switch=args.get("charge_switch"),
             discharge_switch=args.get("discharge_switch"),
             discharge_target_w=float(
@@ -244,6 +256,7 @@ class ZeroFeedInController(hass.Hass):
 
         self.log(
             f"Started | mode={self.state.mode.name} "
+            f"battery_sensor_mode={self.cfg.battery_sensor_mode} "
             f"discharge_target={self.cfg.discharge_target_w}W "
             f"charge_target={self.cfg.charge_target_w}W "
             f"hysteresis={self.cfg.mode_hysteresis_w}W "
@@ -251,6 +264,13 @@ class ZeroFeedInController(hass.Hass):
             f"Ki={self.cfg.ki_up}/{self.cfg.ki_down} "
             f"dry_run={self.cfg.dry_run}"
         )
+
+        if self.cfg.battery_sensor_mode == "unsigned" and not self.cfg.ac_mode_entity:
+            self.log(
+                "battery_sensor_mode='unsigned' requires ac_mode_entity",
+                level="ERROR",
+            )
+
         self._check_entities()
 
     def _seed_state(self):
@@ -275,6 +295,8 @@ class ZeroFeedInController(hass.Hass):
             "soc_sensor": self.cfg.soc_sensor,
             "battery_power": self.cfg.battery_power_sensor,
         }
+        if self.cfg.ac_mode_entity:
+            entities["ac_mode"] = self.cfg.ac_mode_entity
         if self.cfg.charge_switch:
             entities["charge_switch"] = self.cfg.charge_switch
         if self.cfg.discharge_switch:
@@ -331,12 +353,22 @@ class ZeroFeedInController(hass.Hass):
             )
             return None
 
-        # Battery sensor convention: +discharge/-charge
-        # Controller convention:     +discharge/-charge (same, no negation)
+        # Derive signed battery power from sensor mode
+        if self.cfg.battery_sensor_mode == "unsigned":
+            # Unsigned sensor: always positive, sign from AC mode entity
+            ac_mode = self.get_state(self.cfg.ac_mode_entity)
+            if ac_mode == "Input mode":
+                battery_power = -abs(bp)   # charging → negative
+            else:
+                battery_power = abs(bp)    # discharging → positive
+        else:
+            # Signed sensor: +discharge/-charge (no transformation)
+            battery_power = bp
+
         return SensorReading(
             grid_power_w=grid,
             soc_pct=soc,
-            battery_power_w=bp,
+            battery_power_w=battery_power,
         )
 
     # ─── Surplus & mode ──────────────────────────────────
@@ -377,9 +409,11 @@ class ZeroFeedInController(hass.Hass):
 
         if self.state.mode != old_mode:
             self.state.charge_pending_since = None
+            old_integral = self.state.integral
+            self.state.integral = 0.0
             self.log(
                 f"Mode {old_mode.name} → {self.state.mode.name} "
-                f"(integral kept at {self.state.integral:.0f})"
+                f"(integral reset: {old_integral:.0f} → 0)"
             )
 
     def _target_for_mode(self) -> float:

@@ -73,13 +73,21 @@ class Config:
         )
 
 
+RELAY_SAFETY_TIMEOUT_S = 60.0
+"""Never lock the relay for more than this many seconds (failsafe)."""
+
+
 @dataclass
 class DriverState:
     last_sent_discharge_w: int = -1
     last_sent_charge_w: int = -1
     last_relay_change_t: float = 0.0
-    """Monotonic time of the last AC mode change.  Initialised to 0 so
+    """Monotonic time of the last AC mode command.  Initialised to 0 so
     the first direction change is never blocked by lockout."""
+    relay_confirmed_t: float = 0.0
+    """Monotonic time when the device first confirmed the last commanded
+    direction.  Reset (set ≤ last_relay_change_t) on every new command
+    so the next confirmation is tracked fresh."""
     last_set_relay: RelayDirection = RelayDirection.IDLE
     """Track what WE last commanded — the HA entity gets overwritten
     by MQTT device reports and cannot be trusted for lockout."""
@@ -147,31 +155,42 @@ class ZendureSolarFlowDriver(hass.Hass):
             )
             return
 
-        # Relay lockout: hold previous commands while direction is switching
-        if self.cfg.relay_filter_enabled and self._is_relay_locked(desired):
+        # Relay lockout: clamp to current direction while relay is switching
+        relay_locked = self.cfg.relay_filter_enabled and self._is_relay_locked(desired)
+
+        if relay_locked:
+            original = desired
+            if self.driver_state.last_set_relay == RelayDirection.DISCHARGE:
+                desired = max(0.0, desired)
+            elif self.driver_state.last_set_relay == RelayDirection.CHARGE:
+                desired = min(0.0, desired)
+            else:
+                desired = 0.0
+
             elapsed = time.monotonic() - self.driver_state.last_relay_change_t
+            device_mode = self.get_state(self.cfg.ac_mode_entity)
             self.log(
-                f"Locked | desired={desired:.0f}W "
+                f"Locked | wanted={original:.0f}W clamped={desired:.0f}W "
                 f"relay={self.driver_state.last_set_relay.name} "
-                f"({elapsed:.1f}/{self.cfg.direction_lockout_s:.0f}s)"
+                f"device={device_mode} ({elapsed:.1f}s)"
             )
-            return
 
         # Round to device step
         discharge_w = max(0, self._round_to_step(desired))
         charge_w = max(0, self._round_to_step(-desired))
 
-        mode = "DRY" if self.cfg.dry_run else "LIVE"
-        if desired >= 0:
-            power_str = f"out={discharge_w}W"
-        else:
-            power_str = f"in={charge_w}W"
-        device_mode = self.get_state(self.cfg.ac_mode_entity)
-        self.log(
-            f"{mode} | desired={desired:.0f}W {power_str} "
-            f"relay={self.driver_state.last_set_relay.name} "
-            f"device={device_mode}"
-        )
+        if not relay_locked:
+            mode = "DRY" if self.cfg.dry_run else "LIVE"
+            if desired >= 0:
+                power_str = f"out={discharge_w}W"
+            else:
+                power_str = f"in={charge_w}W"
+            device_mode = self.get_state(self.cfg.ac_mode_entity)
+            self.log(
+                f"{mode} | desired={desired:.0f}W {power_str} "
+                f"relay={self.driver_state.last_set_relay.name} "
+                f"device={device_mode}"
+            )
 
         if not self.cfg.dry_run:
             self._send_limits(desired, discharge_w, charge_w)
@@ -198,18 +217,40 @@ class ZendureSolarFlowDriver(hass.Hass):
     # ─── Relay lockout ────────────────────────────────────
 
     def _is_relay_locked(self, desired: float) -> bool:
-        """True if a direction change is needed but still in lockout.
+        """True if a direction change is needed but the relay hasn't settled.
 
-        Uses the driver's own tracking (last_set_relay) instead of the
-        HA entity, because the Zendure MQTT integration overwrites the
-        entity with the device's current state before the relay has
-        physically switched (10-15 s latency).
+        Two-phase lockout:
+          1. Wait for the device to *confirm* the commanded direction
+             (HA entity must match last_set_relay).
+          2. Once confirmed, hold for an additional direction_lockout_s
+             seconds so the grid can stabilise.
+
+        A 60 s safety timeout prevents infinite lockout if the device
+        never confirms (e.g. lost MQTT command).
         """
         desired_dir = self._classify_relay(desired)
         if desired_dir == self.driver_state.last_set_relay or desired_dir == RelayDirection.IDLE:
             return False
-        elapsed = time.monotonic() - self.driver_state.last_relay_change_t
-        return elapsed < self.cfg.direction_lockout_s
+
+        now = time.monotonic()
+        elapsed = now - self.driver_state.last_relay_change_t
+
+        # Safety: never lock longer than 60 s
+        if elapsed >= RELAY_SAFETY_TIMEOUT_S:
+            return False
+
+        # Phase 1: device hasn't confirmed yet → stay locked
+        device_relay = self._read_current_relay()
+        if device_relay != self.driver_state.last_set_relay:
+            return True
+
+        # Phase 2: device confirmed → record the moment (once per command)
+        if self.driver_state.relay_confirmed_t <= self.driver_state.last_relay_change_t:
+            self.driver_state.relay_confirmed_t = now
+
+        # Hold for settle time after confirmation
+        settled = now - self.driver_state.relay_confirmed_t
+        return settled < self.cfg.direction_lockout_s
 
     @staticmethod
     def _classify_relay(limit: float) -> RelayDirection:

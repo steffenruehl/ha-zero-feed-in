@@ -183,9 +183,17 @@ Re-send after 30 s if the intent persists (`AC_MODE_RETRY_S`).
 
 Power limits (outputLimit, inputLimit) are sent whenever their values change. No gating on device mode confirmation — the device is responsible for applying limits in the correct mode.
 
-### 3. Relay Lockout
+### 3. Relay Lockout (two-phase, confirmation-aware)
 
-Tracks the driver's own intent (`last_set_relay`) — NOT the HA entity. During lockout, the entire tick is skipped (previous commands stay in effect).
+Tracks the driver's own intent (`last_set_relay`) — NOT the HA entity.
+
+**Phase 1 — Wait for device confirmation:** After commanding a direction change, the driver stays locked until the HA entity actually reflects the new direction (the physical relay has switched, typically 10-15 s).
+
+**Phase 2 — Settle time:** Once confirmed, the lock holds for an additional `direction_lockout_s` seconds so the grid can stabilise.
+
+A 60 s safety timeout prevents infinite lockout if the device never confirms.
+
+During lockout, power is **clamped** to the current direction (ramping towards zero) instead of freezing at stale values. This keeps the device responsive while preventing relay chatter.
 
 ### 4. Rounding and Suppression
 
@@ -200,9 +208,9 @@ Tracks the driver's own intent (`last_set_relay`) — NOT the HA entity. During 
 
 Direct curtailment: output reduced by (excess + 50 W margin). Integral reset.
 
-### 2. Direction Lockout (5 s)
+### 2. Direction Lockout (confirmation + settle)
 
-Minimum time between relay direction changes. During lockout: tick skipped, previous commands hold.
+Two-phase relay protection: first waits for device to confirm the commanded direction, then holds for `direction_lockout_s` settle time. During lockout: power clamped to current direction (ramps toward zero), preventing stale limits.
 
 ### 3. SOC Protection
 
