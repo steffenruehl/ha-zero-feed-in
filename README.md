@@ -1,6 +1,6 @@
 # ha-zero-feed-in
 
-Zero feed-in controller for the **Zendure SolarFlow 2400 AC+**, running as an [AppDaemon](https://appdaemon.readthedocs.io/) app on [Home Assistant](https://www.home-assistant.io/).
+Zero feed-in controller for the **Zendure SolarFlow 2400 AC+**, running as [AppDaemon](https://appdaemon.readthedocs.io/) apps on [Home Assistant](https://www.home-assistant.io/).
 
 Keeps the grid meter at ~0 W by charging and discharging the battery based on solar surplus.
 
@@ -8,39 +8,44 @@ Keeps the grid meter at ~0 W by charging and discharging the battery based on so
 - **Solar deficit** → discharge battery (cover house demand)
 - **No surplus** → never charge from grid
 
-## How It Works
+## Architecture
 
-A PI controller reads the grid power meter every 5 seconds and adjusts the SolarFlow's charge/discharge limits to keep net grid power near zero.
+Two apps with clear separation of concerns:
 
 ```
-┌──────────────┐                     ┌───────────────┐
-│  Existing PV │───── AC ──────────▸ │   House Grid  │
-│  System      │  (solar power)      │               │
-└──────────────┘                     │  ┌─────────┐  │
-                                     │  │  Loads  │  │
-┌──────────────┐    MQTT (W)         │  └─────────┘  │
-│  Grid Meter  │───────────────────▸ │               │
-│  (IR reader) │                     │               │◂──── Utility Grid
-└──────────────┘                     └───────┬───────┘
-                                             │ AC
-┌──────────────────────────┐        ┌────────┴────────┐
-│  Home Assistant          │  MQTT  │  SolarFlow      │
-│  ┌────────────────────┐  │◂─────▸│  2400 AC+       │
-│  │  AppDaemon         │  │       │                  │
-│  │  ZeroFeedIn        │  │       │  charge/discharge│
-│  └────────────────────┘  │       └──────────────────┘
-└──────────────────────────┘
+┌──────────────────────────────┐        ┌──────────────────┐
+│  Controller (device-agnostic)│        │  SolarFlow       │
+│  ┌────────────────────────┐  │  MQTT  │  2400 AC+        │
+│  │ PI controller          │  │◂─────▸│                  │
+│  │ Mode switching         │  │       │  outputLimit     │
+│  │ Surplus estimation     │──┤       │  inputLimit      │
+│  └──────────┬─────────────┘  │       │  acMode          │
+│             │                │       └──────────────────┘
+│    sensor.zfi_desired_power  │
+│             │                │
+│  ┌──────────▼─────────────┐  │
+│  │ Driver (Zendure)       │──┘
+│  │ AC mode management     │
+│  │ Power rounding/gating  │
+│  └────────────────────────┘
+└──────────────────────────────┘
 ```
+
+| App | File | Responsibility |
+| --- | --- | --- |
+| Controller | `zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
+| Driver | `zendure_solarflow_driver.py` | AC mode, relay lockout, 10 W rounding, redundant-send suppression |
 
 ### Key Features
 
 - **Position-form PI** with asymmetric gains — cautious ramp-up, aggressive ramp-down
 - **Anti-windup back-calculation** — integral stays sane at output limits
 - **Schmitt trigger mode switching** with charge confirmation delay
-- **Relay wear minimization** — AC mode read from entity, redundant sends suppressed
+- **AC mode send-once** — command sent on intent change, retried after 30 s timeout
+- **Relay lockout** — driver tracks own intent, not MQTT entity (10-15 s device lag)
 - **Device state seeding** — no unnecessary commands on startup
 - **Direction switches** — enable/disable charge or discharge from HA UI
-- **Layered safety**: SOC limits, grid-charge protection, surplus clamp, feed-in emergency curtailment
+- **Layered safety**: SOC limits, grid-charge protection, surplus clamp, emergency curtailment
 
 ## Installation
 
@@ -54,7 +59,8 @@ Copy to your AppDaemon apps directory:
 
 ```
 config/appdaemon/apps/
-├── zero_feed_in.py
+├── zero_feed_in_controller.py
+├── zendure_solarflow_driver.py
 └── apps.yaml
 ```
 
@@ -63,27 +69,27 @@ config/appdaemon/apps/
 Find your SolarFlow's actual entity names (via MQTT Explorer or HA Developer Tools) and update `apps.yaml`:
 
 ```yaml
-zero_feed_in:
-  module: zero_feed_in
-  class: ZeroFeedIn
-
-  # Sensors
+# Controller
+zero_feed_in_controller:
+  module: zero_feed_in_controller
+  class: ZeroFeedInController
   grid_power_sensor: sensor.your_grid_meter
-  solarflow_soc_sensor: sensor.your_solarflow_electriclevel
+  soc_sensor: sensor.your_solarflow_electriclevel
+  battery_power_sensor: sensor.your_battery_net_power  # +discharge/-charge
 
-  # Actuators
+# Driver
+zendure_solarflow_driver:
+  module: zendure_solarflow_driver
+  class: ZendureSolarFlowDriver
+  desired_power_sensor: sensor.zfi_desired_power
   output_limit_entity: number.your_solarflow_outputlimit
   input_limit_entity: number.your_solarflow_inputlimit
   ac_mode_entity: select.your_solarflow_acmode
-
-  # Optional: direction switches (create as HA helpers)
-  # charge_switch: input_boolean.zfi_charge_enabled
-  # discharge_switch: input_boolean.zfi_discharge_enabled
 ```
 
 ### 4. Start in Dry Run
 
-The default `dry_run: true` computes everything and publishes HA sensors but sends no commands. Monitor via the AppDaemon log and `sensor.zfi_*` entities.
+Both apps default to `dry_run: true` — they compute and publish HA sensors but send no commands.
 
 ### 5. Go Live
 
@@ -95,8 +101,10 @@ Start with `max_output: 200` and increase over several days.
 
 ## Configuration
 
+### Controller
+
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `target_grid_power` | 30 W | Discharge target (small grid draw as buffer) |
 | `charge_target_power` | 0 W | Charge target (absorb all surplus) |
 | `kp_up` / `kp_down` | 0.3 / 0.8 | Proportional gains (up = cautious, down = aggressive) |
@@ -108,33 +116,45 @@ Start with `max_output: 200` and increase over several days.
 | `min_soc` / `max_soc` | 10% / 100% | SOC limits |
 | `mode_hysteresis` | 50 W | Surplus band for mode switching |
 | `charge_confirm` | 15 s | Seconds surplus must hold before charging |
-| `direction_lockout` | 5 s | Min time between relay direction changes |
 | `max_feed_in` | 800 W | Emergency curtailment threshold |
+
+### Driver
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `interval` | 2 s | Poll interval (faster than controller) |
+| `direction_lockout` | 5 s | Min time between relay direction changes |
+| `relay_filter_enabled` | true | Enable/disable relay lockout |
 
 See [apps.yaml](apps.yaml) for the full annotated configuration.
 
 ## Published HA Sensors
 
-The controller publishes `sensor.zfi_*` entities every cycle:
+Both apps publish `sensor.zfi_*` entities every cycle:
 
-| Sensor | Description |
-|---|---|
-| `zfi_mode` | Operating regime (charging/discharging) |
-| `zfi_relay` | Physical relay state (charge/idle/discharge) |
-| `zfi_surplus` | Estimated solar surplus (W) |
-| `zfi_error` | Regulation error (W) |
-| `zfi_p_term` / `zfi_i_term` | PI components (W) |
-| `zfi_discharge_limit` / `zfi_charge_limit` | Commands sent to device (W) |
-| `zfi_reason` | Human-readable decision reason |
+| Sensor | Source | Description |
+| --- | --- | --- |
+| `zfi_desired_power` | Controller | Signed desired power (W): +discharge, -charge |
+| `zfi_mode` | Controller | Operating regime (charging/discharging) |
+| `zfi_surplus` | Controller | Estimated solar surplus (W) |
+| `zfi_battery_power` | Controller | Actual battery power (W) |
+| `zfi_error` | Controller | Regulation error (W) |
+| `zfi_p_term` / `zfi_i_term` | Controller | PI components (W) |
+| `zfi_reason` | Controller | Human-readable decision reason |
+| `zfi_device_output` | Driver | Signed power sent to device (W) |
+| `zfi_discharge_limit` | Driver | outputLimit sent (W) |
+| `zfi_charge_limit` | Driver | inputLimit sent (W) |
+| `zfi_relay` | Driver | Physical relay state |
 
 ## Documentation
 
-- [zero_feed_in_docs.md](zero_feed_in_docs.md) — Full technical documentation with flowcharts, examples, and tuning guide
+- [zero_feed_in_docs.md](zero_feed_in_docs.md) — Full technical documentation with flowcharts, dashboards, and tuning guide
 - [development_context.md](development_context.md) — Architecture decisions, known issues, and development history
 
 ## Hardware
 
 Developed for:
+
 - **Zendure SolarFlow 2400 AC+** (AC-coupled battery storage)
 - **Home Assistant** with AppDaemon addon
 - Grid meter via IR reader (EDL21 or similar)
