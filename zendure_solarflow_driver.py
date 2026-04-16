@@ -44,31 +44,54 @@ class RelayDirection(Enum):
 
 @dataclass
 class AdaptiveLockout:
-    """Scales relay settle time inversely with power magnitude.
+    """Integrates |power| × dt to decide when relay lockout expires.
 
-    At ``full_power_w`` or above the base lockout applies unchanged.
-    Below that the lockout grows proportionally:
+    Instead of using instantaneous power to scale a fixed duration,
+    each tick contributes ``|power| × dt`` to an accumulator.  The
+    lockout expires when the accumulated energy reaches::
 
-        effective = base × (full_power_w / |power|)
+        threshold = full_power_w × base_lockout_s
 
-    Examples with full_power_w=200 and base=30 s:
-        200 W → 30 s,  100 W → 60 s,  50 W → 120 s
+    Examples with full_power_w=200, base=30 s (threshold = 6000 W·s):
+        200 W sustained → 30 s
+        100 W sustained → 60 s
+        50 W sustained  → 120 s
+        Variable power  → each slice contributes proportionally
 
-    Capped at ``max_multiplier × base`` so the lockout stays finite
-    even when power is near zero.
+    Capped at ``max_multiplier × base`` elapsed time so the lockout
+    stays finite even when power is near zero.
     """
 
     full_power_w: float = 200.0
     max_multiplier: float = 10.0
+    _accumulated_ws: float = 0.0
+    _last_tick_t: float = 0.0
 
-    def effective_lockout_s(self, base_s: float, power_w: float) -> float:
-        """Return scaled lockout duration based on power magnitude."""
-        magnitude = abs(power_w)
-        if magnitude < 1.0:
-            return base_s * self.max_multiplier
-        ratio = self.full_power_w / magnitude
-        multiplier = min(max(1.0, ratio), self.max_multiplier)
-        return base_s * multiplier
+    def reset(self):
+        """Reset accumulator (call on direction change or relay switch)."""
+        self._accumulated_ws = 0.0
+        self._last_tick_t = 0.0
+
+    def tick(self, power_w: float, now: float) -> None:
+        """Accumulate a time slice of |power| × dt."""
+        if self._last_tick_t > 0.0:
+            dt = now - self._last_tick_t
+            if dt > 0:
+                self._accumulated_ws += abs(power_w) * dt
+        self._last_tick_t = now
+
+    def is_settled(self, base_s: float) -> bool:
+        """True if accumulated energy has reached the threshold."""
+        threshold_ws = self.full_power_w * base_s
+        return self._accumulated_ws >= threshold_ws
+
+    @property
+    def progress(self) -> float:
+        """Fraction of threshold reached (0.0 → 1.0+)."""
+        return self._accumulated_ws
+
+    def threshold(self, base_s: float) -> float:
+        return self.full_power_w * base_s
 
 
 @dataclass
@@ -111,8 +134,217 @@ class Config:
         )
 
 
-RELAY_SAFETY_TIMEOUT_S = 60.0
+RELAY_SAFETY_TIMEOUT_S = 300.0
 """Never lock the relay for more than this many seconds (failsafe)."""
+
+MIN_ACTIVE_POWER_W = 10
+"""Minimum power in CHARGING/DISCHARGING states.  Below this the relay
+may switch, so we clamp to this floor while in an active state."""
+
+
+# ═══════════════════════════════════════════════════════════
+#  Relay State Machine
+# ═══════════════════════════════════════════════════════════
+
+class RelayState(Enum):
+    """Logical relay state (not the physical device state)."""
+    IDLE = auto()
+    CHARGING = auto()
+    DISCHARGING = auto()
+
+
+class RelayStateMachine:
+    """Guards relay transitions so the physical relay doesn't chatter.
+
+    Three states: IDLE (power=0), CHARGING (≥10 W charge),
+    DISCHARGING (≥10 W discharge).
+
+    Transition rules:
+      - → CHARGING:    adaptive energy integrator must reach threshold
+      - → DISCHARGING: adaptive energy integrator must reach threshold
+      - → IDLE:        fixed ``idle_lockout_s`` must elapse
+
+    Each transition candidate gets its own AdaptiveLockout / timer.
+    If the requested state changes while a transition is pending the
+    accumulator resets, so only sustained intent triggers a switch.
+
+    The machine also publishes its state and transition progress to
+    HA sensors via a callback.
+    """
+
+    def __init__(
+        self,
+        idle_lockout_s: float,
+        charge_lockout: AdaptiveLockout,
+        discharge_lockout: AdaptiveLockout,
+        base_lockout_s: float,
+        log_fn=None,
+        publish_fn=None,
+    ):
+        self.idle_lockout_s = idle_lockout_s
+        self.charge_lockout = charge_lockout
+        self.discharge_lockout = discharge_lockout
+        self.base_lockout_s = base_lockout_s
+        self._log = log_fn
+        self._publish = publish_fn
+
+        self.state = RelayState.IDLE
+        self._pending: RelayState | None = None
+        self._idle_pending_since: float = 0.0
+
+    def seed(self, direction: RelayDirection):
+        """Set initial state from device without transition guards."""
+        if direction == RelayDirection.CHARGE:
+            self.state = RelayState.CHARGING
+        elif direction == RelayDirection.DISCHARGE:
+            self.state = RelayState.DISCHARGING
+        else:
+            self.state = RelayState.IDLE
+
+    def update(self, desired_w: float, now: float) -> float:
+        """Process a desired power value.  Returns the allowed power.
+
+        The returned power respects the current state constraints:
+          - IDLE → always 0
+          - CHARGING → clamp to [-max, -MIN_ACTIVE_POWER_W]
+          - DISCHARGING → clamp to [+MIN_ACTIVE_POWER_W, +max]
+
+        Internally drives transition logic.
+        """
+        target = self._classify(desired_w)
+
+        if target == self.state:
+            # Already in the right state — reset any pending transition
+            self._clear_pending()
+            return self._clamp(desired_w)
+
+        # A different state is requested — check transition eligibility
+        if target != self._pending:
+            # New target — start fresh
+            self._set_pending(target, now)
+
+        allowed = self._check_transition(target, desired_w, now)
+        return allowed
+
+    def publish(self):
+        """Push current state and transition progress to HA sensors."""
+        if not self._publish:
+            return
+        self._publish(
+            "relay_sm_state",
+            self.state.name.lower(),
+            icon="mdi:state-machine",
+        )
+        # Publish transition progress for each possible target
+        if self._pending == RelayState.CHARGING:
+            al = self.charge_lockout
+            pct = min(100, al.progress / max(1, al.threshold(self.base_lockout_s)) * 100)
+            self._publish("relay_sm_charge_pct", f"{pct:.0f}", "%", "mdi:battery-charging")
+        else:
+            self._publish("relay_sm_charge_pct", "0", "%", "mdi:battery-charging")
+
+        if self._pending == RelayState.DISCHARGING:
+            al = self.discharge_lockout
+            pct = min(100, al.progress / max(1, al.threshold(self.base_lockout_s)) * 100)
+            self._publish("relay_sm_discharge_pct", f"{pct:.0f}", "%", "mdi:battery-arrow-down")
+        else:
+            self._publish("relay_sm_discharge_pct", "0", "%", "mdi:battery-arrow-down")
+
+        if self._pending == RelayState.IDLE:
+            elapsed = time.monotonic() - self._idle_pending_since if self._idle_pending_since > 0 else 0.0
+            pct = min(100, elapsed / max(1, self.idle_lockout_s) * 100)
+            self._publish("relay_sm_idle_pct", f"{pct:.0f}", "%", "mdi:sleep")
+        else:
+            self._publish("relay_sm_idle_pct", "0", "%", "mdi:sleep")
+
+        self._publish(
+            "relay_sm_pending",
+            self._pending.name.lower() if self._pending else "none",
+            icon="mdi:timer-sand",
+        )
+
+    # ── Internal ──────────────────────────────────────────
+
+    def _check_transition(self, target: RelayState, desired_w: float, now: float) -> float:
+        """Check if the pending transition can fire.  Returns allowed power."""
+        can_switch = False
+
+        if target == RelayState.IDLE:
+            elapsed = now - self._idle_pending_since if self._idle_pending_since > 0 else 0.0
+            can_switch = elapsed >= self.idle_lockout_s
+        elif target == RelayState.CHARGING:
+            self.charge_lockout.tick(desired_w, now)
+            can_switch = self.charge_lockout.is_settled(self.base_lockout_s)
+        elif target == RelayState.DISCHARGING:
+            self.discharge_lockout.tick(desired_w, now)
+            can_switch = self.discharge_lockout.is_settled(self.base_lockout_s)
+
+        # Safety cap
+        if not can_switch and self._pending_elapsed(now) >= RELAY_SAFETY_TIMEOUT_S:
+            can_switch = True
+
+        if can_switch:
+            old = self.state
+            self.state = target
+            self._clear_pending()
+            if self._log:
+                self._log(f"SM transition: {old.name} → {target.name}")
+            return self._clamp(desired_w)
+
+        # Not yet — stay in current state
+        return self._clamp_current(desired_w)
+
+    def _clamp(self, desired_w: float) -> float:
+        """Clamp power for the *current* (just-transitioned) state."""
+        return self._clamp_for_state(self.state, desired_w)
+
+    def _clamp_current(self, desired_w: float) -> float:
+        """Clamp power to current state while transition is pending."""
+        return self._clamp_for_state(self.state, desired_w)
+
+    @staticmethod
+    def _clamp_for_state(state: RelayState, desired_w: float) -> float:
+        if state == RelayState.IDLE:
+            return 0.0
+        if state == RelayState.CHARGING:
+            # Charging: desired is negative; floor at -MIN_ACTIVE_POWER_W
+            return min(-MIN_ACTIVE_POWER_W, desired_w)
+        if state == RelayState.DISCHARGING:
+            # Discharging: desired is positive; floor at +MIN_ACTIVE_POWER_W
+            return max(MIN_ACTIVE_POWER_W, desired_w)
+        return 0.0
+
+    @staticmethod
+    def _classify(desired_w: float) -> RelayState:
+        if desired_w > DIRECTION_THRESHOLD_W:
+            return RelayState.DISCHARGING
+        if desired_w < -DIRECTION_THRESHOLD_W:
+            return RelayState.CHARGING
+        return RelayState.IDLE
+
+    def _set_pending(self, target: RelayState, now: float):
+        self._pending = target
+        self.charge_lockout.reset()
+        self.discharge_lockout.reset()
+        self._idle_pending_since = now if target == RelayState.IDLE else 0.0
+
+    def _clear_pending(self):
+        self._pending = None
+        self._idle_pending_since = 0.0
+
+    def _pending_elapsed(self, now: float) -> float:
+        if self._pending == RelayState.IDLE and self._idle_pending_since > 0:
+            return now - self._idle_pending_since
+        # For adaptive lockouts, use last_tick time as proxy
+        if self._pending == RelayState.CHARGING and self.charge_lockout._last_tick_t > 0:
+            return now - (self.charge_lockout._last_tick_t - (
+                self.charge_lockout._accumulated_ws / max(1, self.charge_lockout.full_power_w)
+            ))
+        if self._pending == RelayState.DISCHARGING and self.discharge_lockout._last_tick_t > 0:
+            return now - (self.discharge_lockout._last_tick_t - (
+                self.discharge_lockout._accumulated_ws / max(1, self.discharge_lockout.full_power_w)
+            ))
+        return 0.0
 
 
 @dataclass
@@ -120,19 +352,10 @@ class DriverState:
     last_sent_discharge_w: int = -1
     last_sent_charge_w: int = -1
     last_relay_change_t: float = 0.0
-    """Monotonic time of the last AC mode command.  Initialised to 0 so
-    the first direction change is never blocked by lockout."""
-    relay_confirmed_t: float = 0.0
-    """Monotonic time when the device first confirmed the last commanded
-    direction.  Reset (set ≤ last_relay_change_t) on every new command
-    so the next confirmation is tracked fresh."""
+    """Monotonic time of the last AC mode command."""
     last_set_relay: RelayDirection = RelayDirection.IDLE
     """Track what WE last commanded — the HA entity gets overwritten
     by MQTT device reports and cannot be trusted for lockout."""
-    last_desired_dir: RelayDirection = RelayDirection.IDLE
-    """Last desired direction seen by `_is_relay_locked`.  When this
-    changes the Phase 2 settle timer is restarted so the relay only
-    switches after the controller has committed to one direction."""
 
 
 class ZendureSolarFlowDriver(hass.Hass):
@@ -141,6 +364,21 @@ class ZendureSolarFlowDriver(hass.Hass):
     def initialize(self):
         self.cfg = Config.from_args(self.args)
         self.driver_state = DriverState()
+
+        self.relay_sm = RelayStateMachine(
+            idle_lockout_s=self.cfg.direction_lockout_s,
+            charge_lockout=AdaptiveLockout(
+                full_power_w=self.cfg.adaptive_lockout.full_power_w,
+                max_multiplier=self.cfg.adaptive_lockout.max_multiplier,
+            ),
+            discharge_lockout=AdaptiveLockout(
+                full_power_w=self.cfg.adaptive_lockout.full_power_w,
+                max_multiplier=self.cfg.adaptive_lockout.max_multiplier,
+            ),
+            base_lockout_s=self.cfg.direction_lockout_s,
+            log_fn=self.log,
+            publish_fn=self._set_sensor,
+        )
 
         self._seed_from_device()
         self.run_every(self._on_tick, "now", self.cfg.interval_s)
@@ -172,6 +410,9 @@ class ZendureSolarFlowDriver(hass.Hass):
         elif ac_mode == AC_MODE_INPUT:
             self.driver_state.last_set_relay = RelayDirection.CHARGE
 
+        # Seed state machine from device
+        self.relay_sm.seed(self.driver_state.last_set_relay)
+
         self.log(
             f"Seeded: out={self.driver_state.last_sent_discharge_w}W "
             f"in={self.driver_state.last_sent_charge_w}W "
@@ -199,53 +440,44 @@ class ZendureSolarFlowDriver(hass.Hass):
             )
             return
 
-        # Relay lockout: clamp to current direction while relay is switching
-        relay_locked = self.cfg.relay_filter_enabled and self._is_relay_locked(desired)
+        now = time.monotonic()
 
-        if relay_locked:
-            original = desired
-            if self.driver_state.last_set_relay == RelayDirection.DISCHARGE:
-                desired = max(0.0, desired)
-            elif self.driver_state.last_set_relay == RelayDirection.CHARGE:
-                desired = min(0.0, desired)
-            else:
-                desired = 0.0
+        # State machine decides allowed power
+        if self.cfg.relay_filter_enabled:
+            allowed = self.relay_sm.update(desired, now)
+        else:
+            allowed = desired
 
-            elapsed = time.monotonic() - self.driver_state.last_relay_change_t
-            device_mode = self.get_state(self.cfg.ac_mode_entity)
-            eff_lockout = self.cfg.adaptive_lockout.effective_lockout_s(
-                self.cfg.direction_lockout_s, original
-            )
+        if allowed != desired:
             self.log(
-                f"Locked | wanted={original:.0f}W clamped={desired:.0f}W "
-                f"relay={self.driver_state.last_set_relay.name} "
-                f"device={device_mode} ({elapsed:.1f}s lockout={eff_lockout:.0f}s)"
+                f"SM clamp | wanted={desired:.0f}W allowed={allowed:.0f}W "
+                f"state={self.relay_sm.state.name} "
+                f"pending={self.relay_sm._pending.name if self.relay_sm._pending else 'none'}"
             )
 
         # Round to device step
-        discharge_w = max(0, self._round_to_step(desired))
-        charge_w = max(0, self._round_to_step(-desired))
+        discharge_w = max(0, self._round_to_step(allowed))
+        charge_w = max(0, self._round_to_step(-allowed))
 
-        if not relay_locked:
-            mode = "DRY" if self.cfg.dry_run else "LIVE"
-            if desired >= 0:
-                power_str = f"out={discharge_w}W"
-            else:
-                power_str = f"in={charge_w}W"
-            device_mode = self.get_state(self.cfg.ac_mode_entity)
-            self.log(
-                f"{mode} | desired={desired:.0f}W {power_str} "
-                f"relay={self.driver_state.last_set_relay.name} "
-                f"device={device_mode}"
-            )
+        mode = "DRY" if self.cfg.dry_run else "LIVE"
+        if allowed >= 0:
+            power_str = f"out={discharge_w}W"
+        else:
+            power_str = f"in={charge_w}W"
+        device_mode = self.get_state(self.cfg.ac_mode_entity)
+        self.log(
+            f"{mode} | desired={desired:.0f}W allowed={allowed:.0f}W {power_str} "
+            f"sm={self.relay_sm.state.name} "
+            f"device={device_mode}"
+        )
 
         if not self.cfg.dry_run:
-            self._send_limits(desired, discharge_w, charge_w)
+            self._send_limits(allowed, discharge_w, charge_w)
 
         # Publish what the driver actually sent
         self._set_sensor(
             "device_output",
-            discharge_w if desired >= 0 else -charge_w,
+            discharge_w if allowed >= 0 else -charge_w,
             "W",
             "mdi:transmission-tower-export",
         )
@@ -261,63 +493,8 @@ class ZendureSolarFlowDriver(hass.Hass):
             icon="mdi:electric-switch",
         )
 
-    # ─── Relay lockout ────────────────────────────────────
-
-    def _is_relay_locked(self, desired: float) -> bool:
-        """True if a direction change is needed but the relay hasn't settled.
-
-        Two-phase lockout:
-          1. Wait for the device to *confirm* the commanded direction
-             (HA entity must match last_set_relay).
-          2. Once confirmed, hold for an adaptive settle time that
-             scales inversely with power magnitude (see AdaptiveLockout).
-             Low surplus → longer wait → avoids relay chatter for
-             marginal gains.
-
-        A 60 s safety timeout prevents infinite lockout if the device
-        never confirms (e.g. lost MQTT command).
-        """
-        desired_dir = self._classify_relay(desired)
-        if desired_dir == self.driver_state.last_set_relay or desired_dir == RelayDirection.IDLE:
-            self.driver_state.last_desired_dir = desired_dir
-            return False
-
-        now = time.monotonic()
-        elapsed = now - self.driver_state.last_relay_change_t
-
-        # Desired direction changed while locked → restart Phase 2
-        if desired_dir != self.driver_state.last_desired_dir:
-            self.driver_state.last_desired_dir = desired_dir
-            # Reset confirmed timestamp so Phase 2 must re-qualify
-            self.driver_state.relay_confirmed_t = 0.0
-
-        # Safety: never lock longer than 60 s
-        if elapsed >= RELAY_SAFETY_TIMEOUT_S:
-            return False
-
-        # Phase 1: device hasn't confirmed yet → stay locked
-        device_relay = self._read_current_relay()
-        if device_relay != self.driver_state.last_set_relay:
-            return True
-
-        # Phase 2: device confirmed → record the moment (once per command)
-        if self.driver_state.relay_confirmed_t <= self.driver_state.last_relay_change_t:
-            self.driver_state.relay_confirmed_t = now
-
-        # Hold for adaptive settle time: high power → short, low power → long
-        effective_lockout = self.cfg.adaptive_lockout.effective_lockout_s(
-            self.cfg.direction_lockout_s, desired
-        )
-        settled = now - self.driver_state.relay_confirmed_t
-        return settled < effective_lockout
-
-    @staticmethod
-    def _classify_relay(limit: float) -> RelayDirection:
-        if limit > DIRECTION_THRESHOLD_W:
-            return RelayDirection.DISCHARGE
-        if limit < -DIRECTION_THRESHOLD_W:
-            return RelayDirection.CHARGE
-        return RelayDirection.IDLE
+        # Publish state machine sensors
+        self.relay_sm.publish()
 
     def _read_current_relay(self) -> RelayDirection:
         ac_mode = self.get_state(self.cfg.ac_mode_entity)
@@ -330,11 +507,11 @@ class ZendureSolarFlowDriver(hass.Hass):
     # ─── Send ─────────────────────────────────────────────
 
     def _send_limits(self, desired: float, discharge_w: int, charge_w: int):
-        # Set AC mode before power limits
-        new_relay = self._classify_relay(desired)
-        if new_relay == RelayDirection.DISCHARGE:
+        # Set AC mode based on state machine state
+        sm_state = self.relay_sm.state
+        if sm_state == RelayState.DISCHARGING:
             self._set_ac_mode(AC_MODE_OUTPUT)
-        elif new_relay == RelayDirection.CHARGE:
+        elif sm_state == RelayState.CHARGING:
             self._set_ac_mode(AC_MODE_INPUT)
 
         if discharge_w != self.driver_state.last_sent_discharge_w:
