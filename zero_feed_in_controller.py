@@ -376,12 +376,10 @@ class ZeroFeedInController(hass.Hass):
                 self.state.mode = OperatingMode.DISCHARGING
 
         if self.state.mode != old_mode:
-            self.state.integral = 0.0
-            self.state.last_computed_w = 0.0
             self.state.charge_pending_since = None
             self.log(
-                f"Mode {old_mode.name} → {self.state.mode.name}: "
-                f"integral and last_computed reset"
+                f"Mode {old_mode.name} → {self.state.mode.name} "
+                f"(integral kept at {self.state.integral:.0f})"
             )
 
     def _target_for_mode(self) -> float:
@@ -400,13 +398,26 @@ class ZeroFeedInController(hass.Hass):
         target = self._target_for_mode()
 
         error = r.grid_power_w - target
-        raw_limit = self._run_pi(error)
+        raw_limit, p_term, new_integral = self._run_pi(error)
+        self._last_p = p_term
 
         guarded = self._apply_guards(raw_limit, r, surplus)
         if guarded is not None:
+            # Don't commit integral — freeze PI while guard blocks output
+            self._last_i = self.state.integral
             return guarded
 
+        # Commit PI state
+        self.state.integral = new_integral
+        self._last_i = new_integral
+
         clamped = self._clamp(raw_limit, surplus)
+
+        # Anti-windup: back-calculate integral when surplus/power clamp active
+        if clamped != raw_limit:
+            self.state.integral = clamped - p_term
+            self._last_i = self.state.integral
+
         reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name})"
         return ControlOutput.from_raw(clamped, self._last_p, self._last_i, reason)
 
@@ -417,22 +428,25 @@ class ZeroFeedInController(hass.Hass):
 
         excess = feed_in - self.cfg.max_feed_in_w
         forced = max(0.0, self.state.last_computed_w - excess - EMERGENCY_SAFETY_MARGIN_W)
-        self.state.integral = 0.0
-        return ControlOutput.from_raw(forced, 0.0, 0.0, "EMERGENCY")
+        # Back-calculate integral so PI resumes smoothly (p_term = 0)
+        self.state.integral = forced
+        return ControlOutput.from_raw(forced, 0.0, forced, "EMERGENCY")
 
-    def _run_pi(self, error: float) -> float:
+    def _run_pi(self, error: float) -> tuple[float, float, float]:
+        """Compute PI output without committing state.
+
+        Returns (output, p_term, new_integral).  Caller decides
+        whether to commit new_integral to self.state.
+        """
         if abs(error) <= self.cfg.deadband_w:
-            self._last_p = 0.0
-            self._last_i = self.state.integral
-            return self.state.last_computed_w
+            return self.state.last_computed_w, 0.0, self.state.integral
 
-        output, self._last_p, self._last_i = self.pi.update(
+        output, p_term, new_integral = self.pi.update(
             error=error,
             integral=self.state.integral,
             dt=self.cfg.interval_s,
         )
-        self.state.integral = self._last_i
-        return output
+        return output, p_term, new_integral
 
     def _apply_guards(
         self, raw_limit: float, r: SensorReading, surplus: float

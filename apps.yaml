@@ -34,9 +34,9 @@ zero_feed_in_controller:
   charge_target_power: 0       # charge target (W)
   mode_hysteresis: 50          # Schmitt trigger band (W)
   charge_confirm: 20           # seconds surplus must hold before CHARGING
-  kp_up: 0.3
+  kp_up: 0.4
   kp_down: 0.8
-  ki_up: 0.03
+  ki_up: 0.04
   ki_down: 0.08
   deadband: 25
   interval: 5
