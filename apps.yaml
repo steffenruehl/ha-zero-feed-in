@@ -1,0 +1,69 @@
+# ══════════════════════════════════════════════════════════
+#  Zero Feed-In Controller – AppDaemon Configuration
+# ══════════════════════════════════════════════════════════
+#
+#  File: config/appdaemon/apps/apps.yaml
+#
+#  Entity names must be adapted to your setup!
+#  Use MQTT Explorer to find the correct names.
+# ══════════════════════════════════════════════════════════
+
+zero_feed_in:
+  module: zero_feed_in
+  class: ZeroFeedIn
+
+  # ── Sensors ─────────────────────────────────────────────
+  # Grid meter: positive = draw, negative = feed-in
+  grid_power_sensor: sensor.smart_meter_sum_active_instantaneous_power
+
+  # SolarFlow current output power (W)
+  solarflow_output_sensor: sensor.hec4nencn492140_outputhomepower
+
+  # SolarFlow battery level (%)
+  solarflow_soc_sensor: sensor.hec4nencn492140_electriclevel
+
+  # ── Actuators ───────────────────────────────────────────
+  # Discharge limit (W)
+  output_limit_entity: number.hec4nencn492140_outputlimit
+
+  # AC charge limit (W) – set to 0 when no solar surplus
+  input_limit_entity: number.hec4nencn492140_inputlimit
+
+  # AC mode select – must match direction before sending limits
+  # Options: "Input mode" (charge), "Output mode" (discharge)
+  ac_mode_entity: select.hec4nencn492140_acmode
+
+  # ── Direction switches (optional) ───────────────────────
+  # input_boolean entities to enable/disable charge/discharge from HA UI
+  # Omit or comment out to always allow both directions
+  charge_switch: input_boolean.zfi_charge_enabled
+  discharge_switch: input_boolean.zfi_discharge_enabled
+
+  # ── Controller tuning ───────────────────────────────────
+  target_grid_power: 30        # discharge: accept small grid draw (W)
+  charge_target_power: 0       # charge: absorb all surplus exactly (W)
+  mode_hysteresis: 50          # surplus band to prevent mode flapping (W)
+  charge_confirm: 20           # seconds surplus must hold before entering CHARGING
+  kp_up: 0.3                    # proportional gain ramp-up (cautious)
+  kp_down: 0.8                  # proportional gain ramp-down (aggressive)
+  ki_up: 0.03                   # integral gain ramp-up (slow)
+  ki_down: 0.08                 # integral gain ramp-down (fast)
+  deadband: 25                 # deadband (W)
+  interval: 5                  # control interval (seconds)
+
+  # ── Power limits ────────────────────────────────────────
+  max_output: 800              # max discharge power (W)
+  max_charge: 2400             # max charge power (W)
+  min_soc: 10                  # don't discharge below (%)
+  max_soc: 85                  # don't charge above (%)
+
+  # ── Protection ──────────────────────────────────────────
+  max_feed_in: 800             # emergency above this (W)
+  emergency_kp_multiplier: 4.0 # Kp factor during emergency
+  direction_lockout: 5         # direction change lockout (s)
+
+  # ── Debug ───────────────────────────────────────────────
+  # true  = compute only, don't send commands
+  # false = live operation
+  dry_run: false
+  sensor_prefix: sensor.zfi    # prefix for published HA sensors
