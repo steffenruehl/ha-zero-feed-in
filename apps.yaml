@@ -83,9 +83,8 @@ zendure_solarflow_driver:
   # ── Driver settings ────────────────────────────────────
   interval: 2                  # poll interval (s) — faster than controller
   direction_lockout: 30        # base relay lockout (s)
-  relay_filter_enabled: true   # set false to disable lockout
+  relay_sm_enabled: true        # set false to disable state machine
   adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
-  adaptive_lockout_max_mult: 10 # max lockout multiplier for tiny surplus
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false

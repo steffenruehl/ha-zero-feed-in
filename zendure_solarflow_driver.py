@@ -57,13 +57,9 @@ class AdaptiveLockout:
         100 W sustained → 60 s
         50 W sustained  → 120 s
         Variable power  → each slice contributes proportionally
-
-    Capped at ``max_multiplier × base`` elapsed time so the lockout
-    stays finite even when power is near zero.
     """
 
     full_power_w: float = 200.0
-    max_multiplier: float = 10.0
     _accumulated_ws: float = 0.0
     _last_tick_t: float = 0.0
 
@@ -87,7 +83,7 @@ class AdaptiveLockout:
 
     @property
     def progress(self) -> float:
-        """Fraction of threshold reached (0.0 → 1.0+)."""
+        """Accumulated energy (W·s)."""
         return self._accumulated_ws
 
     def threshold(self, base_s: float) -> float:
@@ -102,14 +98,10 @@ class Config:
     ac_mode_entity: str
     interval_s: int = 2
     direction_lockout_s: float = 5.0
-    relay_filter_enabled: bool = True
-    adaptive_lockout: AdaptiveLockout = None  # type: ignore[assignment]
+    relay_sm_enabled: bool = True
+    adaptive_lockout_ref_w: float = 200.0
     dry_run: bool = True
     sensor_prefix: str = "sensor.zfi"
-
-    def __post_init__(self):
-        if self.adaptive_lockout is None:
-            self.adaptive_lockout = AdaptiveLockout()
 
     @classmethod
     def from_args(cls, args: dict) -> Config:
@@ -122,12 +114,11 @@ class Config:
             direction_lockout_s=float(
                 args.get("direction_lockout", cls.direction_lockout_s)
             ),
-            relay_filter_enabled=bool(
-                args.get("relay_filter_enabled", cls.relay_filter_enabled)
+            relay_sm_enabled=bool(
+                args.get("relay_sm_enabled", cls.relay_sm_enabled)
             ),
-            adaptive_lockout=AdaptiveLockout(
-                full_power_w=float(args.get("adaptive_lockout_ref_w", 200.0)),
-                max_multiplier=float(args.get("adaptive_lockout_max_mult", 10.0)),
+            adaptive_lockout_ref_w=float(
+                args.get("adaptive_lockout_ref_w", cls.adaptive_lockout_ref_w)
             ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
@@ -190,7 +181,7 @@ class RelayStateMachine:
 
         self.state = RelayState.IDLE
         self._pending: RelayState | None = None
-        self._idle_pending_since: float = 0.0
+        self._pending_since: float = 0.0
 
     def seed(self, direction: RelayDirection):
         """Set initial state from device without transition guards."""
@@ -251,7 +242,7 @@ class RelayStateMachine:
             self._publish("relay_sm_discharge_pct", "0", "%", "mdi:battery-arrow-down")
 
         if self._pending == RelayState.IDLE:
-            elapsed = time.monotonic() - self._idle_pending_since if self._idle_pending_since > 0 else 0.0
+            elapsed = time.monotonic() - self._pending_since if self._pending_since > 0 else 0.0
             pct = min(100, elapsed / max(1, self.idle_lockout_s) * 100)
             self._publish("relay_sm_idle_pct", f"{pct:.0f}", "%", "mdi:sleep")
         else:
@@ -270,7 +261,7 @@ class RelayStateMachine:
         can_switch = False
 
         if target == RelayState.IDLE:
-            elapsed = now - self._idle_pending_since if self._idle_pending_since > 0 else 0.0
+            elapsed = now - self._pending_since if self._pending_since > 0 else 0.0
             can_switch = elapsed >= self.idle_lockout_s
         elif target == RelayState.CHARGING:
             self.charge_lockout.tick(desired_w, now)
@@ -292,14 +283,10 @@ class RelayStateMachine:
             return self._clamp(desired_w)
 
         # Not yet — stay in current state
-        return self._clamp_current(desired_w)
+        return self._clamp(desired_w)
 
     def _clamp(self, desired_w: float) -> float:
-        """Clamp power for the *current* (just-transitioned) state."""
-        return self._clamp_for_state(self.state, desired_w)
-
-    def _clamp_current(self, desired_w: float) -> float:
-        """Clamp power to current state while transition is pending."""
+        """Clamp power to the current state's constraints."""
         return self._clamp_for_state(self.state, desired_w)
 
     @staticmethod
@@ -324,26 +311,17 @@ class RelayStateMachine:
 
     def _set_pending(self, target: RelayState, now: float):
         self._pending = target
+        self._pending_since = now
         self.charge_lockout.reset()
         self.discharge_lockout.reset()
-        self._idle_pending_since = now if target == RelayState.IDLE else 0.0
 
     def _clear_pending(self):
         self._pending = None
-        self._idle_pending_since = 0.0
+        self._pending_since = 0.0
 
     def _pending_elapsed(self, now: float) -> float:
-        if self._pending == RelayState.IDLE and self._idle_pending_since > 0:
-            return now - self._idle_pending_since
-        # For adaptive lockouts, use last_tick time as proxy
-        if self._pending == RelayState.CHARGING and self.charge_lockout._last_tick_t > 0:
-            return now - (self.charge_lockout._last_tick_t - (
-                self.charge_lockout._accumulated_ws / max(1, self.charge_lockout.full_power_w)
-            ))
-        if self._pending == RelayState.DISCHARGING and self.discharge_lockout._last_tick_t > 0:
-            return now - (self.discharge_lockout._last_tick_t - (
-                self.discharge_lockout._accumulated_ws / max(1, self.discharge_lockout.full_power_w)
-            ))
+        if self._pending is not None and self._pending_since > 0:
+            return now - self._pending_since
         return 0.0
 
 
@@ -368,12 +346,10 @@ class ZendureSolarFlowDriver(hass.Hass):
         self.relay_sm = RelayStateMachine(
             idle_lockout_s=self.cfg.direction_lockout_s,
             charge_lockout=AdaptiveLockout(
-                full_power_w=self.cfg.adaptive_lockout.full_power_w,
-                max_multiplier=self.cfg.adaptive_lockout.max_multiplier,
+                full_power_w=self.cfg.adaptive_lockout_ref_w,
             ),
             discharge_lockout=AdaptiveLockout(
-                full_power_w=self.cfg.adaptive_lockout.full_power_w,
-                max_multiplier=self.cfg.adaptive_lockout.max_multiplier,
+                full_power_w=self.cfg.adaptive_lockout_ref_w,
             ),
             base_lockout_s=self.cfg.direction_lockout_s,
             log_fn=self.log,
@@ -385,10 +361,9 @@ class ZendureSolarFlowDriver(hass.Hass):
 
         self.log(
             f"Started | desired_power={self.cfg.desired_power_sensor} "
-            f"relay_filter={self.cfg.relay_filter_enabled} "
+            f"relay_sm={self.cfg.relay_sm_enabled} "
             f"lockout={self.cfg.direction_lockout_s}s "
-            f"adaptive_ref={self.cfg.adaptive_lockout.full_power_w}W "
-            f"adaptive_max={self.cfg.adaptive_lockout.max_multiplier}x "
+            f"adaptive_ref={self.cfg.adaptive_lockout_ref_w}W "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -443,7 +418,7 @@ class ZendureSolarFlowDriver(hass.Hass):
         now = time.monotonic()
 
         # State machine decides allowed power
-        if self.cfg.relay_filter_enabled:
+        if self.cfg.relay_sm_enabled:
             allowed = self.relay_sm.update(desired, now)
         else:
             allowed = desired
