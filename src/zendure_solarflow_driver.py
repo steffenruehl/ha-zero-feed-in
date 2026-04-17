@@ -17,8 +17,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
-import appdaemon.plugins.hass.hassapi as hass
+if TYPE_CHECKING:
+    import appdaemon.plugins.hass.hassapi as hass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -369,7 +371,15 @@ class DriverState:
     by MQTT device reports and cannot be trusted for lockout."""
 
 
-class ZendureSolarFlowDriver(hass.Hass):
+try:
+    import appdaemon.plugins.hass.hassapi as hass
+
+    _HASS_BASE = hass.Hass
+except ImportError:
+    _HASS_BASE = object  # type: ignore[assignment,misc]
+
+
+class ZendureSolarFlowDriver(_HASS_BASE):
     """Translates signed desired-power into Zendure SolarFlow commands.
 
     Polls ``sensor.zfi_desired_power`` (published by the controller)

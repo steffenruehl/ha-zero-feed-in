@@ -126,7 +126,8 @@ src/
 config/
 └── apps.yaml                     # AppDaemon configuration for both apps
 tests/
-└── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController
+├── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController
+└── test_zendure_solarflow_driver.py  # unit tests for AdaptiveLockout & RelayStateMachine
 docs/
 ├── development_context.md        # this file
 └── zero_feed_in_docs.md          # full technical documentation
@@ -169,19 +170,27 @@ ZeroFeedInController(hass.Hass): — thin HA adapter
 
 ```
 Constants:  DIRECTION_THRESHOLD_W, ROUNDING_STEP_W, AC_MODE_*,
-            AC_MODE_RETRY_S
+            AC_MODE_RETRY_S, RELAY_SAFETY_TIMEOUT_S, MIN_ACTIVE_POWER_W
 
 Enums:      RelayDirection (CHARGE, IDLE, DISCHARGE)
+            RelayState     (IDLE, CHARGING, DISCHARGING)
 
 Dataclasses:
-  Config       — desired_power_sensor, device entities, lockout settings
-  DriverState  — last_sent limits, relay tracking, lockout timer
+  AdaptiveLockout — energy integrator for relay lockout (pure computation)
+  Config          — desired_power_sensor, device entities, lockout settings
+  DriverState     — last_sent limits, relay tracking
 
-ZendureSolarFlowDriver(hass.Hass):
+RelayStateMachine:  — guards relay transitions (pure computation)
+  seed()            — set initial state from device
+  update()          — process desired power, return allowed power
+  publish()         — push state and transition progress to HA sensors
+  _classify()       — map desired_w to target RelayState
+  _clamp_for_state()— constrain power to current state's direction
+
+ZendureSolarFlowDriver(_HASS_BASE):
   initialize()              — config, seed, schedule (2 s interval)
   _seed_from_device()       — read current limits + AC mode
-  _on_tick()                — read desired → lockout check → round → send
-  _is_relay_locked()        — lockout using own intent tracking
+  _on_tick()                — read desired → SM update → round → send
   _send_limits()            — AC mode + power limits
   _set_ac_mode()            — send-once with 30 s retry timeout
   _set_sensor()             — publish sensor.zfi_* driver states
@@ -248,7 +257,8 @@ ZendureSolarFlowDriver(hass.Hass):
 ### Missing features
 
 - **No persistence across restarts**: integral, mode reset. Startup seeding mitigates.
-- **No unit tests**: PIController, compute pipeline, guards are testable pure functions
+- **No unit tests**: PIController, compute pipeline, guards are testable pure functions  
+  → **Resolved**: 88 tests (32 controller + 56 driver) covering ControlLogic, PIController, AdaptiveLockout, RelayStateMachine
 - **No time-of-use / dynamic tariff support**: could charge from grid during negative prices
 - **Emergency only curtails discharge**: doesn't start charging to absorb existing PV surplus
 - **Single-instance only**: no multi-device HEMS support
