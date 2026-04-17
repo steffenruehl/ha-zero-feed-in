@@ -198,20 +198,22 @@ ZendureSolarFlowDriver(_HASS_BASE):
 
 ## Published HA Sensors (sensor.zfi_*)
 
+Sensors marked *(debug)* are only published when `debug: true` in the respective app config.
+
 ### Controller sensors
 
 | Entity | Type | Description |
 | --- | --- | --- |
 | `zfi_desired_power` | W | Signed desired power (+discharge, -charge) |
 | `zfi_mode` | text | Operating regime: charging/discharging |
-| `zfi_surplus` | W | Estimated solar surplus |
-| `zfi_battery_power` | W | Actual battery power (+discharge, -charge) |
-| `zfi_target` | W | Active PI target (0 or 30) |
-| `zfi_error` | W | Regulation error |
-| `zfi_p_term` | W | Proportional component |
-| `zfi_i_term` | W | Integral component |
-| `zfi_integral` | W | Integral accumulator |
-| `zfi_reason` | text | Decision reason |
+| `zfi_surplus` | W | Estimated solar surplus *(debug)* |
+| `zfi_battery_power` | W | Actual battery power (+discharge, -charge) *(debug)* |
+| `zfi_target` | W | Active PI target (0 or 30) *(debug)* |
+| `zfi_error` | W | Regulation error *(debug)* |
+| `zfi_p_term` | W | Proportional component *(debug)* |
+| `zfi_i_term` | W | Integral component *(debug)* |
+| `zfi_integral` | W | Integral accumulator *(debug)* |
+| `zfi_reason` | text | Decision reason *(debug)* |
 
 ### Driver sensors
 
@@ -221,6 +223,14 @@ ZendureSolarFlowDriver(_HASS_BASE):
 | `zfi_discharge_limit` | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | Physical relay state from AC mode entity |
+| `zfi_relay_sm_state` | text | Current SM state (idle/charging/discharging) *(debug)* |
+| `zfi_relay_sm_pending` | text | Pending transition target (or "none") *(debug)* |
+| `zfi_relay_sm_lockout_pct` | % | Unified lockout progress for active transition *(debug)* |
+| `zfi_relay_sm_accumulated_ws` | W·s | Accumulated energy toward transition threshold *(debug)* |
+| `zfi_relay_sm_threshold_ws` | W·s | Energy threshold required for transition *(debug)* |
+| `zfi_relay_sm_charge_pct` | % | Charge transition progress *(debug)* |
+| `zfi_relay_sm_discharge_pct` | % | Discharge transition progress *(debug)* |
+| `zfi_relay_sm_idle_pct` | % | Idle transition progress *(debug)* |
 
 ## Current Status
 

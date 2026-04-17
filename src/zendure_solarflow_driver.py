@@ -125,6 +125,8 @@ class Config:
     """Reference power for full-speed adaptive lockout (W)."""
     dry_run: bool = True
     """If True, compute but do not send commands to the device."""
+    debug: bool = False
+    """If True, publish relay state machine internals to HA sensors."""
     sensor_prefix: str = "sensor.zfi"
     """Prefix for HA sensor entities published by this driver."""
 
@@ -147,6 +149,7 @@ class Config:
                 args.get("adaptive_lockout_ref_w", cls.adaptive_lockout_ref_w)
             ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
+            debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
         )
 
@@ -252,7 +255,13 @@ class RelayStateMachine:
             self.state.name.lower(),
             icon="mdi:state-machine",
         )
-        # Publish transition progress for each possible target
+        self._publish(
+            "relay_sm_pending",
+            self._pending.name.lower() if self._pending else "none",
+            icon="mdi:timer-sand",
+        )
+
+        # Per-direction transition progress (percentage)
         if self._pending == RelayState.CHARGING:
             al = self.charge_lockout
             pct = min(100, al.progress / max(1, al.threshold(self.base_lockout_s)) * 100)
@@ -274,11 +283,50 @@ class RelayStateMachine:
         else:
             self._publish("relay_sm_idle_pct", "0", "%", "mdi:sleep")
 
+        # Unified lockout progress — single sensor for the active transition
+        unified_pct, accumulated_ws, threshold_ws = self._lockout_progress()
         self._publish(
-            "relay_sm_pending",
-            self._pending.name.lower() if self._pending else "none",
-            icon="mdi:timer-sand",
+            "relay_sm_lockout_pct", f"{unified_pct:.0f}", "%", "mdi:timer-sand",
         )
+        self._publish(
+            "relay_sm_accumulated_ws",
+            f"{accumulated_ws:.0f}",
+            "W·s",
+            "mdi:sigma",
+        )
+        self._publish(
+            "relay_sm_threshold_ws",
+            f"{threshold_ws:.0f}",
+            "W·s",
+            "mdi:target",
+        )
+
+    def _lockout_progress(self) -> tuple[float, float, float]:
+        """Return (pct, accumulated_ws, threshold_ws) for the active pending transition.
+
+        Returns (0, 0, 0) when no transition is pending.
+        """
+        if self._pending is None:
+            return 0.0, 0.0, 0.0
+
+        if self._pending == RelayState.CHARGING:
+            al = self.charge_lockout
+            threshold = al.threshold(self.base_lockout_s)
+            pct = min(100, al.progress / max(1, threshold) * 100)
+            return pct, al.progress, threshold
+
+        if self._pending == RelayState.DISCHARGING:
+            al = self.discharge_lockout
+            threshold = al.threshold(self.base_lockout_s)
+            pct = min(100, al.progress / max(1, threshold) * 100)
+            return pct, al.progress, threshold
+
+        if self._pending == RelayState.IDLE:
+            elapsed = time.monotonic() - self._pending_since if self._pending_since > 0 else 0.0
+            pct = min(100, elapsed / max(1, self.idle_lockout_s) * 100)
+            return pct, elapsed, self.idle_lockout_s
+
+        return 0.0, 0.0, 0.0
 
     # ── Internal ──────────────────────────────────────────
 
@@ -527,8 +575,9 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             icon="mdi:electric-switch",
         )
 
-        # Publish state machine sensors
-        self.relay_sm.publish()
+        # Publish state machine sensors (debug only)
+        if self.cfg.debug:
+            self.relay_sm.publish()
 
     def _read_current_relay(self) -> RelayDirection:
         """Read the device's current AC mode entity and return as a ``RelayDirection``."""

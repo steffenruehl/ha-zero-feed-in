@@ -420,6 +420,10 @@ class TestPublish:
         assert published["relay_sm_charge_pct"] == "0"
         assert published["relay_sm_discharge_pct"] == "0"
         assert published["relay_sm_idle_pct"] == "0"
+        # Unified lockout sensors — no pending transition
+        assert published["relay_sm_lockout_pct"] == "0"
+        assert published["relay_sm_accumulated_ws"] == "0"
+        assert published["relay_sm_threshold_ws"] == "0"
 
     def test_publish_shows_pending_progress(self):
         published = {}
@@ -440,6 +444,34 @@ class TestPublish:
         assert published["relay_sm_pending"] == "discharging"
         pct = int(published["relay_sm_discharge_pct"])
         assert 49 <= pct <= 51  # ~50%
+        # Unified lockout mirrors the active transition
+        unified_pct = int(published["relay_sm_lockout_pct"])
+        assert 49 <= unified_pct <= 51
+        assert published["relay_sm_accumulated_ws"] == "3000"
+        assert published["relay_sm_threshold_ws"] == "6000"
+
+    def test_publish_charge_progress(self):
+        """Charging transition publishes accumulated energy and threshold."""
+        published = {}
+
+        def capture(name, value, unit=None, icon=None):
+            published[name] = value
+
+        sm = RelayStateMachine(
+            idle_lockout_s=5.0,
+            charge_lockout=AdaptiveLockout(full_power_w=200.0),
+            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
+            base_lockout_s=30.0,
+            publish_fn=capture,
+        )
+        sm.update(-200.0, now=T0)
+        sm.update(-200.0, now=T0 + 10)
+        sm.publish()
+        assert published["relay_sm_pending"] == "charging"
+        assert published["relay_sm_accumulated_ws"] == "2000"
+        assert published["relay_sm_threshold_ws"] == "6000"
+        pct = int(published["relay_sm_charge_pct"])
+        assert 32 <= pct <= 34  # ~33%
 
     def test_no_publish_without_callback(self):
         """publish() with no callback doesn't crash."""

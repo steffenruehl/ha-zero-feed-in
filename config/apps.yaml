@@ -63,6 +63,7 @@ zero_feed_in_controller:
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false
+  debug: true                   # publish PI internals (p_term, i_term, etc.)
   sensor_prefix: sensor.zfi
 
 # ──────────────────────────────────────────────────────────
@@ -88,4 +89,5 @@ zendure_solarflow_driver:
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false
+  debug: true                   # publish relay SM internals (lockout %, etc.)
   sensor_prefix: sensor.zfi

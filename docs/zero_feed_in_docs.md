@@ -353,12 +353,19 @@ flowchart LR
 
 ## Published HA Sensors
 
-### Controller sensors
+### Controller sensors (always published)
 
 | Entity | Type | Unit | Description |
 | --- | --- | --- | --- |
 | `zfi_desired_power` | number | W | **Main output**: signed desired power (+discharge, -charge) |
 | `zfi_mode` | text | — | Operating regime: `charging` or `discharging` |
+
+### Controller sensors (debug only)
+
+Published only when `debug: true` in the controller config.
+
+| Entity | Type | Unit | Description |
+| --- | --- | --- | --- |
 | `zfi_surplus` | number | W | Estimated PV surplus |
 | `zfi_battery_power` | number | W | Actual battery power (+discharge, -charge) |
 | `zfi_target` | number | W | Active PI target (0 or 30) |
@@ -368,7 +375,7 @@ flowchart LR
 | `zfi_integral` | number | W | Integral accumulator |
 | `zfi_reason` | text | — | Decision reason |
 
-### Driver sensors
+### Driver sensors (always published)
 
 | Entity | Type | Unit | Description |
 | --- | --- | --- | --- |
@@ -376,6 +383,21 @@ flowchart LR
 | `zfi_discharge_limit` | number | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
+
+### Driver sensors (debug only)
+
+Published only when `debug: true` in the driver config.
+
+| Entity | Type | Unit | Description |
+| --- | --- | --- | --- |
+| `zfi_relay_sm_state` | text | — | Current SM state (idle/charging/discharging) |
+| `zfi_relay_sm_pending` | text | — | Pending transition target (or "none") |
+| `zfi_relay_sm_lockout_pct` | number | % | Unified lockout progress for active transition |
+| `zfi_relay_sm_accumulated_ws` | number | W·s | Accumulated energy toward transition threshold |
+| `zfi_relay_sm_threshold_ws` | number | W·s | Energy threshold required for transition |
+| `zfi_relay_sm_charge_pct` | number | % | Charge transition progress |
+| `zfi_relay_sm_discharge_pct` | number | % | Discharge transition progress |
+| `zfi_relay_sm_idle_pct` | number | % | Idle transition progress |
 
 ---
 
@@ -442,6 +464,18 @@ cards:
       - entity: sensor.hec4nencn492140_electriclevel
         name: SOC %
 
+  # ── Relay state machine ─────────────────────────
+  - type: history-graph
+    title: Relay State Machine
+    hours_to_show: 4
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout Progress %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+
   # ── Current state (entities card) ───────────────
   - type: entities
     title: ZFI Status
@@ -474,6 +508,17 @@ cards:
         name: Charge Limit
       - entity: sensor.zfi_reason
         name: Reason
+      - type: divider
+      - entity: sensor.zfi_relay_sm_state
+        name: SM State
+      - entity: sensor.zfi_relay_sm_pending
+        name: SM Pending
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: SM Lockout %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: SM Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: SM Threshold (W·s)
       - type: divider
       - entity: select.hec4nencn492140_acmode
         name: AC Mode (device)
@@ -521,37 +566,77 @@ cards:
       - entity: input_boolean.zfi_discharge_enabled
 ```
 
-### AC Mode Debug Dashboard
+### Relay State Machine Debug Dashboard
 
-Specifically for diagnosing AC mode switching issues:
+For diagnosing relay transitions and adaptive lockout behaviour:
 
 ```yaml
 type: vertical-stack
 cards:
+  # ── Lockout energy integrator over time ─────────
   - type: history-graph
-    title: AC Mode Debug
+    title: Adaptive Lockout Progress
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+
+  # ── Per-direction progress ──────────────────────
+  - type: history-graph
+    title: Direction Progress
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge %
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge %
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle %
+
+  # ── AC mode & power context ────────────────────
+  - type: history-graph
+    title: AC Mode & Power
     hours_to_show: 1
     entities:
       - entity: select.hec4nencn492140_acmode
-        name: AC Mode (device entity)
+        name: AC Mode (device)
       - entity: sensor.zfi_relay
-        name: Relay (driver tracking)
+        name: Relay (driver)
       - entity: sensor.zfi_desired_power
         name: Desired Power
       - entity: sensor.zfi_discharge_limit
         name: Discharge Sent
       - entity: sensor.zfi_charge_limit
         name: Charge Sent
-      - entity: number.hec4nencn492140_outputlimit
-        name: Device outputLimit
-      - entity: number.hec4nencn492140_inputlimit
-        name: Device inputLimit
 
+  # ── Current SM state ───────────────────────────
   - type: entities
-    title: AC Mode State
+    title: Relay State Machine
     entities:
+      - entity: sensor.zfi_relay_sm_state
+        name: Current State
+      - entity: sensor.zfi_relay_sm_pending
+        name: Pending Transition
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout Progress %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated Energy (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+      - type: divider
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge Progress %
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge Progress %
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle Progress %
+      - type: divider
       - entity: select.hec4nencn492140_acmode
-        name: AC Mode (entity)
+        name: AC Mode (device)
       - entity: sensor.zfi_relay
         name: Relay (driver)
       - entity: sensor.zfi_desired_power
@@ -600,11 +685,11 @@ Optional switches (create as HA helpers → Toggle):
 
 ### 4. Start in Dry Run
 
-Set `dry_run: true` in both apps. Monitor via AppDaemon log and `sensor.zfi_*` entities.
+Set `dry_run: true` in both apps. Set `debug: true` to publish internal sensors for the debug dashboards. Monitor via AppDaemon log and `sensor.zfi_*` entities.
 
 ### 5. Go Live
 
-Set `dry_run: false` in both apps. Start with `max_output: 200`.
+Set `dry_run: false` in both apps. Start with `max_output: 200`. Once stable, set `debug: false` to reduce HA sensor churn.
 
 ---
 

@@ -116,6 +116,8 @@ class Config:
 
     # Debug
     dry_run: bool = True
+    debug: bool = False
+    """If True, publish internal PI sensors (p_term, i_term, integral, etc.)."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
 
     @classmethod
@@ -163,6 +165,7 @@ class Config:
                 args.get("emergency_kp_multiplier", cls.emergency_kp_mult)
             ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
+            debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
         )
 
@@ -798,6 +801,11 @@ class ZeroFeedInController(_HASS_BASE):
             self.logic.state.mode.name.lower(),
             icon="mdi:swap-vertical",
         )
+
+        if not self.cfg.debug:
+            return
+
+        # ── Debug-only sensors below ─────────────────────
 
         # Physical estimates
         self._set_sensor("surplus", round(surplus), "W", "mdi:solar-power")
