@@ -182,11 +182,17 @@ class RelayStateMachine:
     Transition rules:
       - → CHARGING:    adaptive energy integrator must reach threshold
       - → DISCHARGING: adaptive energy integrator must reach threshold
-      - → IDLE:        fixed ``idle_lockout_s`` must elapse
+      - → IDLE:        accumulated time wanting IDLE must reach ``idle_lockout_s``
 
-    Each transition candidate gets its own AdaptiveLockout / timer.
-    If the requested state changes while a transition is pending the
-    accumulator resets, so only sustained intent triggers a switch.
+    Each non-current state tracks its own transition progress
+    independently.  Switching between two non-current targets does
+    **not** reset the other's accumulator, so oscillating desired
+    power still makes progress toward whichever transition
+    accumulates enough first.
+
+    Accumulators are only reset when:
+      - The desired state matches the current state (stable), or
+      - An actual state transition fires.
 
     The machine also publishes its state and transition progress to
     HA sensors via a callback.
@@ -209,8 +215,14 @@ class RelayStateMachine:
         self._publish = publish_fn
 
         self.state = RelayState.IDLE
-        self._pending: RelayState | None = None
-        self._pending_since: float = 0.0
+        self._last_target: RelayState | None = None
+        """Most recently requested non-current state (for publish display)."""
+        self._idle_accumulated_s: float = 0.0
+        """Accumulated seconds wanting IDLE (only ticked when target is IDLE)."""
+        self._idle_last_tick_t: float = 0.0
+        """Timestamp of the last idle tick (0.0 = no previous tick)."""
+        self._departure_since: float = 0.0
+        """Wall-clock time of first tick wanting to leave current state (for safety timeout)."""
 
     def seed(self, direction: RelayDirection):
         """Set initial state from device without transition guards."""
@@ -229,22 +241,42 @@ class RelayStateMachine:
           - CHARGING → clamp to [-max, -MIN_ACTIVE_POWER_W]
           - DISCHARGING → clamp to [+MIN_ACTIVE_POWER_W, +max]
 
-        Internally drives transition logic.
+        Each non-current state's accumulator is ticked independently;
+        switching targets does not reset the other accumulators.
         """
         target = self._classify(desired_w)
 
         if target == self.state:
-            # Already in the right state — reset any pending transition
-            self._clear_pending()
+            # Stable in current state — reset all transition trackers
+            self._reset_all_transitions()
             return self._clamp(desired_w)
 
-        # A different state is requested — check transition eligibility
-        if target != self._pending:
-            # New target — start fresh
-            self._set_pending(target, now)
+        # Track wall-clock departure time for safety timeout
+        if self._departure_since == 0.0:
+            self._departure_since = now
 
-        allowed = self._check_transition(target, desired_w, now)
-        return allowed
+        self._last_target = target
+
+        # Tick only the target's accumulator; pause others' tick clocks
+        self._tick_target(target, desired_w, now)
+
+        # Check if this target's accumulator has settled
+        can_switch = self._is_ready(target)
+
+        # Safety cap — never block longer than RELAY_SAFETY_TIMEOUT_S
+        if not can_switch and (now - self._departure_since) >= RELAY_SAFETY_TIMEOUT_S:
+            can_switch = True
+
+        if can_switch:
+            old = self.state
+            self.state = target
+            self._reset_all_transitions()
+            if self._log:
+                self._log(f"SM transition: {old.name} → {target.name}")
+            return self._clamp(desired_w)
+
+        # Not yet — stay in current state
+        return self._clamp(desired_w)
 
     def publish(self):
         """Push current state and transition progress to HA sensors."""
@@ -257,33 +289,25 @@ class RelayStateMachine:
         )
         self._publish(
             "relay_sm_pending",
-            self._pending.name.lower() if self._pending else "none",
+            self._last_target.name.lower() if self._last_target else "none",
             icon="mdi:timer-sand",
         )
 
-        # Per-direction transition progress (percentage)
-        if self._pending == RelayState.CHARGING:
-            al = self.charge_lockout
-            pct = min(100, al.progress / max(1, al.threshold(self.base_lockout_s)) * 100)
-            self._publish("relay_sm_charge_pct", f"{pct:.0f}", "%", "mdi:battery-charging")
-        else:
-            self._publish("relay_sm_charge_pct", "0", "%", "mdi:battery-charging")
+        # Per-direction transition progress (always shown independently)
+        al = self.charge_lockout
+        threshold = al.threshold(self.base_lockout_s)
+        pct = min(100, al.progress / max(1, threshold) * 100)
+        self._publish("relay_sm_charge_pct", f"{pct:.0f}", "%", "mdi:battery-charging")
 
-        if self._pending == RelayState.DISCHARGING:
-            al = self.discharge_lockout
-            pct = min(100, al.progress / max(1, al.threshold(self.base_lockout_s)) * 100)
-            self._publish("relay_sm_discharge_pct", f"{pct:.0f}", "%", "mdi:battery-arrow-down")
-        else:
-            self._publish("relay_sm_discharge_pct", "0", "%", "mdi:battery-arrow-down")
+        al = self.discharge_lockout
+        threshold = al.threshold(self.base_lockout_s)
+        pct = min(100, al.progress / max(1, threshold) * 100)
+        self._publish("relay_sm_discharge_pct", f"{pct:.0f}", "%", "mdi:battery-arrow-down")
 
-        if self._pending == RelayState.IDLE:
-            elapsed = time.monotonic() - self._pending_since if self._pending_since > 0 else 0.0
-            pct = min(100, elapsed / max(1, self.idle_lockout_s) * 100)
-            self._publish("relay_sm_idle_pct", f"{pct:.0f}", "%", "mdi:sleep")
-        else:
-            self._publish("relay_sm_idle_pct", "0", "%", "mdi:sleep")
+        pct = min(100, self._idle_accumulated_s / max(1, self.idle_lockout_s) * 100)
+        self._publish("relay_sm_idle_pct", f"{pct:.0f}", "%", "mdi:sleep")
 
-        # Unified lockout progress — single sensor for the active transition
+        # Unified lockout progress — for the most recently targeted state
         unified_pct, accumulated_ws, threshold_ws = self._lockout_progress()
         self._publish(
             "relay_sm_lockout_pct", f"{unified_pct:.0f}", "%", "mdi:timer-sand",
@@ -302,62 +326,79 @@ class RelayStateMachine:
         )
 
     def _lockout_progress(self) -> tuple[float, float, float]:
-        """Return (pct, accumulated_ws, threshold_ws) for the active pending transition.
+        """Return (pct, accumulated, threshold) for the most recently targeted state.
 
         Returns (0, 0, 0) when no transition is pending.
         """
-        if self._pending is None:
+        if self._last_target is None:
             return 0.0, 0.0, 0.0
 
-        if self._pending == RelayState.CHARGING:
+        if self._last_target == RelayState.CHARGING:
             al = self.charge_lockout
             threshold = al.threshold(self.base_lockout_s)
             pct = min(100, al.progress / max(1, threshold) * 100)
             return pct, al.progress, threshold
 
-        if self._pending == RelayState.DISCHARGING:
+        if self._last_target == RelayState.DISCHARGING:
             al = self.discharge_lockout
             threshold = al.threshold(self.base_lockout_s)
             pct = min(100, al.progress / max(1, threshold) * 100)
             return pct, al.progress, threshold
 
-        if self._pending == RelayState.IDLE:
-            elapsed = time.monotonic() - self._pending_since if self._pending_since > 0 else 0.0
-            pct = min(100, elapsed / max(1, self.idle_lockout_s) * 100)
-            return pct, elapsed, self.idle_lockout_s
+        if self._last_target == RelayState.IDLE:
+            pct = min(100, self._idle_accumulated_s / max(1, self.idle_lockout_s) * 100)
+            return pct, self._idle_accumulated_s, self.idle_lockout_s
 
         return 0.0, 0.0, 0.0
 
     # ── Internal ──────────────────────────────────────────
 
-    def _check_transition(self, target: RelayState, desired_w: float, now: float) -> float:
-        """Check if the pending transition can fire.  Returns allowed power."""
-        can_switch = False
+    def _tick_target(self, target: RelayState, desired_w: float, now: float) -> None:
+        """Tick the accumulator for *target* and pause the others' tick clocks.
 
+        Pausing means resetting ``_last_tick_t`` to 0 on the non-active
+        accumulators so that when we switch back to them later, the first
+        tick only sets the timestamp (no gap-time accumulation).
+        """
         if target == RelayState.IDLE:
-            elapsed = now - self._pending_since if self._pending_since > 0 else 0.0
-            can_switch = elapsed >= self.idle_lockout_s
+            self._tick_idle(now)
+            self.charge_lockout._last_tick_t = 0.0
+            self.discharge_lockout._last_tick_t = 0.0
         elif target == RelayState.CHARGING:
             self.charge_lockout.tick(desired_w, now)
-            can_switch = self.charge_lockout.is_settled(self.base_lockout_s)
+            self.discharge_lockout._last_tick_t = 0.0
+            self._idle_last_tick_t = 0.0
         elif target == RelayState.DISCHARGING:
             self.discharge_lockout.tick(desired_w, now)
-            can_switch = self.discharge_lockout.is_settled(self.base_lockout_s)
+            self.charge_lockout._last_tick_t = 0.0
+            self._idle_last_tick_t = 0.0
 
-        # Safety cap
-        if not can_switch and self._pending_elapsed(now) >= RELAY_SAFETY_TIMEOUT_S:
-            can_switch = True
+    def _tick_idle(self, now: float) -> None:
+        """Accumulate elapsed time for the IDLE transition."""
+        if self._idle_last_tick_t > 0.0:
+            dt = now - self._idle_last_tick_t
+            if dt > 0:
+                self._idle_accumulated_s += dt
+        self._idle_last_tick_t = now
 
-        if can_switch:
-            old = self.state
-            self.state = target
-            self._clear_pending()
-            if self._log:
-                self._log(f"SM transition: {old.name} → {target.name}")
-            return self._clamp(desired_w)
+    def _is_ready(self, target: RelayState) -> bool:
+        """Return True if *target*'s accumulator has reached its threshold."""
+        if target == RelayState.IDLE:
+            return self._idle_accumulated_s >= self.idle_lockout_s
+        if target == RelayState.CHARGING:
+            return self.charge_lockout.is_settled(self.base_lockout_s)
+        if target == RelayState.DISCHARGING:
+            return self.discharge_lockout.is_settled(self.base_lockout_s)
+        return False
 
-        # Not yet — stay in current state
-        return self._clamp(desired_w)
+    def _reset_all_transitions(self) -> None:
+        """Reset every transition accumulator (on state change or stable match)."""
+        self.charge_lockout.reset()
+        self.discharge_lockout.reset()
+        self._idle_accumulated_s = 0.0
+        self._idle_last_tick_t = 0.0
+        self._departure_since = 0.0
+        self._last_target = None
 
     def _clamp(self, desired_w: float) -> float:
         """Clamp power to the current state's constraints."""
@@ -383,20 +424,7 @@ class RelayStateMachine:
             return RelayState.CHARGING
         return RelayState.IDLE
 
-    def _set_pending(self, target: RelayState, now: float):
-        self._pending = target
-        self._pending_since = now
-        self.charge_lockout.reset()
-        self.discharge_lockout.reset()
 
-    def _clear_pending(self):
-        self._pending = None
-        self._pending_since = 0.0
-
-    def _pending_elapsed(self, now: float) -> float:
-        if self._pending is not None and self._pending_since > 0:
-            return now - self._pending_since
-        return 0.0
 
 
 @dataclass

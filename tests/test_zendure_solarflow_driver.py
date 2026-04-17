@@ -344,8 +344,10 @@ class TestTransitions:
         assert result == -MIN_ACTIVE_POWER_W
         assert sm.state == RelayState.CHARGING
 
-    def test_direction_flip_resets_accumulator(self):
-        """If desired direction flips mid-lockout, the accumulator resets."""
+    def test_direction_flip_new_target_starts_fresh(self):
+        """Flipping from DISCHARGE to CHARGE target while in IDLE:
+        the new charge accumulator starts from zero (no prior ticks),
+        but the old discharge accumulator preserves its progress."""
         sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 15)
@@ -356,6 +358,56 @@ class TestTransitions:
         # Continue charging for the full 30s from flip
         sm.update(-200.0, now=T0 + 46)
         assert sm.state == RelayState.CHARGING
+
+    def test_direction_flip_preserves_other_accumulator(self):
+        """Flipping target back after a brief interruption resumes
+        from the preserved accumulator progress."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm.update(200.0, now=T0)
+        sm.update(200.0, now=T0 + 15)  # discharge acc = 3000 W·s
+        # Briefly flip to charge for one tick
+        sm.update(-200.0, now=T0 + 16)
+        # Flip back to discharge — acc preserved at 3000 W·s
+        sm.update(200.0, now=T0 + 17)  # first tick after pause (sets ts)
+        sm.update(200.0, now=T0 + 32)  # +3000 → total 6000 → settled
+        assert sm.state == RelayState.DISCHARGING
+
+    def test_oscillation_idle_discharge_while_charging(self):
+        """In CHARGING, oscillating between IDLE and DISCHARGE targets
+        must still allow the IDLE timer to accumulate and eventually fire."""
+        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm.seed(RelayDirection.CHARGE)
+
+        # Alternating: 2 s IDLE, 1 s DISCHARGE — IDLE accumulates ~2 s per cycle
+        sm.update(0.0, now=T0)          # IDLE first tick (sets ts)
+        sm.update(0.0, now=T0 + 2)     # IDLE acc = 2 s
+        sm.update(200.0, now=T0 + 3)   # DISCHARGE (pauses idle tick clock)
+        sm.update(0.0, now=T0 + 4)     # IDLE first tick after pause (sets ts)
+        sm.update(0.0, now=T0 + 6)     # IDLE acc = 2 + 2 = 4 s
+        assert sm.state == RelayState.CHARGING  # not yet at 5 s
+
+        sm.update(200.0, now=T0 + 7)   # DISCHARGE (pauses idle)
+        sm.update(0.0, now=T0 + 8)     # IDLE first tick (sets ts)
+        sm.update(0.0, now=T0 + 10)    # IDLE acc = 4 + 2 = 6 s → settled
+        assert sm.state == RelayState.IDLE
+
+    def test_oscillation_idle_charge_while_discharging(self):
+        """In DISCHARGING, oscillating between IDLE and CHARGE targets
+        must still allow the IDLE timer to accumulate and eventually fire."""
+        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm.seed(RelayDirection.DISCHARGE)
+
+        sm.update(0.0, now=T0)
+        sm.update(0.0, now=T0 + 2)
+        sm.update(-200.0, now=T0 + 3)
+        sm.update(0.0, now=T0 + 4)
+        sm.update(0.0, now=T0 + 6)
+        assert sm.state == RelayState.DISCHARGING  # 4 s < 5 s
+
+        sm.update(-200.0, now=T0 + 7)
+        sm.update(0.0, now=T0 + 8)
+        sm.update(0.0, now=T0 + 10)
+        assert sm.state == RelayState.IDLE  # 6 s ≥ 5 s
 
     def test_low_power_longer_lockout(self):
         """50 W takes 120 s to transition (from docs: threshold 6000 / 50 = 120s)."""

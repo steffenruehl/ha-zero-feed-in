@@ -200,9 +200,9 @@ For sustained constant power the effective lockout is:
 | 50 W | 120 s | Marginal — probably not worth the relay wear |
 | <20 W | ≥300 s (safety cap) | Negligible — idle instead |
 
-IDLE transitions use a fixed timer (`idle_lockout_s`) instead of the energy integrator.
+IDLE transitions use an accumulated-time lockout (`idle_lockout_s`): time is only counted during ticks where IDLE is the target, so oscillations between non-current states accumulate IDLE time across interruptions.
 
-**Direction-change reset:** If the *desired* direction flips while a transition is pending (e.g. controller oscillates between CHARGE and DISCHARGE during marginal surplus), the energy accumulator resets to zero. The relay only switches after the controller has committed to one direction long enough.
+**Independent accumulators:** Each non-current state tracks its own transition progress independently. Switching between two non-current targets (e.g. oscillating between IDLE and DISCHARGE while in CHARGING) does **not** reset the other's accumulator. This ensures that even with oscillating desired power, the state machine eventually transitions — whichever accumulator reaches its threshold first wins. All accumulators are reset only when the desired state matches the current state (stable) or when an actual transition fires.
 
 A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
@@ -223,7 +223,7 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
-The `RelayStateMachine` gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. If the desired direction flips while a transition is pending, the accumulator resets — the relay only switches after sustained commitment to one direction. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`MIN_ACTIVE_POWER_W`), keeping the device responsive.
+The `RelayStateMachine` gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`MIN_ACTIVE_POWER_W`), keeping the device responsive.
 
 ### 3. SOC Protection
 
@@ -437,10 +437,6 @@ cards:
         name: Discharge Limit
       - entity: sensor.zfi_charge_limit
         name: Charge Limit
-      - entity: number.hec4nencn492140_outputlimit
-        name: Device outputLimit
-      - entity: number.hec4nencn492140_inputlimit
-        name: Device inputLimit
 
   # ── PI internals ────────────────────────────────
   - type: history-graph
@@ -587,9 +583,9 @@ cards:
       - entity: sensor.zfi_relay_sm_threshold_ws
         name: Threshold (W·s)
 
-  # ── Per-direction progress ──────────────────────
+  # ── Per-direction progress (independent accumulators) ─
   - type: history-graph
-    title: Direction Progress
+    title: Direction Progress (independent)
     hours_to_show: 1
     entities:
       - entity: sensor.zfi_relay_sm_charge_pct
@@ -622,9 +618,9 @@ cards:
       - entity: sensor.zfi_relay_sm_state
         name: Current State
       - entity: sensor.zfi_relay_sm_pending
-        name: Pending Transition
+        name: Last Target
       - entity: sensor.zfi_relay_sm_lockout_pct
-        name: Lockout Progress %
+        name: Last Target Lockout %
       - entity: sensor.zfi_relay_sm_accumulated_ws
         name: Accumulated Energy (W·s)
       - entity: sensor.zfi_relay_sm_threshold_ws
