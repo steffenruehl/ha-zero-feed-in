@@ -52,7 +52,7 @@ zero_feed_in_controller:
   interval: 5
 
   # ── Power limits ────────────────────────────────────────
-  max_output: 800              # max discharge (W)
+  max_output: 1200             # max discharge (W)
   max_charge: 2400             # max charge (W)
   min_soc: 10
   max_soc: 85

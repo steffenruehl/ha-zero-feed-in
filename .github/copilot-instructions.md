@@ -17,7 +17,6 @@ config/
   apps.yaml                   # AppDaemon configuration for both apps
 tests/
   test_zero_feed_in_controller.py  # Unit tests for ControlLogic & PIController
-  test_zendure_solarflow_driver.py  # Unit tests for AdaptiveLockout & RelayStateMachine
 docs/
   development_context.md      # Architecture decisions and design rationale
   zero_feed_in_docs.md        # Full technical documentation
@@ -59,9 +58,3 @@ When modifying existing code, add missing docstrings and type annotations to any
 
 - Single `main` branch, remote `origin` → `github.com:steffenruehl/ha-zero-feed-in.git`
 - Commit messages: imperative mood, summary line + blank line + body for non-trivial changes
-
-## Terminal
-
-- Use `bash -c "..."` to wrap terminal commands (avoids zsh autocorrect issues)
-- The system has `python3` (not `python`)
-- Run tests: `bash -c "cd /home/ruehl/src/zero-feed-in && python3 -m pytest tests/ -v"`
