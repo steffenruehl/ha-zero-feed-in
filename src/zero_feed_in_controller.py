@@ -17,8 +17,10 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
-import appdaemon.plugins.hass.hassapi as hass
+if TYPE_CHECKING:
+    import appdaemon.plugins.hass.hassapi as hass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -578,8 +580,15 @@ class ControlLogic:
 #  Main AppDaemon App (thin HA adapter)
 # ═══════════════════════════════════════════════════════════
 
+try:
+    import appdaemon.plugins.hass.hassapi as hass
 
-class ZeroFeedInController(hass.Hass):
+    _HASS_BASE = hass.Hass
+except ImportError:
+    _HASS_BASE = object  # type: ignore[assignment,misc]
+
+
+class ZeroFeedInController(_HASS_BASE):
     """Thin Home Assistant / AppDaemon adapter.
 
     Responsibilities:
