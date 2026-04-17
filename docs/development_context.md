@@ -96,7 +96,7 @@ Therefore: surplus = PV - house = -battery_power - grid_power
 
 - Entering CHARGING requires surplus to stay above threshold for charge_confirm_s (default 15-20 s)
 - Entering DISCHARGING is instant — demand should be covered quickly
-- On mode transition, integral and last_computed_w are reset to 0
+- On mode transition, integral is reset to 0
 
 ### Asymmetric Targets
 
@@ -243,7 +243,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Power limits always sent when values change (no mode gating)
 - Relay lockout uses driver's own tracking (not HA entity, which MQTT overwrites)
 - Redundant sends suppressed (only send when values change)
-- Charge confirmation: surplus must hold for 20 s before CHARGING
+- Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
 
@@ -274,10 +274,10 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - **Single-instance only**: no multi-device HEMS support
 
 ### Code quality improvements
-- `_last_p` and `_last_i` are instance variables set as side effects of `_run_pi()` and read in `_apply_guards()` / `_build_output()`. Could be returned explicitly or stored in a cycle-scoped dataclass.
+- `_last_p` and `_last_i` are instance variables set as side effects of `compute()` and read in `_apply_guards()`. Could be returned explicitly or stored in a cycle-scoped dataclass.
 - `Config.from_args()` has no validation — invalid entity names or out-of-range values silently accepted.
 - Log format could include a cycle counter for easier trace analysis.
-- `_publish_ha_sensors()` calls `set_state` 12 times per cycle (every 5s) — could batch or reduce frequency.
+- `_publish_ha_sensors()` calls `set_state` 2 times per cycle (10 times when `debug: true`) — could batch or reduce frequency.
 
 ## Tuning Guide
 
@@ -296,7 +296,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `max_output` | 800W | Legal BKW limit (2400W with electrician sign-off). |
 | `max_charge` | 2400W | AC charge limit. |
 | `max_feed_in` | 800W | Emergency threshold. |
-| `emergency_kp_multiplier` | 4.0 | How aggressively to curtail during emergency. |
+| `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
 
 ### Asymmetric gain rationale
 The gains are intentionally asymmetric:

@@ -183,32 +183,30 @@ Re-send after 30 s if the intent persists (`AC_MODE_RETRY_S`).
 
 Power limits (outputLimit, inputLimit) are sent whenever their values change. No gating on device mode confirmation — the device is responsible for applying limits in the correct mode.
 
-### 3. Relay Lockout (two-phase, adaptive, direction-aware)
+### 3. Relay Lockout (adaptive, energy-integrator)
 
-Tracks the driver's own intent (`last_set_relay`) — NOT the HA entity.
-
-**Phase 1 — Wait for device confirmation:** After commanding a direction change, the driver stays locked until the HA entity actually reflects the new direction (the physical relay has switched, typically 10-15 s).
-
-**Phase 2 — Adaptive settle time:** Once confirmed, the lock holds for a duration that scales inversely with the magnitude of the desired power (`AdaptiveLockout` class):
+The `RelayStateMachine` gates relay transitions behind an energy integrator (`AdaptiveLockout`).  Each tick accumulates `|power| × dt`; the transition fires when the accumulated energy reaches `full_power_w × base_lockout_s`.
 
 ```
-effective_lockout = base_lockout × (reference_power / |desired_power|)
+threshold = full_power_w × base_lockout_s   (e.g. 200 W × 30 s = 6 000 W·s)
 ```
+
+For sustained constant power the effective lockout is:
 
 | |desired_power| | Lockout (base=30s, ref=200W) | Rationale |
 | --- | --- | --- |
-| 200 W+ | 30 s (1×) | High surplus — worth switching |
-| 100 W | 60 s (2×) | Moderate — wait longer |
-| 50 W | 120 s (4×) | Marginal — probably not worth the relay wear |
-| <20 W | 300 s (10× cap) | Negligible — idle instead |
+| 200 W+ | 30 s | High surplus — worth switching |
+| 100 W | 60 s | Moderate — wait longer |
+| 50 W | 120 s | Marginal — probably not worth the relay wear |
+| <20 W | ≥300 s (safety cap) | Negligible — idle instead |
 
-Capped at `max_multiplier × base` (default 10×) so the lockout stays finite.
+IDLE transitions use a fixed timer (`idle_lockout_s`) instead of the energy integrator.
 
-**Direction-change reset:** If the *desired* direction flips while the lockout is active (e.g. controller oscillates between CHARGE and DISCHARGE during marginal surplus), the Phase 2 settle timer restarts from zero. This ensures the relay only switches after the controller has committed to one direction long enough — preventing relay chatter during ambiguous conditions.
+**Direction-change reset:** If the *desired* direction flips while a transition is pending (e.g. controller oscillates between CHARGE and DISCHARGE during marginal surplus), the energy accumulator resets to zero. The relay only switches after the controller has committed to one direction long enough.
 
-A 60 s safety timeout prevents infinite lockout if the device never confirms (e.g. lost MQTT command).
+A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
-During lockout, power is **clamped** to the current direction (ramping towards zero) instead of freezing at stale values. This keeps the device responsive while preventing relay chatter.
+During lockout, power is **clamped** to the current direction's minimum active power (`MIN_ACTIVE_POWER_W = 10 W`), keeping the device responsive while preventing relay chatter.
 
 ### 4. Rounding and Suppression
 
@@ -221,11 +219,11 @@ During lockout, power is **clamped** to the current direction (ramping towards z
 
 ### 1. Emergency (Feed-in > 800 W)
 
-Direct curtailment: output reduced by (excess + 50 W margin). Integral reset.
+Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calculated to the forced value so the PI resumes smoothly.
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
-Two-phase relay protection: first waits for device to confirm the commanded direction, then holds for an adaptive settle time that scales inversely with power magnitude (high surplus → short lockout, low surplus → long lockout). If the desired direction flips during lockout, the settle timer resets — the relay only switches after sustained commitment to one direction. During lockout: power clamped to current direction (ramps toward zero), preventing stale limits.
+The `RelayStateMachine` gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. If the desired direction flips while a transition is pending, the accumulator resets — the relay only switches after sustained commitment to one direction. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`MIN_ACTIVE_POWER_W`), keeping the device responsive.
 
 ### 3. SOC Protection
 
@@ -297,27 +295,31 @@ flowchart TD
 flowchart TD
     A([Tick: every 2s]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
-    B -- Yes --> C{Relay locked?}
-    C -- Yes --> Z
-    C -- No --> D["Round to 10W steps<br>discharge_w, charge_w"]
+    B -- Yes --> SM{SM enabled?}
+    SM -- Yes --> SMU["RelayStateMachine.update()<br>clamps power to current state"]
+    SM -- No --> PASS["allowed = desired"]
+    SMU --> RND
+    PASS --> RND
 
-    D --> E{desired > 0?}
-    E -- "Yes (discharge)" --> F[Set AC mode: Output]
-    E -- "No (charge)" --> G[Set AC mode: Input]
+    RND["Round to 10W steps<br>discharge_w, charge_w"]
 
-    F --> H{Device confirmed<br>Output mode?}
-    G --> I{Device confirmed<br>Input mode?}
+    RND --> DRY{dry_run?}
+    DRY -- Yes --> PUB
+    DRY -- No --> SEND
 
-    H -- Yes --> J["Send outputLimit"]
-    H -- No --> K["Hold outputLimit"]
-    I -- Yes --> L["Send inputLimit"]
-    I -- No --> M["Hold inputLimit"]
+    SEND["_send_limits()"]
+    SEND --> ACM{"SM state?"}
+    ACM -- DISCHARGING --> AO["Set AC mode: Output<br>(send-once, retry 30s)"]
+    ACM -- CHARGING --> AI["Set AC mode: Input<br>(send-once, retry 30s)"]
+    ACM -- IDLE --> SKIP_AC["No AC mode change"]
 
-    J --> PUB
-    K --> PUB
-    L --> PUB
-    M --> PUB
+    AO --> LIM
+    AI --> LIM
+    SKIP_AC --> LIM
 
+    LIM["Send outputLimit / inputLimit<br>(only when value changed)"]
+
+    LIM --> PUB
     PUB["Publish sensor.zfi_device_output<br>discharge_limit, charge_limit, relay"]
 ```
 
@@ -699,11 +701,11 @@ Set `dry_run: false` in both apps. Start with `max_output: 200`. Once stable, se
 
 ```
 PV=1200W, house=500W, battery charging 400W
-battery_sensor = +400 (charging)
-battery_power_w = -400 (controller convention)
+battery_sensor = -400 (charging → negative per convention)
+battery_power_w = -400 (signed mode, no transformation)
 grid = house - PV + charge = 500 - 1200 + 400 = -300W (feeding in)
 
-surplus = -battery_power_w - grid = 400 - (-300) = 700W
+surplus = -battery_power_w - grid = -(-400) - (-300) = 400 + 300 = 700W
 mode: 700 > 50 → CHARGING, target = 0W
 error = -300 - 0 = -300W
 PI increases charge
@@ -716,7 +718,7 @@ clamp: cap at surplus=700 → charge up to 700W
 
 ```
 PV drops to 600W, house=500W, battery charging 650W
-battery_sensor = +650, battery_power_w = -650
+battery_sensor = -650, battery_power_w = -650
 grid = 500 - 600 + 650 = +550W (drawing from grid!)
 
 surplus = -(-650) - 550 = 650 - 550 = 100W
@@ -747,10 +749,10 @@ PI increases discharge
 
 ```
 PV=0W, house=100W, battery discharging 300W
-battery_sensor = -300, battery_power_w = +300
+battery_sensor = +300, battery_power_w = +300
 grid = 100 - 0 - 300 = -200W (feeding in!)
 
-surplus = -(300) - (-200) = -300 + 200 = -100W
+surplus = -(+300) - (-200) = -300 + 200 = -100W
 mode: stays DISCHARGING, PI reduces output
 → desired_power drops toward 100W
 ```
@@ -762,7 +764,7 @@ grid = -1100W (1100W flowing to grid)
 feed_in = 1100 > 800 → EMERGENCY
 excess = 1100 - 800 = 300
 forced = current_output - 300 - 50 (safety margin)
-integral → 0
+integral → forced (back-calculated)
 ```
 
 ### 6. Battery full — surplus goes to grid

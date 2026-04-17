@@ -236,8 +236,9 @@ class ControllerState:
     """Mutable state carried across control cycles by ``ControlLogic``.
 
     Reset semantics:
-        * ``integral`` and ``last_computed_w`` are reset to 0 on mode
-          transitions.
+        * ``integral`` is reset to 0 on mode transitions.
+        * ``last_computed_w`` is set by each cycle's output (not
+          explicitly reset on mode change).
         * ``charge_pending_since`` is set when a charge-mode candidate
           is first detected and cleared on confirmation or cancellation.
     """
