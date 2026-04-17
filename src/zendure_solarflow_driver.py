@@ -37,6 +37,13 @@ AC_MODE_RETRY_S = 30
 
 
 class RelayDirection(Enum):
+    """Logical direction the AC relay should be set to.
+
+    The Zendure SolarFlow 2400 AC+ has a physical relay that switches
+    between Input mode (charging) and Output mode (discharging).
+    IDLE means no power flow is requested.
+    """
+
     CHARGE = auto()
     IDLE = auto()
     DISCHARGE = auto()
@@ -92,19 +99,36 @@ class AdaptiveLockout:
 
 @dataclass
 class Config:
+    """Typed configuration for the Zendure SolarFlow driver.
+
+    Loaded from the ``zendure_solarflow_driver`` section of ``apps.yaml``
+    via the ``from_args`` classmethod.
+    """
+
     desired_power_sensor: str
+    """HA entity ID for the controller's desired-power output."""
     output_entity: str
+    """HA number entity for ``outputLimit`` (discharge power, W)."""
     input_entity: str
+    """HA number entity for ``inputLimit`` (charge power, W)."""
     ac_mode_entity: str
+    """HA select entity for AC mode ('Input mode' / 'Output mode')."""
     interval_s: int = 2
+    """Poll interval in seconds (should be faster than the controller)."""
     direction_lockout_s: float = 5.0
+    """Base lockout duration before allowing a relay direction change (s).""" 
     relay_sm_enabled: bool = True
+    """If False, bypass the relay state machine entirely."""
     adaptive_lockout_ref_w: float = 200.0
+    """Reference power for full-speed adaptive lockout (W)."""
     dry_run: bool = True
+    """If True, compute but do not send commands to the device."""
     sensor_prefix: str = "sensor.zfi"
+    """Prefix for HA sensor entities published by this driver."""
 
     @classmethod
-    def from_args(cls, args: dict) -> Config:
+    def from_args(cls, args: dict[str, object]) -> Config:
+        """Map free-form AppDaemon ``args`` to typed ``Config`` fields."""
         return cls(
             desired_power_sensor=args["desired_power_sensor"],
             output_entity=args["output_limit_entity"],
@@ -327,8 +351,17 @@ class RelayStateMachine:
 
 @dataclass
 class DriverState:
+    """Mutable state tracking what the driver has sent to the device.
+
+    Used for redundant-send suppression and relay intent tracking.
+    The HA entity state cannot be trusted because the Zendure MQTT
+    integration overwrites it faster than the physical relay switches.
+    """
+
     last_sent_discharge_w: int = -1
+    """Last ``outputLimit`` value sent (W), or -1 if none sent yet."""
     last_sent_charge_w: int = -1
+    """Last ``inputLimit`` value sent (W), or -1 if none sent yet."""
     last_relay_change_t: float = 0.0
     """Monotonic time of the last AC mode command."""
     last_set_relay: RelayDirection = RelayDirection.IDLE
@@ -337,9 +370,24 @@ class DriverState:
 
 
 class ZendureSolarFlowDriver(hass.Hass):
-    """Translates signed desired-power into Zendure SolarFlow commands."""
+    """Translates signed desired-power into Zendure SolarFlow commands.
 
-    def initialize(self):
+    Polls ``sensor.zfi_desired_power`` (published by the controller)
+    every ``interval_s`` seconds and maps it to:
+
+    * ``outputLimit`` — discharge power (W)
+    * ``inputLimit`` — charge power (W)
+    * ``acMode`` — relay direction ('Input mode' / 'Output mode')
+
+    An optional relay state machine prevents relay chatter by
+    gating direction changes behind an adaptive energy integrator.
+    """
+
+    cfg: Config
+    driver_state: DriverState
+    relay_sm: RelayStateMachine
+
+    def initialize(self) -> None:
         self.cfg = Config.from_args(self.args)
         self.driver_state = DriverState()
 
@@ -367,8 +415,8 @@ class ZendureSolarFlowDriver(hass.Hass):
             f"dry_run={self.cfg.dry_run}"
         )
 
-    def _seed_from_device(self):
-        """Read current device limits to avoid redundant sends on startup."""
+    def _seed_from_device(self) -> None:
+        """Read current device limits and AC mode to avoid redundant sends on startup."""
         out_raw = self._read_float(self.cfg.output_entity)
         in_raw = self._read_float(self.cfg.input_entity)
         self.driver_state.last_sent_discharge_w = (
@@ -406,7 +454,8 @@ class ZendureSolarFlowDriver(hass.Hass):
 
     # ─── Tick ─────────────────────────────────────────────
 
-    def _on_tick(self, _kwargs):
+    def _on_tick(self, _kwargs: dict) -> None:
+        """Called every ``interval_s`` seconds: read desired power, apply SM, send."""
         desired = self._read_float(self.cfg.desired_power_sensor)
         if desired is None:
             self.log(
@@ -472,6 +521,7 @@ class ZendureSolarFlowDriver(hass.Hass):
         self.relay_sm.publish()
 
     def _read_current_relay(self) -> RelayDirection:
+        """Read the device's current AC mode entity and return as a ``RelayDirection``."""
         ac_mode = self.get_state(self.cfg.ac_mode_entity)
         if ac_mode == AC_MODE_OUTPUT:
             return RelayDirection.DISCHARGE
@@ -481,7 +531,13 @@ class ZendureSolarFlowDriver(hass.Hass):
 
     # ─── Send ─────────────────────────────────────────────
 
-    def _send_limits(self, desired: float, discharge_w: int, charge_w: int):
+    def _send_limits(self, desired: float, discharge_w: int, charge_w: int) -> None:
+        """Send AC mode and power limit commands to the device.
+
+        AC mode is set first (based on the relay state machine state),
+        then ``outputLimit`` and ``inputLimit`` are sent only when their
+        values have changed from the last-sent value.
+        """
         # Set AC mode based on state machine state
         sm_state = self.relay_sm.state
         if sm_state == RelayState.DISCHARGING:
@@ -505,8 +561,13 @@ class ZendureSolarFlowDriver(hass.Hass):
             )
             self.driver_state.last_sent_charge_w = charge_w
 
-    def _set_ac_mode(self, mode: str):
-        """Send AC mode command only on intent change or after retry timeout."""
+    def _set_ac_mode(self, mode: str) -> None:
+        """Send AC mode command only on intent change or after retry timeout.
+
+        Uses the driver's own intent tracking (``last_set_relay``) rather
+        than the HA entity state, because the MQTT integration overwrites
+        the entity faster than the physical relay switches (10–15 s).
+        """
         new_relay = (
             RelayDirection.CHARGE if mode == AC_MODE_INPUT
             else RelayDirection.DISCHARGE
@@ -532,15 +593,17 @@ class ZendureSolarFlowDriver(hass.Hass):
 
     @staticmethod
     def _round_to_step(value: float) -> int:
+        """Round a power value to the nearest device step (10 W)."""
         return int(round(value / ROUNDING_STEP_W) * ROUNDING_STEP_W)
 
     def _set_sensor(
         self,
         name: str,
-        value,
+        value: object,
         unit: str | None = None,
         icon: str | None = None,
-    ):
+    ) -> None:
+        """Create or update a ``sensor.zfi_<name>`` entity in HA."""
         entity_id = f"{self.cfg.sensor_prefix}_{name}"
         attrs = {"friendly_name": f"ZFI {name.replace('_', ' ').title()}"}
         if unit:

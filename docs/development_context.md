@@ -120,13 +120,19 @@ if raw < 0:  # wants to charge
 ## File Structure
 
 ```
-config/appdaemon/apps/
-├── zero_feed_in_controller.py    # device-agnostic PI controller
-├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
-└── apps.yaml                     # configuration for both apps
+src/
+├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
+└── zendure_solarflow_driver.py   # Zendure SolarFlow driver
+config/
+└── apps.yaml                     # AppDaemon configuration for both apps
+tests/
+└── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController
+docs/
+├── development_context.md        # this file
+└── zero_feed_in_docs.md          # full technical documentation
 ```
 
-### Controller Code Organization (zero_feed_in_controller.py)
+### Controller Code Organization (src/zero_feed_in_controller.py)
 
 ```
 Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX, EMERGENCY_SAFETY_MARGIN_W
@@ -135,26 +141,31 @@ Enums:      OperatingMode (CHARGING, DISCHARGING)
 
 Dataclasses:
   Config          — typed config from apps.yaml
-  SensorReading   — grid_power_w, soc_pct, battery_power_w
+  Measurement     — grid_power_w, soc_pct, battery_power_w, switch states
   ControlOutput   — desired_power_w, p/i terms, reason
   ControllerState — integral, last_computed_w, mode, charge_pending_since
 
 PIController:     — asymmetric gains, anti-windup back-calculation
 
-ZeroFeedInController(hass.Hass):
-  initialize()                  — config, PI, seed, schedule
-  _seed_state()                 — seed from battery_power_sensor
-  _on_tick()                    — read → compute → update → log → publish
-  _read_sensors()               — grid + soc + battery_power
-  _estimate_solar_surplus()     — -battery_power_w - grid_power_w
+ControlLogic:     — pure-computation control logic (no HA dependency)
+  seed()                        — initialise from battery_power_sensor
+  estimate_surplus()            — -battery_power_w - grid_power_w
+  compute()                     — emergency → mode → PI → guards → clamp
+  target_for_mode()             — active grid-power target
   _update_operating_mode()      — Schmitt trigger with charge confirmation
-  _compute()                    — emergency → mode → PI → guards → clamp
   _apply_guards()               — switches + SOC + grid-charge protection
   _clamp()                      — limit enforcement + surplus cap
+  _check_emergency()            — feed-in protection
+  _run_pi()                     — PI computation (without committing state)
+
+ZeroFeedInController(hass.Hass): — thin HA adapter
+  initialize()                  — config, seed, schedule
+  _on_tick()                    — read → compute → log → publish
+  _read_measurement()           — assemble Measurement from HA sensors
   _publish_ha_sensors()         — publishes sensor.zfi_* entities
 ```
 
-### Driver Code Organization (zendure_solarflow_driver.py)
+### Driver Code Organization (src/zendure_solarflow_driver.py)
 
 ```
 Constants:  DIRECTION_THRESHOLD_W, ROUNDING_STEP_W, AC_MODE_*,

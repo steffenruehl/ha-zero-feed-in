@@ -23,17 +23,17 @@ zero_feed_in_controller:
   soc_sensor: sensor.hec4nencn492140_electriclevel
 
   # Battery power: +discharge/-charge (signed sensor, no negation needed)
-  #battery_power_sensor: sensor.energy_battery_hec4nencn492140_outputhomepower_hec4nencn492140_gridinputpower_net_power
+  battery_power_sensor: sensor.energy_battery_hec4nencn492140_outputhomepower_hec4nencn492140_gridinputpower_net_power
 
   # Battery sensor mode: "signed" (default) or "unsigned"
   #   signed   – sensor has correct sign (+discharge/-charge), no extra entity needed
   #   unsigned – sensor is always positive; sign derived from ac_mode_entity
-  #battery_sensor_mode: signed
+  battery_sensor_mode: signed
   # ac_mode_entity: select.hec4nencn492140_acmode   # required for unsigned mode
   # Alternative unsigned sensor:
-  battery_power_sensor: sensor.battery_plug_power
-  battery_sensor_mode: unsigned
-  ac_mode_entity: select.hec4nencn492140_acmode
+  #battery_power_sensor: sensor.battery_plug_power
+  #battery_sensor_mode: unsigned
+  #ac_mode_entity: select.hec4nencn492140_acmode
 
   # ── Direction switches (optional) ───────────────────────
   charge_switch: input_boolean.zfi_charge_enabled
