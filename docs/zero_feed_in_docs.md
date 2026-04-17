@@ -415,7 +415,7 @@ cards:
   # ── Power overview ──────────────────────────────
   - type: history-graph
     title: Power & Control
-    hours_to_show: 4
+    hours_to_show: 0.5
     entities:
       - entity: sensor.smart_meter_sum_active_instantaneous_power
         name: Grid Power
@@ -431,7 +431,7 @@ cards:
   # ── Device commands ─────────────────────────────
   - type: history-graph
     title: Device Commands
-    hours_to_show: 4
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_discharge_limit
         name: Discharge Limit
@@ -441,7 +441,7 @@ cards:
   # ── PI internals ────────────────────────────────
   - type: history-graph
     title: PI Controller
-    hours_to_show: 4
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_error
         name: Error
@@ -457,7 +457,7 @@ cards:
   # ── Battery ─────────────────────────────────────
   - type: history-graph
     title: Battery
-    hours_to_show: 4
+    hours_to_show: 0.5
     entities:
       - entity: sensor.hec4nencn492140_electriclevel
         name: SOC %
@@ -465,7 +465,7 @@ cards:
   # ── Relay state machine ─────────────────────────
   - type: history-graph
     title: Relay State Machine
-    hours_to_show: 4
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_lockout_pct
         name: Lockout Progress %
@@ -542,7 +542,7 @@ type: vertical-stack
 cards:
   - type: history-graph
     title: Zero Feed-In
-    hours_to_show: 8
+    hours_to_show: 0.5
     entities:
       - entity: sensor.smart_meter_sum_active_instantaneous_power
         name: Grid
@@ -574,7 +574,7 @@ cards:
   # ── Lockout energy integrator over time ─────────
   - type: history-graph
     title: Adaptive Lockout Progress
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_lockout_pct
         name: Lockout %
@@ -586,7 +586,7 @@ cards:
   # ── Per-direction progress (independent accumulators) ─
   - type: history-graph
     title: Direction Progress (independent)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_charge_pct
         name: Charge %
@@ -598,7 +598,7 @@ cards:
   # ── AC mode & power context ────────────────────
   - type: history-graph
     title: AC Mode & Power
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: select.hec4nencn492140_acmode
         name: AC Mode (device)
