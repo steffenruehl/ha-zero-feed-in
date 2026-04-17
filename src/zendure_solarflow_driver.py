@@ -562,7 +562,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             self.log(
                 f"SM clamp | wanted={desired:.0f}W allowed={allowed:.0f}W "
                 f"state={self.relay_sm.state.name} "
-                f"pending={self.relay_sm._pending.name if self.relay_sm._pending else 'none'}"
+                f"target={self.relay_sm._last_target.name if self.relay_sm._last_target else 'none'}"
             )
 
         # Round to device step
