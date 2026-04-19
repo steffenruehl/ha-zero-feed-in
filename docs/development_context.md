@@ -165,7 +165,7 @@ ControlLogic:     — pure-computation control logic (no HA dependency)
   compute()                     — emergency → mode → PI+FF → guards → clamp → relay-lock freeze
   target_for_mode()             — active grid-power target
   _update_operating_mode()      — Schmitt trigger with charge confirmation
-  _apply_guards()               — switches + SOC + grid-charge protection
+  _apply_guards()               — switches + SOC + grid-charge protection (resets integral)
   _clamp()                      — limit enforcement + surplus cap
   _check_emergency()            — feed-in protection
   _run_pi()                     — PI computation (without committing state)

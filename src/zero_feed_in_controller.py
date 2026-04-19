@@ -676,8 +676,11 @@ class ControlLogic:
 
         guarded = self._apply_guards(combined, m, surplus)
         if guarded is not None:
-            # Don't commit integral — freeze PI while guard blocks output
-            self._last_i = self.state.integral
+            # Guard forces idle — reset integral so PI starts fresh when
+            # the guard clears.  The integral is only meaningful in a
+            # closed loop; while the output is blocked there is no feedback.
+            self.state.integral = 0.0
+            self._last_i = 0.0
             self.state.last_computed_w = guarded.desired_power_w
             self.ff.update_previous(m.ff_readings)
             return guarded

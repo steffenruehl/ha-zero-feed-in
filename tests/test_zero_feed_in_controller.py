@@ -410,14 +410,19 @@ class TestStateUpdates:
         output = logic.compute(m, now=0)
         assert logic.state.last_computed_w == output.desired_power_w
 
-    def test_integral_frozen_during_guard(self):
-        """When a guard blocks output, integral should not change."""
+    def test_integral_reset_during_guard(self):
+        """When a guard blocks output, integral should reset to zero.
+
+        The integral is only meaningful in a closed loop.  While the guard
+        blocks output (loop open), the integral becomes stale and must not
+        carry over when the guard clears.
+        """
         logic = make_logic(min_soc_pct=10, deadband_w=0)
         logic.seed(None)
         logic.state.integral = 100.0
         m = make_measurement(grid_power_w=200, soc_pct=10)
         logic.compute(m, now=0)
-        assert logic.state.integral == 100.0
+        assert logic.state.integral == 0.0
 
 
 # ═══════════════════════════════════════════════════════════

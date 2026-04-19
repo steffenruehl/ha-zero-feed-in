@@ -135,6 +135,12 @@ Optional `input_boolean` entities for HA UI control:
 | `charge_switch` | Controller idles instead of charging |
 | `discharge_switch` | Controller idles instead of discharging |
 
+When any guard forces the controller to idle (direction switches, SOC limits,
+no-surplus protection), the **integral is reset to zero**.  The integral only
+has meaning in a closed control loop; while the output is blocked (loop open),
+there is no feedback, so the integral becomes stale.  Resetting ensures the PI
+starts fresh when the guard clears.
+
 ---
 
 ## Controller: PI Controller + Feed-Forward
