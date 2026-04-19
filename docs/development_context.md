@@ -150,7 +150,7 @@ Dataclasses:
   ControllerState — integral, last_computed_w, mode, charge_pending_since,
                     previous_grid_w, previous_pv_w
 
-PIController:     — asymmetric gains, anti-windup back-calculation
+PIController:     — anti-windup back-calculation
 
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
@@ -248,7 +248,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 
 - Two-app architecture: controller + Zendure driver
 - Controller publishes `sensor.zfi_desired_power`, driver reads it
-- PI controller uses position form with asymmetric gains and anti-windup back-calculation
+- PI controller uses position form with anti-windup back-calculation
 - PID: D-term on grid delta catches load steps immediately, fires even in PI deadband
 - PV feed-forward: compensates solar changes before they appear at the grid meter
 - Slew rate limiter: prevents PI windup from commanding beyond device ramp capability
@@ -298,10 +298,8 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `kp_up` | 0.3 | Proportional gain for ramp-up (cautious). |
-| `kp_down` | 0.8 | Proportional gain for ramp-down (aggressive). |
-| `ki_up` | 0.03 | Integral gain for ramp-up (slow). |
-| `ki_down` | 0.08 | Integral gain for ramp-down (fast). |
+| `kp` | 0.3 | Proportional gain. |
+| `ki` | 0.03 | Integral gain. |
 | `deadband` | 25W | No action within this error range. |
 | `kd` | 0.3 | Derivative gain on grid power delta. |
 | `kd_deadband` | 30W | Ignore grid changes below this (noise filter). |
@@ -319,12 +317,9 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `max_feed_in` | 800W | Emergency threshold. |
 | `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
 
-### Asymmetric gain rationale
-The gains are intentionally asymmetric:
-- **Ramp up (kp_up=0.3, ki_up=0.03)**: Cautious. The device has 10-15s response latency.
-  Ramping up too fast causes overshoot into feed-in, wasting battery energy.
-- **Ramp down (kp_down=0.8, ki_down=0.08)**: Aggressive. When we're feeding in,
-  cut power immediately. Battery energy is too precious to waste on the grid.
+### Gain tuning
+Start with kp=0.3, ki=0.03.  The device has 10-15s response latency;
+Kp values above 1.0 risk oscillation with this latency.
 
 ### Device latency
 Measured at 10-15 seconds.  This is the time from sending a new

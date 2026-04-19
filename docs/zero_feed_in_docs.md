@@ -174,12 +174,12 @@ if |combined - last_output| > max_delta:
 Prevents PI windup when commanding steps larger than the device can deliver.
 Disabled by default (slew_rate = 0). Enable after measuring device step response.
 
-### Asymmetric Gains
+### Gains
 
-| Direction | Error | Kp | Ki | Rationale |
-| --- | --- | --- | --- | --- |
-| Ramp up (grid drawing) | > 0 | `kp_up` (0.3) | `ki_up` (0.03) | Cautious — avoid feeding in |
-| Ramp down (feeding in) | < 0 | `kp_down` (0.8) | `ki_down` (0.08) | Aggressive — battery is precious |
+| Parameter | Default | Rationale |
+| --- | --- | --- |
+| `kp` | 0.3 | Proportional gain |
+| `ki` | 0.03 | Integral gain |
 
 ### Anti-Windup (Back-Calculation)
 
@@ -289,7 +289,7 @@ flowchart TD
     J -- Yes --> K{"D-term fires?"}
     K -- Yes --> K2["D-only correction"]
     K -- No --> K3["Freeze PI, keep output"]
-    J -- No --> L["PID step: P + I + D<br>asymmetric gains"]
+    J -- No --> L["PID step: P + I + D"]
 
     K2 --> FF
     K3 --> FF
@@ -807,9 +807,9 @@ PI wants to charge → guard: SOC ≥ max → idle
 
 | Problem | Action |
 | --- | --- |
-| Output oscillates | Reduce kp_up (try 0.2), increase deadband |
-| Persistent offset | Increase ki_up (try 0.05) |
-| Sluggish on load changes | Increase kp_up (try 0.5), reduce interval |
+| Output oscillates | Reduce kp (try 0.2), increase deadband |
+| Persistent offset | Increase ki (try 0.05) |
+| Sluggish on load changes | Increase kp (try 0.5), reduce interval |
 | Relay clicks frequently | Increase direction_lockout (30+ s), lower adaptive_lockout_ref_w (100 W), increase deadband |
 | Mode flaps | Increase mode_hysteresis (80–100 W), increase charge_confirm (25 s) |
 | Relay switches on marginal surplus | Lower adaptive_lockout_ref_w, increase adaptive_lockout_max_mult |
@@ -822,5 +822,4 @@ PI wants to charge → guard: SOC ≥ max → idle
 - **Device response time**: 10–15 s (not 2–4 s as Zendure docs suggest)
 - **Flash writes**: `setOutputLimit`/`setInputLimit` may write to device flash
 - **Single phase**: SolarFlow feeds one phase; three-phase balancing at meter works
-- **No D-term**: PID would react faster to sudden load spikes
 - **Single instance only**: no multi-device HEMS support

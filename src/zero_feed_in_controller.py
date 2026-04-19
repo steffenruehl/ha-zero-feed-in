@@ -103,10 +103,10 @@ class Config:
     # Controller tuning
     discharge_target_w: float = 30.0
     charge_target_w: float = 0.0
-    kp_up: float = 0.3
-    kp_down: float = 0.8
-    ki_up: float = 0.03
-    ki_down: float = 0.08
+    kp: float = 0.3
+    """Proportional gain."""
+    ki: float = 0.03
+    """Integral gain."""
     deadband_w: float = 25.0
     interval_s: int = 5
 
@@ -176,10 +176,8 @@ class Config:
             charge_target_w=float(
                 args.get("charge_target_power", cls.charge_target_w)
             ),
-            kp_up=float(args.get("kp_up", args.get("kp", cls.kp_up))),
-            kp_down=float(args.get("kp_down", args.get("kp", cls.kp_down))),
-            ki_up=float(args.get("ki_up", args.get("ki", cls.ki_up))),
-            ki_down=float(args.get("ki_down", args.get("ki", cls.ki_down))),
+            kp=float(args.get("kp", cls.kp)),
+            ki=float(args.get("ki", cls.ki)),
             deadband_w=float(args.get("deadband", cls.deadband_w)),
             interval_s=int(args.get("interval", cls.interval_s)),
             max_discharge_w=float(args.get("max_output", cls.max_discharge_w)),
@@ -324,10 +322,7 @@ EMERGENCY_SAFETY_MARGIN_W = 50
 
 
 class PIController:
-    """PI controller with asymmetric gains and anti-windup back-calculation.
-
-    Asymmetric gains allow different response speeds for increasing
-    vs. decreasing power (e.g. ramp up slowly, ramp down fast).
+    """PI controller with anti-windup back-calculation.
 
     Anti-windup uses *back-calculation*: when the output saturates at
     ``output_min`` or ``output_max``, the integral term is
@@ -337,17 +332,13 @@ class PIController:
 
     def __init__(
         self,
-        kp_up: float,
-        kp_down: float,
-        ki_up: float,
-        ki_down: float,
+        kp: float,
+        ki: float,
         output_min: float,
         output_max: float,
     ) -> None:
-        self.kp_up: float = kp_up
-        self.kp_down: float = kp_down
-        self.ki_up: float = ki_up
-        self.ki_down: float = ki_down
+        self.kp: float = kp
+        self.ki: float = ki
         self.output_min: float = output_min
         self.output_max: float = output_max
 
@@ -369,13 +360,8 @@ class PIController:
             power, the proportional contribution, and the
             (possibly back-calculated) new integral value.
         """
-        if error >= 0:
-            kp, ki = self.kp_up, self.ki_up
-        else:
-            kp, ki = self.kp_down, self.ki_down
-
-        p_term = kp * error
-        new_integral = integral + ki * error * dt
+        p_term = self.kp * error
+        new_integral = integral + self.ki * error * dt
 
         output = p_term + new_integral
 
@@ -410,10 +396,8 @@ class ControlLogic:
         self.cfg = cfg
         self.state = ControllerState()
         self.pi = PIController(
-            kp_up=cfg.kp_up,
-            kp_down=cfg.kp_down,
-            ki_up=cfg.ki_up,
-            ki_down=cfg.ki_down,
+            kp=cfg.kp,
+            ki=cfg.ki,
             output_min=-cfg.max_charge_w,
             output_max=cfg.max_discharge_w,
         )

@@ -44,10 +44,8 @@ zero_feed_in_controller:
   charge_target_power: 0       # charge target (W)
   mode_hysteresis: 50          # Schmitt trigger band (W)
   charge_confirm: 20           # seconds surplus must hold before CHARGING
-  kp_up: 0.4
-  kp_down: 0.45
-  ki_up: 0.04
-  ki_down: 0.05
+  kp: 0.4
+  ki: 0.04
   deadband: 35
   interval: 5
 
@@ -56,7 +54,7 @@ zero_feed_in_controller:
   kd_deadband: 30
 
   # ── PV feed-forward (optional) ─────────────────────────
-  pv_sensor: sensor.q_home_pv_power
+  pv_sensor: sensor.solarstrom_switch_0_power
   ff_pv_gain: 0.6
   ff_pv_deadband: 20
 
