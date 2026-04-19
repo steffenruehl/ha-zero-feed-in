@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
+from src.csv_logger import CsvLogger
+
 if TYPE_CHECKING:
     import appdaemon.plugins.hass.hassapi as hass
 
@@ -130,6 +132,10 @@ class Config:
     sensor_prefix: str = "sensor.zfi"
     """Prefix for HA sensor entities published by this driver."""
 
+    # File logging
+    log_dir: str = ""
+    """Directory for CSV log files. Empty = file logging disabled."""
+
     @classmethod
     def from_args(cls, args: dict[str, object]) -> Config:
         """Map free-form AppDaemon ``args`` to typed ``Config`` fields."""
@@ -151,6 +157,7 @@ class Config:
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
+            log_dir=args.get("log_dir", cls.log_dir),
         )
 
 
@@ -160,6 +167,12 @@ RELAY_SAFETY_TIMEOUT_S = 300.0
 MIN_ACTIVE_POWER_W = 10
 """Minimum power in CHARGING/DISCHARGING states.  Below this the relay
 may switch, so we clamp to this floor while in an active state."""
+
+DRIVER_CSV_COLUMNS = [
+    "desired_w", "allowed_w", "discharge_limit_w", "charge_limit_w",
+    "sm_state", "sm_target", "device_mode",
+]
+"""Column names for driver CSV log (excluding timestamp)."""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -477,6 +490,16 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         self.cfg = Config.from_args(self.args)
         self.driver_state = DriverState()
 
+        # CSV file logger (disabled when log_dir is empty)
+        self._csv: CsvLogger | None = None
+        if self.cfg.log_dir:
+            self._csv = CsvLogger(
+                self.cfg.log_dir,
+                "zfi_driver",
+                DRIVER_CSV_COLUMNS,
+            )
+            self.log(f"CSV logging to {self.cfg.log_dir}/zfi_driver_*.csv")
+
         self.relay_sm = RelayStateMachine(
             idle_lockout_s=self.cfg.direction_lockout_s,
             charge_lockout=AdaptiveLockout(
@@ -606,6 +629,21 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         # Publish state machine sensors (debug only)
         if self.cfg.debug:
             self.relay_sm.publish()
+
+        # CSV file log
+        if self._csv is not None:
+            self._csv.log_row({
+                "desired_w": round(desired),
+                "allowed_w": round(allowed),
+                "discharge_limit_w": discharge_w,
+                "charge_limit_w": charge_w,
+                "sm_state": self.relay_sm.state.name,
+                "sm_target": (
+                    self.relay_sm._last_target.name
+                    if self.relay_sm._last_target else "none"
+                ),
+                "device_mode": device_mode,
+            })
 
     def _read_current_relay(self) -> RelayDirection:
         """Read the device's current AC mode entity and return as a ``RelayDirection``."""

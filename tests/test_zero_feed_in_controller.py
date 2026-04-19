@@ -540,17 +540,21 @@ class TestConfigFromArgs:
 
 class TestControlOutput:
     def test_from_raw(self):
-        out = ControlOutput.from_raw(200.0, 50.0, 150.0, "test")
+        out = ControlOutput.from_raw(200.0, 50.0, 10.0, 150.0, 5.0, "test")
         assert out.desired_power_w == 200.0
         assert out.p_term == 50.0
+        assert out.d_term == 10.0
         assert out.i_term == 150.0
+        assert out.ff_pv_term == 5.0
         assert out.reason == "test"
 
     def test_idle(self):
-        out = ControlOutput.idle(10.0, 20.0, "guard")
+        out = ControlOutput.idle(10.0, 5.0, 20.0, 3.0, "guard")
         assert out.desired_power_w == 0.0
         assert out.p_term == 10.0
+        assert out.d_term == 5.0
         assert out.i_term == 20.0
+        assert out.ff_pv_term == 3.0
         assert out.reason == "guard"
 
 
@@ -832,3 +836,320 @@ class TestControllerState:
         assert s.last_computed_w == 0.0
         assert s.mode == OperatingMode.DISCHARGING
         assert s.charge_pending_since is None
+        assert s.previous_grid_w is None
+        assert s.previous_pv_w is None
+
+
+# ═══════════════════════════════════════════════════════════
+#  D-term (derivative on grid delta)
+# ═══════════════════════════════════════════════════════════
+
+
+class TestDTerm:
+    def test_d_term_zero_on_first_cycle(self):
+        """No previous grid → D-term is 0."""
+        logic = make_logic(kd=0.3, kd_deadband_w=30, deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=200, soc_pct=50)
+        output = logic.compute(m, now=0)
+        assert output.d_term == 0.0
+
+    def test_d_term_fires_on_large_grid_step(self):
+        """Large grid delta → D-term is non-zero."""
+        logic = make_logic(kd=0.3, kd_deadband_w=30, deadband_w=0)
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=50, soc_pct=50)
+        logic.compute(m1, now=0)
+
+        # Grid jumps from 50 to 200 → delta=150, above deadband of 30
+        m2 = make_measurement(grid_power_w=200, soc_pct=50)
+        output = logic.compute(m2, now=5)
+        # D-term = 0.3 * 150 = 45
+        assert output.d_term == pytest.approx(45.0)
+
+    def test_d_term_ignored_within_deadband(self):
+        """Small grid delta within kd_deadband → D-term is 0."""
+        logic = make_logic(kd=0.3, kd_deadband_w=30, deadband_w=0)
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=100, soc_pct=50)
+        logic.compute(m1, now=0)
+
+        # Grid changes by only 20 → below kd_deadband of 30
+        m2 = make_measurement(grid_power_w=120, soc_pct=50)
+        output = logic.compute(m2, now=5)
+        assert output.d_term == 0.0
+
+    def test_d_term_fires_in_pi_deadband(self):
+        """D fires even when PI error is in deadband (hold region)."""
+        logic = make_logic(
+            kd=0.3, kd_deadband_w=30,
+            deadband_w=25, discharge_target_w=30,
+        )
+        logic.seed(None)
+        logic.state.last_computed_w = 100.0
+
+        # First tick to set previous_grid_w
+        m1 = make_measurement(grid_power_w=35, soc_pct=50)
+        logic.compute(m1, now=0)
+
+        # Grid jumps to 135 → delta=100 (above kd_deadband)
+        # But error = 135 - 30 = 105 → outside PI deadband
+        # Let's use a case where error IS in deadband but delta is large
+        # previous_grid is now 35
+        logic.state.last_computed_w = 100.0
+        # Grid jumps from 35 to 85 → delta=50, error=85-30=55 → outside deadband
+        # Need error in deadband: grid ~ target ± deadband
+        # error = grid - 30, |error| <= 25 → grid in [5, 55]
+        # So grid must be in [5, 55] but jump from 35 → at least +30 delta
+        # grid=35 → grid=68 → delta=33 > 30, error=68-30=38 > 25 → not in deadband
+
+        # Use a wider deadband or different approach
+        logic2 = make_logic(
+            kd=0.3, kd_deadband_w=30,
+            deadband_w=100, discharge_target_w=30,
+        )
+        logic2.seed(None)
+        logic2.state.last_computed_w = 100.0
+        m_a = make_measurement(grid_power_w=30, soc_pct=50)
+        logic2.compute(m_a, now=0)
+
+        # Grid jumps from 30 to 100 → delta=70 > 30, error=100-30=70 <= 100 (in deadband)
+        m_b = make_measurement(grid_power_w=100, soc_pct=50)
+        output = logic2.compute(m_b, now=5)
+        # D-term = 0.3 * 70 = 21, PI frozen → output = last_computed + d_term
+        assert output.d_term == pytest.approx(21.0)
+        assert output.desired_power_w == pytest.approx(100.0 + 21.0)
+
+    def test_d_term_negative_on_grid_drop(self):
+        """Grid drops → negative D-term."""
+        logic = make_logic(kd=0.3, kd_deadband_w=30, deadband_w=0)
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=200, soc_pct=50)
+        logic.compute(m1, now=0)
+
+        m2 = make_measurement(grid_power_w=100, soc_pct=50)
+        output = logic.compute(m2, now=5)
+        # D-term = 0.3 * (100 - 200) = -30
+        assert output.d_term == pytest.approx(-30.0)
+
+
+# ═══════════════════════════════════════════════════════════
+#  PV Feed-Forward
+# ═══════════════════════════════════════════════════════════
+
+
+class TestPVFeedForward:
+    def test_ff_zero_when_no_pv_sensor(self):
+        """No PV sensor → ff_pv_term is always 0."""
+        logic = make_logic(ff_pv_gain=0.6, deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50)
+        output = logic.compute(m, now=0)
+        assert output.ff_pv_term == 0.0
+
+    def test_ff_zero_on_first_cycle(self):
+        """First cycle with PV → no previous → ff = 0."""
+        logic = make_logic(ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
+        output = logic.compute(m, now=0)
+        assert output.ff_pv_term == 0.0
+
+    def test_ff_positive_on_pv_drop(self):
+        """PV drops → positive ff (need more discharge)."""
+        logic = make_logic(
+            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0, kd=0.0,
+        )
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
+        logic.compute(m1, now=0)
+
+        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=800)
+        output = logic.compute(m2, now=5)
+        # delta = 800 - 1000 = -200, ff = -0.6 * (-200) = 120
+        assert output.ff_pv_term == pytest.approx(120.0)
+
+    def test_ff_negative_on_pv_rise(self):
+        """PV rises → negative ff (can charge more)."""
+        logic = make_logic(
+            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0, kd=0.0,
+        )
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
+        logic.compute(m1, now=0)
+
+        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=700)
+        output = logic.compute(m2, now=5)
+        # delta = 700 - 500 = 200, ff = -0.6 * 200 = -120
+        assert output.ff_pv_term == pytest.approx(-120.0)
+
+    def test_ff_ignored_within_deadband(self):
+        """Small PV change within ff_pv_deadband → ff = 0."""
+        logic = make_logic(
+            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0, kd=0.0,
+        )
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
+        logic.compute(m1, now=0)
+
+        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1010)
+        output = logic.compute(m2, now=5)
+        assert output.ff_pv_term == 0.0
+
+    def test_ff_disabled_when_gain_zero(self):
+        """ff_pv_gain=0 → ff is always 0 regardless of PV change."""
+        logic = make_logic(
+            ff_pv_gain=0.0, ff_pv_deadband_w=20, deadband_w=0, kd=0.0,
+        )
+        logic.seed(None)
+        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
+        logic.compute(m1, now=0)
+
+        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
+        output = logic.compute(m2, now=5)
+        assert output.ff_pv_term == 0.0
+
+
+# ═══════════════════════════════════════════════════════════
+#  Slew Rate Limiter
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSlewRateLimiter:
+    def test_slew_disabled_when_zero(self):
+        """slew_rate_w_per_s=0 → no limiting."""
+        logic = make_logic(slew_rate_w_per_s=0.0, deadband_w=0, kd=0.0)
+        logic.seed(None)
+        logic.state.integral = 600.0
+        m = make_measurement(grid_power_w=500, soc_pct=50)
+        output = logic.compute(m, now=0)
+        # Should not be limited by slew rate
+        assert output.desired_power_w > 100
+
+    def test_slew_limits_large_increase(self):
+        """Large step up is limited by slew rate."""
+        logic = make_logic(
+            slew_rate_w_per_s=40.0, deadband_w=0, kd=0.0,
+            interval_s=5,
+        )
+        logic.seed(None)
+        # last_computed_w = 0, PI wants large positive output
+        logic.state.integral = 400.0
+        m = make_measurement(grid_power_w=300, soc_pct=50)
+        output = logic.compute(m, now=0)
+        # max_delta = 40 * 5 = 200, from 0 → max = 200
+        assert output.desired_power_w <= 200.0
+
+    def test_slew_limits_large_decrease(self):
+        """Large step down is limited by slew rate."""
+        logic = make_logic(
+            slew_rate_w_per_s=40.0, deadband_w=0, kd=0.0,
+            interval_s=5, max_discharge_w=800,
+        )
+        logic.seed(None)
+        logic.state.last_computed_w = 500.0
+        logic.state.integral = 0.0
+        # PI wants to go near 0 (grid near target)
+        m = make_measurement(grid_power_w=30, soc_pct=50)
+        output = logic.compute(m, now=0)
+        # max_delta = 200, from 500 → min = 300
+        assert output.desired_power_w >= 300.0
+
+    def test_slew_allows_small_changes(self):
+        """Small changes within slew rate pass through unchanged."""
+        logic = make_logic(
+            slew_rate_w_per_s=100.0, deadband_w=0, kd=0.0,
+            interval_s=5,
+        )
+        logic.seed(None)
+        logic.state.last_computed_w = 100.0
+        logic.state.integral = 100.0
+        # Small grid error → small change from 100
+        m = make_measurement(grid_power_w=50, soc_pct=50)
+        output = logic.compute(m, now=0)
+        # max_delta = 500, change should be within this
+        # PI output should be moderate, not slew limited
+
+
+# ═══════════════════════════════════════════════════════════
+#  Config.from_args — new fields
+# ═══════════════════════════════════════════════════════════
+
+
+class TestConfigFromArgsNewFields:
+    MINIMAL_ARGS = {
+        "grid_power_sensor": "sensor.grid",
+        "soc_sensor": "sensor.soc",
+        "battery_power_sensor": "sensor.battery",
+    }
+
+    def test_defaults_for_new_fields(self):
+        cfg = Config.from_args(self.MINIMAL_ARGS)
+        assert cfg.kd == 0.3
+        assert cfg.kd_deadband_w == 30.0
+        assert cfg.pv_sensor == ""
+        assert cfg.ff_pv_gain == 0.6
+        assert cfg.ff_pv_deadband_w == 20.0
+        assert cfg.slew_rate_w_per_s == 0.0
+
+    def test_custom_new_fields(self):
+        args = {
+            **self.MINIMAL_ARGS,
+            "kd": 0.5,
+            "kd_deadband": 50,
+            "pv_sensor": "sensor.pv",
+            "ff_pv_gain": 0.8,
+            "ff_pv_deadband": 30,
+            "slew_rate": 60,
+        }
+        cfg = Config.from_args(args)
+        assert cfg.kd == 0.5
+        assert cfg.kd_deadband_w == 50.0
+        assert cfg.pv_sensor == "sensor.pv"
+        assert cfg.ff_pv_gain == 0.8
+        assert cfg.ff_pv_deadband_w == 30.0
+        assert cfg.slew_rate_w_per_s == 60.0
+
+
+# ═══════════════════════════════════════════════════════════
+#  Previous state updated each cycle
+# ═══════════════════════════════════════════════════════════
+
+
+class TestPreviousStateUpdates:
+    def test_previous_grid_updated_after_compute(self):
+        logic = make_logic(deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=123.0, soc_pct=50)
+        logic.compute(m, now=0)
+        assert logic.state.previous_grid_w == 123.0
+
+    def test_previous_pv_updated_after_compute(self):
+        logic = make_logic(deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
+        logic.compute(m, now=0)
+        assert logic.state.previous_pv_w == 500.0
+
+    def test_previous_pv_none_when_no_sensor(self):
+        logic = make_logic(deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50)
+        logic.compute(m, now=0)
+        assert logic.state.previous_pv_w is None
+
+    def test_previous_grid_updated_on_emergency(self):
+        """Previous state is updated even when emergency fires."""
+        logic = make_logic(max_feed_in_w=800)
+        logic.state.last_computed_w = 500.0
+        m = make_measurement(grid_power_w=-1000, soc_pct=50)
+        logic.compute(m, now=0)
+        assert logic.state.previous_grid_w == -1000.0
+
+    def test_previous_grid_updated_on_guard(self):
+        """Previous state is updated even when a guard blocks output."""
+        logic = make_logic(min_soc_pct=10, deadband_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=200, soc_pct=10)
+        logic.compute(m, now=0)
+        assert logic.state.previous_grid_w == 200.0
