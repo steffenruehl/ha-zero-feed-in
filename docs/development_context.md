@@ -236,7 +236,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_discharge_limit` | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | Physical relay state from AC mode entity |
-| `zfi_relay_locked` | text | `true` when SM is clamping output (lockout active) |
+| `zfi_relay_locked` | text | `true` when SM is clamping output or relay is physically switching (8 s holdoff after SM transition) |
 | `zfi_relay_sm_state` | text | Current SM state (idle/charging/discharging) *(debug)* |
 | `zfi_relay_sm_pending` | text | Pending transition target (or "none") *(debug)* |
 | `zfi_relay_sm_lockout_pct` | % | Unified lockout progress for active transition *(debug)* |
@@ -258,6 +258,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Power limits always sent when values change (no mode gating)
 - Relay lockout uses driver's own tracking (not HA entity, which MQTT overwrites)
 - Driver publishes `sensor.zfi_relay_locked` (always, not debug-only) so the controller can freeze the integral during relay lockout
+- `relay_locked` stays `true` for 8 seconds after each SM transition (`RELAY_SWITCH_DELAY_S`) to account for physical relay switching time
 - Redundant sends suppressed (only send when values change)
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except

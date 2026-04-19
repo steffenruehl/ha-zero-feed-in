@@ -48,6 +48,10 @@ the relay may switch, so we clamp to this floor while in an active state."""
 RELAY_SAFETY_TIMEOUT_S = 600.0
 """Never lock the relay for more than this many seconds (failsafe)."""
 
+RELAY_SWITCH_DELAY_S = 8.0
+"""Holdoff after an SM transition: keep relay_locked=true for this long
+to let the physical relay finish switching."""
+
 
 
 class RelayDirection(Enum):
@@ -499,6 +503,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
     def initialize(self) -> None:
         self.cfg = Config.from_args(self.args)
         self.driver_state = DriverState()
+        self._last_sm_transition_t: float = -RELAY_SWITCH_DELAY_S
 
         # CSV file logger (disabled when log_dir is empty)
         self._csv: CsvLogger | None = None
@@ -588,7 +593,10 @@ class ZendureSolarFlowDriver(_HASS_BASE):
 
         # State machine decides allowed power
         if self.cfg.relay_sm_enabled:
+            prev_state = self.relay_sm.state
             allowed = self.relay_sm.update(desired, now)
+            if self.relay_sm.state != prev_state:
+                self._last_sm_transition_t = now
         else:
             allowed = desired
 
@@ -636,8 +644,11 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             self._read_current_relay().name.lower(),
             icon="mdi:electric-switch",
         )
-        # Signal to controller that the SM is clamping output
-        relay_locked = allowed != desired
+        # Signal to controller that the SM is clamping output or relay
+        # is still physically switching after an SM transition.
+        sm_clamping = allowed != desired
+        relay_switching = (now - self._last_sm_transition_t) < RELAY_SWITCH_DELAY_S
+        relay_locked = sm_clamping or relay_switching
         self._set_sensor(
             "relay_locked",
             str(relay_locked).lower(),

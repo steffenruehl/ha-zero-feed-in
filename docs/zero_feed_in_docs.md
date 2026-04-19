@@ -221,8 +221,11 @@ When output hits limits, `integral = limit - P_term`. Prevents windup during sat
 ### Relay Lockout Anti-Windup
 
 When the driver’s relay state machine is clamping output (e.g. during a relay
-transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.
-The controller reads this via the optional `relay_locked_sensor` config and
+transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.Additionally, `relay_locked` stays `true` for 8 seconds after each SM
+transition (`RELAY_SWITCH_DELAY_S`) to account for the physical relay
+switching time. This prevents the controller from winding up the integral
+while the relay is physically switching and the device cannot yet actuate
+the new setpoint.The controller reads this via the optional `relay_locked_sensor` config and
 **freezes the integral**: no new integral is committed, and no back-calculation
 is performed. The normal output pipeline still runs (P + I + FF → clamp), so
 the driver sees the controller’s intent, but the integral does not wind up
@@ -455,7 +458,7 @@ Published only when `debug: true` in the controller config.
 | `zfi_discharge_limit` | number | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
-| `zfi_relay_locked` | text | — | `true` when SM is clamping output (lockout active) |
+| `zfi_relay_locked` | text | — | `true` when SM is clamping output or relay is physically switching (8 s holdoff) |
 
 ### Driver sensors (debug only)
 

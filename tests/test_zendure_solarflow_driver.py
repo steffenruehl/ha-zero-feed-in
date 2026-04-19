@@ -15,6 +15,7 @@ from src.zendure_solarflow_driver import (
     DIRECTION_THRESHOLD_W,
     MIN_ACTIVE_POWER_W,
     RELAY_SAFETY_TIMEOUT_S,
+    RELAY_SWITCH_DELAY_S,
     ROUNDING_STEP_W,
     AdaptiveLockout,
     RelayDirection,
@@ -951,3 +952,102 @@ class TestUpdateReturnValues:
         result = sm.update(200.0, now=T0 + 30)
         assert sm.state == RelayState.DISCHARGING
         assert result == 200.0
+
+
+# ═══════════════════════════════════════════════════════════
+#  Relay switch delay holdoff
+# ═══════════════════════════════════════════════════════════
+
+
+def _sim_relay_locked(
+    sm: RelayStateMachine,
+    desired: float,
+    now: float,
+    last_transition_t: float,
+) -> tuple[bool, float]:
+    """Simulate the driver's relay_locked logic.
+
+    Returns (relay_locked, updated last_transition_t).
+    """
+    prev_state = sm.state
+    allowed = sm.update(desired, now)
+    if sm.state != prev_state:
+        last_transition_t = now
+    sm_clamping = allowed != desired
+    relay_switching = (now - last_transition_t) < RELAY_SWITCH_DELAY_S
+    relay_locked = sm_clamping or relay_switching
+    return relay_locked, last_transition_t
+
+
+class TestRelaySwitchDelay:
+    """Tests for the 8-second holdoff on relay_locked after SM transitions."""
+
+    def test_relay_locked_true_immediately_after_transition(self):
+        """relay_locked stays true right after SM transitions."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        last_t = -RELAY_SWITCH_DELAY_S  # no holdoff at start
+        # Request discharge until SM transitions
+        sm.update(200.0, now=T0)
+        locked, last_t = _sim_relay_locked(sm, 200.0, T0 + 30, last_t)
+        assert sm.state == RelayState.DISCHARGING
+        # SM just transitioned — allowed==desired but holdoff active
+        assert locked is True
+
+    def test_relay_locked_true_during_holdoff(self):
+        """relay_locked stays true within RELAY_SWITCH_DELAY_S of transition."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        last_t = -RELAY_SWITCH_DELAY_S
+        sm.update(200.0, now=T0)
+        _, last_t = _sim_relay_locked(sm, 200.0, T0 + 30, last_t)
+        # 7 seconds after transition — still within holdoff
+        locked, last_t = _sim_relay_locked(sm, 200.0, T0 + 30 + 7, last_t)
+        assert locked is True
+
+    def test_relay_locked_false_after_holdoff(self):
+        """relay_locked goes false once holdoff expires and SM is stable."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        last_t = -RELAY_SWITCH_DELAY_S
+        sm.update(200.0, now=T0)
+        _, last_t = _sim_relay_locked(sm, 200.0, T0 + 30, last_t)
+        # 8+ seconds after transition — holdoff expired
+        locked, last_t = _sim_relay_locked(sm, 200.0, T0 + 30 + RELAY_SWITCH_DELAY_S, last_t)
+        assert locked is False
+
+    def test_sm_clamping_overrides_holdoff(self):
+        """relay_locked is true when SM clamps, regardless of holdoff timer."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        last_t = -RELAY_SWITCH_DELAY_S
+        # SM is IDLE, request discharge — SM clamps to 0
+        locked, last_t = _sim_relay_locked(sm, 200.0, T0, last_t)
+        assert sm.state == RelayState.IDLE
+        assert locked is True
+
+    def test_no_holdoff_at_startup(self):
+        """No false holdoff when driver starts (initialized to -RELAY_SWITCH_DELAY_S)."""
+        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm.seed(RelayDirection.DISCHARGE)
+        last_t = -RELAY_SWITCH_DELAY_S
+        # Stable in DISCHARGING — no clamping, no holdoff
+        locked, last_t = _sim_relay_locked(sm, 200.0, T0, last_t)
+        assert locked is False
+
+    def test_holdoff_resets_on_each_transition(self):
+        """Each SM transition resets the holdoff timer."""
+        sm = make_sm(base_lockout_s=0.01, ref_w=200.0, idle_lockout_s=0.01)
+        last_t = -RELAY_SWITCH_DELAY_S
+        # Transition to DISCHARGING (near-zero lockout)
+        sm.update(200.0, now=T0)
+        _, last_t = _sim_relay_locked(sm, 200.0, T0 + 0.02, last_t)
+        assert sm.state == RelayState.DISCHARGING
+        t_first = last_t
+        # Wait out holdoff
+        locked, last_t = _sim_relay_locked(sm, 200.0, t_first + RELAY_SWITCH_DELAY_S, last_t)
+        assert locked is False
+        # Now transition to IDLE (need idle lockout to pass too)
+        t_idle_start = t_first + RELAY_SWITCH_DELAY_S + 1
+        sm.update(0.0, now=t_idle_start)
+        _, last_t = _sim_relay_locked(sm, 0.0, t_idle_start + 0.02, last_t)
+        assert sm.state == RelayState.IDLE
+        # Holdoff active again
+        locked, last_t = _sim_relay_locked(sm, 0.0, last_t + 1, last_t)
+        assert locked is True
