@@ -88,9 +88,18 @@ class AdaptiveLockout:
     _accumulated_ws: float = 0.0
     _last_tick_t: float = 0.0
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset accumulator (call on direction change or relay switch)."""
         self._accumulated_ws = 0.0
+        self._last_tick_t = 0.0
+
+    def pause(self) -> None:
+        """Pause accumulation without resetting progress.
+
+        Clears the last-tick timestamp so that when accumulation resumes,
+        the elapsed gap is not counted.  Call on accumulators whose target
+        is not currently active.
+        """
         self._last_tick_t = 0.0
 
     def tick(self, power_w: float, now: float) -> None:
@@ -112,6 +121,7 @@ class AdaptiveLockout:
         return self._accumulated_ws
 
     def threshold(self, base_s: float) -> float:
+        """Energy threshold (W·s) that must be accumulated before the lockout expires."""
         return self.full_power_w * base_s
 
 
@@ -361,44 +371,38 @@ class RelayStateMachine:
         if self._last_target is None:
             return 0.0, 0.0, 0.0
 
-        if self._last_target == RelayState.CHARGING:
-            al = self.charge_lockout
-            threshold = al.threshold(self.base_lockout_s)
-            pct = min(100, al.progress / max(1, threshold) * 100)
-            return pct, al.progress, threshold
-
-        if self._last_target == RelayState.DISCHARGING:
-            al = self.discharge_lockout
-            threshold = al.threshold(self.base_lockout_s)
-            pct = min(100, al.progress / max(1, threshold) * 100)
-            return pct, al.progress, threshold
-
         if self._last_target == RelayState.IDLE:
             pct = min(100, self._idle_accumulated_s / max(1, self.idle_lockout_s) * 100)
             return pct, self._idle_accumulated_s, self.idle_lockout_s
 
-        return 0.0, 0.0, 0.0
+        al = (
+            self.charge_lockout
+            if self._last_target == RelayState.CHARGING
+            else self.discharge_lockout
+        )
+        threshold = al.threshold(self.base_lockout_s)
+        pct = min(100, al.progress / max(1, threshold) * 100)
+        return pct, al.progress, threshold
 
     # ── Internal ──────────────────────────────────────────
 
     def _tick_target(self, target: RelayState, desired_w: float, now: float) -> None:
-        """Tick the accumulator for *target* and pause the others' tick clocks.
+        """Tick the accumulator for *target* and pause the other two.
 
-        Pausing means resetting ``_last_tick_t`` to 0 on the non-active
-        accumulators so that when we switch back to them later, the first
-        tick only sets the timestamp (no gap-time accumulation).
+        Each non-active accumulator is paused so that an idle gap does not
+        inflate its progress when it becomes active again.
         """
         if target == RelayState.IDLE:
             self._tick_idle(now)
-            self.charge_lockout._last_tick_t = 0.0
-            self.discharge_lockout._last_tick_t = 0.0
+            self.charge_lockout.pause()
+            self.discharge_lockout.pause()
         elif target == RelayState.CHARGING:
             self.charge_lockout.tick(desired_w, now)
-            self.discharge_lockout._last_tick_t = 0.0
+            self.discharge_lockout.pause()
             self._idle_last_tick_t = 0.0
         elif target == RelayState.DISCHARGING:
             self.discharge_lockout.tick(desired_w, now)
-            self.charge_lockout._last_tick_t = 0.0
+            self.charge_lockout.pause()
             self._idle_last_tick_t = 0.0
 
     def _tick_idle(self, now: float) -> None:

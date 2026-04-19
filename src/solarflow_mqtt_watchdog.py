@@ -32,15 +32,11 @@ Config (apps.yaml):
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
 
 try:
     import requests as _requests
 except ImportError:  # pragma: no cover
     _requests = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    import appdaemon.plugins.hass.hassapi as hass
 
 try:
     import appdaemon.plugins.hass.hassapi as hass
@@ -138,16 +134,3 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         except Exception as exc:  # noqa: BLE001
             self.log(f"Reconnect failed: {exc}", level="ERROR")
 
-    # ── Optional: status check ────────────────────────────────────────
-
-    def _check_mqtt_status(self) -> bool | None:
-        """Return True/False/None for the device's MQTT connected state."""
-        if _requests is None:
-            return None
-        url = f"http://{self._solarflow_ip}/rpc?method=HA.Mqtt.GetStatus"
-        try:
-            resp = _requests.get(url, timeout=5)
-            data = resp.json()
-            return bool(data.get("connected"))
-        except Exception:  # noqa: BLE001
-            return None

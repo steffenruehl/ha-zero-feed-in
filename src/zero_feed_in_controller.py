@@ -38,6 +38,9 @@ UNAVAILABLE_STATES = {None, "unknown", "unavailable"}
 DEFAULT_SENSOR_PREFIX = "sensor.zfi"
 """Prefix for HA entities published by this controller."""
 
+EMERGENCY_SAFETY_MARGIN_W = 50
+"""Extra margin subtracted from the forced output during an emergency clamp (W)."""
+
 CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
@@ -442,9 +445,6 @@ class ControllerState:
     """Current operating mode (Schmitt trigger output)."""
     charge_pending_since: float | None = None
     """Monotonic timestamp when charge-mode candidacy started, or None."""
-
-
-EMERGENCY_SAFETY_MARGIN_W = 50
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1172,16 +1172,9 @@ class ZeroFeedInController(_HASS_BASE):
         self._set_sensor(
             "integral", round(self.logic.state.integral), "W", "mdi:sigma"
         )
+        target_w = self.logic.target_for_mode()
+        self._set_sensor("target", round(target_w), "W", "mdi:target")
         self._set_sensor(
-            "target",
-            round(self.logic.target_for_mode()),
-            "W",
-            "mdi:target",
-        )
-        self._set_sensor(
-            "error",
-            round(m.grid_power_w - self.logic.target_for_mode()),
-            "W",
-            "mdi:delta",
+            "error", round(m.grid_power_w - target_w), "W", "mdi:delta"
         )
         self._set_sensor("reason", output.reason, icon="mdi:information-outline")
