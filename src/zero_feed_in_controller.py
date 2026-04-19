@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
@@ -39,9 +39,9 @@ DEFAULT_SENSOR_PREFIX = "sensor.zfi"
 """Prefix for HA entities published by this controller."""
 
 CONTROLLER_CSV_COLUMNS = [
-    "grid_w", "soc_pct", "battery_power_w", "pv_power_w",
+    "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
-    "p_term", "i_term", "ff_pv_term",
+    "p_term", "i_term", "ff_term",
     "integral", "target_w", "error_w", "reason",
 ]
 """Column names for controller CSV log (excluding timestamp)."""
@@ -110,6 +110,28 @@ class PIGainSet:
 
 
 @dataclass
+class FeedForwardSource:
+    """A single feed-forward input source.
+
+    Each source tracks a HA sensor entity and applies a gain-scaled
+    delta to the control output.  The ``sign`` field determines the
+    effect direction:
+
+    * ``-1.0`` for generation (PV): drop → increase discharge.
+    * ``+1.0`` for loads (wallbox, dryer): increase → increase discharge.
+    """
+
+    entity: str
+    """HA sensor entity ID."""
+    gain: float
+    """Fraction of delta to apply (0.0–1.0)."""
+    sign: float
+    """+1.0 for loads, -1.0 for generation."""
+    previous_w: float | None = None
+    """Sensor reading from the previous cycle. None until first reading."""
+
+
+@dataclass
 class Config:
     """Typed, validated configuration loaded from ``apps.yaml``.
 
@@ -144,6 +166,11 @@ class Config:
     charge_switch: str | None = None
     discharge_switch: str | None = None
 
+    # Relay lockout feedback from driver
+    relay_locked_sensor: str | None = None
+    """HA entity published by the driver when the relay SM is clamping output.
+    When 'true', the controller freezes the integral to prevent windup."""
+
     # Controller tuning
     discharge_target_w: float = 30.0
     charge_target_w: float = 0.0
@@ -166,13 +193,13 @@ class Config:
     deadband_w: float = 25.0
     interval_s: int = 5
 
-    # PV feed-forward
-    pv_sensor: str = ""
-    """HA entity for PV power (W). Empty = disabled."""
-    ff_pv_gain: float = 0.6
-    """Fraction of PV change applied as correction. 0 = disabled."""
-    ff_pv_deadband_w: float = 20.0
-    """Ignore PV changes below this (MPPT noise filter)."""
+    # Feed-forward
+    ff_enabled: bool = True
+    """Master switch to enable/disable feed-forward compensation."""
+    ff_deadband_w: float = 20.0
+    """Ignore total FF correction below this threshold (W)."""
+    ff_sources: tuple[FeedForwardSource, ...] = ()
+    """Feed-forward input sources (PV, loads, etc.). Empty = FF disabled."""
 
     # Power limits
     max_discharge_w: float = 800.0
@@ -221,6 +248,7 @@ class Config:
             ac_mode_entity=args.get("ac_mode_entity"),
             charge_switch=args.get("charge_switch"),
             discharge_switch=args.get("discharge_switch"),
+            relay_locked_sensor=args.get("relay_locked_sensor"),
             discharge_target_w=float(
                 args.get("target_grid_power", cls.discharge_target_w)
             ),
@@ -244,11 +272,9 @@ class Config:
             emergency_kp_mult=float(
                 args.get("emergency_kp_multiplier", cls.emergency_kp_mult)
             ),
-            pv_sensor=args.get("pv_sensor", cls.pv_sensor),
-            ff_pv_gain=float(args.get("ff_pv_gain", cls.ff_pv_gain)),
-            ff_pv_deadband_w=float(
-                args.get("ff_pv_deadband", cls.ff_pv_deadband_w)
-            ),
+            ff_enabled=bool(args.get("ff_enabled", cls.ff_enabled)),
+            ff_deadband_w=float(args.get("ff_deadband", cls.ff_deadband_w)),
+            ff_sources=cls._parse_ff_sources(args),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
@@ -289,6 +315,38 @@ class Config:
             "ki_charge_down": ki,
         }
 
+    @classmethod
+    def _parse_ff_sources(
+        cls, args: dict[str, object],
+    ) -> tuple[FeedForwardSource, ...]:
+        """Parse feed-forward sources from args.
+
+        Supports the new ``feed_forward_sources`` list format and the
+        legacy ``pv_sensor`` / ``ff_pv_gain`` / ``ff_pv_deadband``
+        single-source shorthand.
+        """
+        raw = args.get("feed_forward_sources")
+        if raw is not None:
+            return tuple(
+                FeedForwardSource(
+                    entity=src["entity"],
+                    gain=float(src.get("gain", 0.6)),
+                    sign=float(src.get("sign", -1.0)),
+                )
+                for src in raw
+            )
+        # Backward compat: old pv_sensor key
+        pv_sensor = args.get("pv_sensor", "")
+        if pv_sensor:
+            return (
+                FeedForwardSource(
+                    entity=pv_sensor,
+                    gain=float(args.get("ff_pv_gain", 0.6)),
+                    sign=-1.0,
+                ),
+            )
+        return ()
+
 
 @dataclass
 class Measurement:
@@ -309,12 +367,14 @@ class Measurement:
     """Battery state of charge in percent (0–100)."""
     battery_power_w: float
     """Actual battery power (W).  +discharge / -charge."""
-    pv_power_w: float | None = None
-    """PV production (W). Always >= 0. None if sensor not configured."""
+    ff_readings: dict[str, float | None] = field(default_factory=dict)
+    """Sensor readings for feed-forward sources, keyed by entity ID."""
     discharge_enabled: bool = True
     """Whether the user's discharge switch (``input_boolean``) is on."""
     charge_enabled: bool = True
     """Whether the user's charge switch (``input_boolean``) is on."""
+    relay_locked: bool = False
+    """Whether the driver's relay SM is clamping output (lockout active)."""
 
 
 @dataclass
@@ -332,8 +392,8 @@ class ControlOutput:
     """Proportional term of the PI output (W)."""
     i_term: float
     """Integral term of the PI output (W)."""
-    ff_pv_term: float
-    """PV feed-forward term (W)."""
+    ff_term: float
+    """Feed-forward term (W). Sum of all FF sources."""
     reason: str
     """Human-readable decision reason (e.g. 'EMERGENCY', 'SOC too low')."""
 
@@ -342,7 +402,7 @@ class ControlOutput:
         raw: float,
         p_term: float,
         i_term: float,
-        ff_pv_term: float,
+        ff_term: float,
         reason: str,
     ) -> ControlOutput:
         """Construct from a raw (possibly clamped) power value."""
@@ -350,16 +410,16 @@ class ControlOutput:
             desired_power_w=raw,
             p_term=p_term,
             i_term=i_term,
-            ff_pv_term=ff_pv_term,
+            ff_term=ff_term,
             reason=reason,
         )
 
     @staticmethod
     def idle(
-        p_term: float, i_term: float, ff_pv_term: float, reason: str,
+        p_term: float, i_term: float, ff_term: float, reason: str,
     ) -> ControlOutput:
         """Shorthand for a zero-power (idle) output with a guard reason."""
-        return ControlOutput.from_raw(0.0, p_term, i_term, ff_pv_term, reason)
+        return ControlOutput.from_raw(0.0, p_term, i_term, ff_term, reason)
 
 
 @dataclass
@@ -382,11 +442,78 @@ class ControllerState:
     """Current operating mode (Schmitt trigger output)."""
     charge_pending_since: float | None = None
     """Monotonic timestamp when charge-mode candidacy started, or None."""
-    previous_pv_w: float | None = None
-    """PV power from previous cycle (W). Used for PV feed-forward."""
 
 
 EMERGENCY_SAFETY_MARGIN_W = 50
+
+
+# ═══════════════════════════════════════════════════════════
+#  Feed-Forward (pure computation)
+# ═══════════════════════════════════════════════════════════
+
+
+class FeedForward:
+    """Multi-source feed-forward compensation.
+
+    Tracks an arbitrary number of ``FeedForwardSource`` instances.
+    Each cycle, the HA adapter passes a ``{entity: reading}`` dict and
+    this class computes the total correction (sign × gain × delta).
+    A deadband is applied to the **sum** of all sources, not per-source.
+
+    First-cycle bootstrap: sources whose ``previous_w`` is still
+    ``None`` contribute 0 and are silently initialised.
+    """
+
+    def __init__(
+        self,
+        sources: tuple[FeedForwardSource, ...],
+        deadband_w: float = 20.0,
+        enabled: bool = True,
+    ) -> None:
+        self._sources: list[FeedForwardSource] = [
+            FeedForwardSource(
+                entity=s.entity,
+                gain=s.gain,
+                sign=s.sign,
+            )
+            for s in sources
+        ]
+        self._deadband_w = deadband_w
+        self._enabled = enabled
+
+    @property
+    def entities(self) -> list[str]:
+        """Return entity IDs that the HA adapter must read each cycle."""
+        return [s.entity for s in self._sources]
+
+    def compute(self, readings: dict[str, float | None]) -> float:
+        """Compute total feed-forward correction.
+
+        For each source, the delta from the previous reading is
+        scaled by ``sign × gain`` and added to the total.
+        A deadband is applied to the sum: if ``|total| < deadband_w``
+        the correction is suppressed to zero.
+        Returns 0.0 when disabled.
+        """
+        if not self._enabled:
+            return 0.0
+        total = 0.0
+        for src in self._sources:
+            current = readings.get(src.entity)
+            if current is None or src.previous_w is None:
+                continue
+            delta = current - src.previous_w
+            total += src.sign * src.gain * delta
+        if abs(total) < self._deadband_w:
+            return 0.0
+        return total
+
+    def update_previous(self, readings: dict[str, float | None]) -> None:
+        """Update previous-cycle readings for all sources."""
+        for src in self._sources:
+            current = readings.get(src.entity)
+            if current is not None:
+                src.previous_w = current
 
 
 # ═══════════════════════════════════════════════════════════
@@ -479,9 +606,14 @@ class ControlLogic:
             output_min=-cfg.max_charge_w,
             output_max=cfg.max_discharge_w,
         )
+        self.ff = FeedForward(
+            cfg.ff_sources,
+            deadband_w=cfg.ff_deadband_w,
+            enabled=cfg.ff_enabled,
+        )
         self._last_p = 0.0
         self._last_i = 0.0
-        self._last_ff_pv = 0.0
+        self._last_ff = 0.0
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -527,7 +659,7 @@ class ControlLogic:
         emergency = self._check_emergency(m)
         if emergency is not None:
             self.state.last_computed_w = emergency.desired_power_w
-            self._update_previous(m)
+            self.ff.update_previous(m.ff_readings)
             return emergency
 
         self._update_operating_mode(surplus, now)
@@ -537,42 +669,42 @@ class ControlLogic:
         pi_out, p_term, new_integral = self._run_pi(error)
         self._last_p = p_term
 
-        ff_pv = self._compute_pv_feed_forward(m.pv_power_w)
-        self._last_ff_pv = ff_pv
+        ff = self.ff.compute(m.ff_readings)
+        self._last_ff = ff
 
-        combined = pi_out + ff_pv
+        combined = pi_out + ff
 
         guarded = self._apply_guards(combined, m, surplus)
         if guarded is not None:
             # Don't commit integral — freeze PI while guard blocks output
             self._last_i = self.state.integral
             self.state.last_computed_w = guarded.desired_power_w
-            self._update_previous(m)
+            self.ff.update_previous(m.ff_readings)
             return guarded
 
-        # Commit PI state
-        self.state.integral = new_integral
-        self._last_i = new_integral
+        # Commit PI state (unless relay is locked — freeze to prevent windup)
+        if m.relay_locked:
+            self._last_i = self.state.integral
+        else:
+            self.state.integral = new_integral
+            self._last_i = new_integral
 
         clamped = self._clamp(combined, surplus)
 
         # Anti-windup: back-calculate integral when surplus/power clamp active
-        if clamped != combined:
+        if clamped != combined and not m.relay_locked:
             self.state.integral = clamped - p_term
             self._last_i = self.state.integral
 
-        reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name})"
+        suffix = " (relay locked)" if m.relay_locked else ""
+        reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name}){suffix}"
         output = ControlOutput.from_raw(
             clamped, self._last_p, self._last_i,
-            self._last_ff_pv, reason,
+            self._last_ff, reason,
         )
         self.state.last_computed_w = output.desired_power_w
-        self._update_previous(m)
+        self.ff.update_previous(m.ff_readings)
         return output
-
-    def _update_previous(self, m: Measurement) -> None:
-        """Update previous-cycle state for PV feed-forward."""
-        self.state.previous_pv_w = m.pv_power_w
 
     def _check_emergency(self, m: Measurement) -> ControlOutput | None:
         """Detect excessive grid feed-in and force a reduced setpoint.
@@ -617,26 +749,6 @@ class ControlLogic:
             gains=gains,
         )
         return pi_output, p_term, new_integral
-
-    def _compute_pv_feed_forward(self, pv_power: float | None) -> float:
-        """True feed-forward from PV production changes.
-
-        PV drops → positive term (need more discharge / less charge).
-        PV rises → negative term (can charge more / discharge less).
-        """
-        if pv_power is None:
-            return 0.0
-
-        prev = self.state.previous_pv_w
-        if prev is None:
-            return 0.0
-
-        delta = pv_power - prev
-        if abs(delta) < self.cfg.ff_pv_deadband_w:
-            return 0.0
-
-        return -self.cfg.ff_pv_gain * delta
-
 
     def _update_operating_mode(self, surplus: float, now: float) -> None:
         """Schmitt trigger with charge-confirmation delay.
@@ -707,30 +819,30 @@ class ControlLogic:
         if raw_limit > 0 and not m.discharge_enabled:
             return ControlOutput.idle(
                 self._last_p, self._last_i,
-                self._last_ff_pv, "Discharge disabled",
+                self._last_ff, "Discharge disabled",
             )
         if raw_limit < 0 and not m.charge_enabled:
             return ControlOutput.idle(
                 self._last_p, self._last_i,
-                self._last_ff_pv, "Charge disabled",
+                self._last_ff, "Charge disabled",
             )
 
         if raw_limit > 0 and m.soc_pct <= self.cfg.min_soc_pct:
             return ControlOutput.idle(
                 self._last_p, self._last_i,
-                self._last_ff_pv, "SOC too low",
+                self._last_ff, "SOC too low",
             )
 
         if raw_limit < 0:
             if surplus <= 0:
                 return ControlOutput.idle(
                     self._last_p, self._last_i,
-                    self._last_ff_pv, "No surplus, charge blocked",
+                    self._last_ff, "No surplus, charge blocked",
                 )
             if m.soc_pct >= self.cfg.max_soc_pct:
                 return ControlOutput.idle(
                     self._last_p, self._last_i,
-                    self._last_ff_pv, "SOC full",
+                    self._last_ff, "SOC full",
                 )
 
         return None
@@ -811,7 +923,8 @@ class ZeroFeedInController(_HASS_BASE):
             f"dis_dn=({self.cfg.kp_discharge_down:.2f},{self.cfg.ki_discharge_down:.3f}) "
             f"chg_up=({self.cfg.kp_charge_up:.2f},{self.cfg.ki_charge_up:.3f}) "
             f"chg_dn=({self.cfg.kp_charge_down:.2f},{self.cfg.ki_charge_down:.3f}) "
-            f"ff_pv_gain={self.cfg.ff_pv_gain} "
+            f"ff_sources={len(self.cfg.ff_sources)} "
+            f"ff_enabled={self.cfg.ff_enabled} "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -836,8 +949,10 @@ class ZeroFeedInController(_HASS_BASE):
             entities["charge_switch"] = self.cfg.charge_switch
         if self.cfg.discharge_switch:
             entities["discharge_switch"] = self.cfg.discharge_switch
-        if self.cfg.pv_sensor:
-            entities["pv_sensor"] = self.cfg.pv_sensor
+        if self.cfg.relay_locked_sensor:
+            entities["relay_locked"] = self.cfg.relay_locked_sensor
+        for entity in self.logic.ff.entities:
+            entities[f"ff:{entity}"] = entity
         for label, entity_id in entities.items():
             raw = self.get_state(entity_id)
             if raw in UNAVAILABLE_STATES:
@@ -909,17 +1024,27 @@ class ZeroFeedInController(_HASS_BASE):
             # Signed sensor: +discharge/-charge (no transformation)
             battery_power = bp
 
-        # Read optional PV sensor
-        pv = self._read_float(self.cfg.pv_sensor) if self.cfg.pv_sensor else None
+        # Read feed-forward sensor readings
+        ff_readings: dict[str, float | None] = {}
+        for entity in self.logic.ff.entities:
+            ff_readings[entity] = self._read_float(entity)
 
         return Measurement(
             grid_power_w=grid,
             soc_pct=soc,
             battery_power_w=battery_power,
-            pv_power_w=pv,
+            ff_readings=ff_readings,
             discharge_enabled=self._is_switch_on(self.cfg.discharge_switch),
             charge_enabled=self._is_switch_on(self.cfg.charge_switch),
+            relay_locked=self._is_relay_locked(),
         )
+
+    def _is_relay_locked(self) -> bool:
+        """Return True if the driver's relay SM is clamping output."""
+        entity = self.cfg.relay_locked_sensor
+        if entity is None:
+            return False
+        return self.get_state(entity) == "true"
 
     def _is_switch_on(self, entity: str | None) -> bool:
         """Return True if the switch entity is on, or if no entity is configured."""
@@ -947,7 +1072,7 @@ class ZeroFeedInController(_HASS_BASE):
             f"mode={self.logic.state.mode.name} "
             f"{power_str} | "
             f"P={output.p_term:.0f} I={output.i_term:.0f} "
-            f"FF={output.ff_pv_term:.0f} | "
+            f"FF={output.ff_term:.0f} | "
             f"{output.reason}"
         )
 
@@ -962,13 +1087,12 @@ class ZeroFeedInController(_HASS_BASE):
             "grid_w": round(m.grid_power_w),
             "soc_pct": round(m.soc_pct, 1),
             "battery_power_w": round(m.battery_power_w),
-            "pv_power_w": round(m.pv_power_w) if m.pv_power_w is not None else "",
             "surplus_w": round(surplus),
             "mode": self.logic.state.mode.name,
             "desired_power_w": round(output.desired_power_w),
             "p_term": round(output.p_term),
             "i_term": round(output.i_term),
-            "ff_pv_term": round(output.ff_pv_term),
+            "ff_term": round(output.ff_term),
             "integral": round(self.logic.state.integral),
             "target_w": round(target),
             "error_w": round(m.grid_power_w - target),
@@ -1040,7 +1164,7 @@ class ZeroFeedInController(_HASS_BASE):
         self._set_sensor("p_term", round(output.p_term), "W", "mdi:alpha-p-box")
         self._set_sensor("i_term", round(output.i_term), "W", "mdi:alpha-i-box")
         self._set_sensor(
-            "ff_pv", round(output.ff_pv_term), "W", "mdi:solar-power-variant",
+            "ff", round(output.ff_term), "W", "mdi:flash",
         )
         self._set_sensor(
             "integral", round(self.logic.state.integral), "W", "mdi:sigma"
@@ -1056,11 +1180,5 @@ class ZeroFeedInController(_HASS_BASE):
             round(m.grid_power_w - self.logic.target_for_mode()),
             "W",
             "mdi:delta",
-        )
-        self._set_sensor(
-            "pv_power",
-            round(m.pv_power_w or 0),
-            "W",
-            "mdi:solar-panel",
         )
         self._set_sensor("reason", output.reason, icon="mdi:information-outline")

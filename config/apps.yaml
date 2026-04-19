@@ -39,6 +39,9 @@ zero_feed_in_controller:
   charge_switch: input_boolean.zfi_charge_enabled
   discharge_switch: input_boolean.zfi_discharge_enabled
 
+  # ── Relay lockout feedback (from driver) ────────────────
+  relay_locked_sensor: sensor.zfi_relay_locked   # freeze integral during relay transitions
+
   # ── Controller tuning ───────────────────────────────────
   target_grid_power: 30        # discharge target (W)
   charge_target_power: 0       # charge target (W)
@@ -53,30 +56,75 @@ zero_feed_in_controller:
   # Formula: Kp = interval / (2 × T1), Ki = Kp / (4 × T1)
   #
   #   Quadrant          Physical action      T1     Kp    Ki
-  #   discharge_up      increase discharge   5.0s   0.50  0.025
-  #   discharge_down    decrease discharge   3.5s   0.71  0.051
-  #   charge_up         increase charge      7.5s   0.33  0.011
-  #   charge_down       decrease charge      5.5s   0.45  0.021
+  #   Quadrant          Physical action      T1     Kp    Ki
+  #   discharge_up      increase discharge   5.0s   0.25  0.012
+  #   discharge_down    decrease discharge   3.5s   0.35  0.025
+  #   charge_up         increase charge      7.5s   0.17  0.006
+  #   charge_down       decrease charge      5.5s   0.23  0.010
   #
   # Selection:
   #                     error >= 0            error < 0
   #   DISCHARGING       discharge_up          discharge_down
   #   CHARGING          charge_down           charge_up
   #
-  kp_discharge_up: 0.50
-  kp_discharge_down: 0.71
-  kp_charge_up: 0.33
-  kp_charge_down: 0.45
+  kp_discharge_up: 0.25
+  kp_discharge_down: 0.35
+  kp_charge_up: 0.17
+  kp_charge_down: 0.23
 
-  ki_discharge_up: 0.025
-  ki_discharge_down: 0.051
-  ki_charge_up: 0.011
-  ki_charge_down: 0.021
+  ki_discharge_up: 0.012
+  ki_discharge_down: 0.025
+  ki_charge_up: 0.006
+  ki_charge_down: 0.010
 
-  # ── PV feed-forward (optional) ─────────────────────────
-  pv_sensor: sensor.solarstrom_switch_0_power
-  ff_pv_gain: 0.6
-  ff_pv_deadband: 20
+  # ── Feed-forward sources (optional) ─────────────────────
+  # Each source tracks a sensor and applies sign × gain × delta.
+  # sign: -1.0 for generation (PV), +1.0 for loads (wallbox, dryer).
+  # Deadband is applied to the total sum, not per source.
+  ff_enabled: true              # set true to enable feed-forward
+  ff_deadband: 30               # ignore total FF below this (W)
+  feed_forward_sources:
+    - entity: sensor.solarstrom_switch_0_power
+      gain: 0.6
+      sign: -1.0          # PV drop → increase discharge
+    - entity: sensor.power_waschmaschine_active_power_3
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_trockner_active_power_4
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_sat_active_power_2
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_drucker_active_power
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_geschirrspuler_active_power_5
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_dampfgarer_active_power_6
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.power_office_steffen_active_power_7
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.solar_plug_1_active_power_8
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.solar_outlet_keller_active_power
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.heating_outlet_switch_0_power
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.car_power
+      gain: 0.7
+      sign: 1.0          # Load increase → increase discharge
+    - entity: sensor.brunnen_plug_power
+      gain: 0.9
+      sign: 1.0          # Load increase → increase discharge
+
+
 
   # ── Power limits ────────────────────────────────────────
   max_output: 1200             # max discharge (W)

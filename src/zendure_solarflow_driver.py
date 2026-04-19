@@ -636,6 +636,13 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             self._read_current_relay().name.lower(),
             icon="mdi:electric-switch",
         )
+        # Signal to controller that the SM is clamping output
+        relay_locked = allowed != desired
+        self._set_sensor(
+            "relay_locked",
+            str(relay_locked).lower(),
+            icon="mdi:lock" if relay_locked else "mdi:lock-open",
+        )
 
         # Publish state machine sensors (debug only)
         if self.cfg.debug:

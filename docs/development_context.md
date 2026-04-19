@@ -145,25 +145,30 @@ Enums:      OperatingMode (CHARGING, DISCHARGING)
 
 Dataclasses:
   Config          — typed config from apps.yaml
-  Measurement     — grid_power_w, soc_pct, battery_power_w, pv_power_w, switch states
-  ControlOutput   — desired_power_w, p/d/i/ff_pv terms, reason
-  ControllerState — integral, last_computed_w, mode, charge_pending_since,
-                    previous_grid_w, previous_pv_w
+  FeedForwardSource — entity, gain, sign, previous_w
+  Measurement     — grid_power_w, soc_pct, battery_power_w, ff_readings, switch states, relay_locked
+  ControlOutput   — desired_power_w, p/i/ff terms, reason
+  ControllerState — integral, last_computed_w, mode, charge_pending_since
 
-PIController:     — anti-windup back-calculation, gains supplied per call (PIGains)\n  PIGains:          — Kp/Ki pair for one quadrant\n  PIGainSet:        — four quadrant gain sets with select(mode, error)
+PIController:     — anti-windup back-calculation, gains supplied per call (PIGains)
+  PIGains:          — Kp/Ki pair for one quadrant
+  PIGainSet:        — four quadrant gain sets with select(mode, error)
+
+FeedForward:      — multi-source feed-forward compensation (deadband on sum)
+  entities          — list of entity IDs the HA adapter must read
+  compute()         — sum(sign × gain × delta), deadband on total
+  update_previous() — store current readings for next cycle
 
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
   estimate_surplus()            — -battery_power_w - grid_power_w
-  compute()                     — emergency → mode → PI+FF → guards → clamp
+  compute()                     — emergency → mode → PI+FF → guards → clamp → relay-lock freeze
   target_for_mode()             — active grid-power target
   _update_operating_mode()      — Schmitt trigger with charge confirmation
   _apply_guards()               — switches + SOC + grid-charge protection
   _clamp()                      — limit enforcement + surplus cap
   _check_emergency()            — feed-in protection
   _run_pi()                     — PI computation (without committing state)
-  _compute_pv_feed_forward()    — PV feed-forward compensation
-  _update_previous()            — update previous_pv_w
 
 ZeroFeedInController(hass.Hass): — thin HA adapter
   initialize()                  — config, seed, CsvLogger, schedule
@@ -219,9 +224,8 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_error` | W | Regulation error *(debug)* |
 | `zfi_p_term` | W | Proportional component *(debug)* |
 | `zfi_i_term` | W | Integral component *(debug)* |
-| `zfi_ff_pv` | W | PV feed-forward component *(debug)* |
+| `zfi_ff` | W | Feed-forward component *(debug)* |
 | `zfi_integral` | W | Integral accumulator *(debug)* |
-| `zfi_pv_power` | W | PV production reading *(debug)* |
 | `zfi_reason` | text | Decision reason *(debug)* |
 
 ### Driver sensors
@@ -232,6 +236,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_discharge_limit` | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | Physical relay state from AC mode entity |
+| `zfi_relay_locked` | text | `true` when SM is clamping output (lockout active) |
 | `zfi_relay_sm_state` | text | Current SM state (idle/charging/discharging) *(debug)* |
 | `zfi_relay_sm_pending` | text | Pending transition target (or "none") *(debug)* |
 | `zfi_relay_sm_lockout_pct` | % | Unified lockout progress for active transition *(debug)* |
@@ -246,12 +251,13 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Two-app architecture: controller + Zendure driver
 - Controller publishes `sensor.zfi_desired_power`, driver reads it
 - PI controller uses position form with anti-windup back-calculation
-- PV feed-forward: compensates solar changes before they appear at the grid meter
+- Multi-source feed-forward: compensates PV and load changes before they appear at the grid meter
 - Battery sensor convention: +discharge/-charge (read directly, no negation)
 - Surplus estimated from `battery_power_sensor`: `-battery_power_w - grid_power_w`
 - Driver sends AC mode once on intent change, retries after 30 s
 - Power limits always sent when values change (no mode gating)
 - Relay lockout uses driver's own tracking (not HA entity, which MQTT overwrites)
+- Driver publishes `sensor.zfi_relay_locked` (always, not debug-only) so the controller can freeze the integral during relay lockout
 - Redundant sends suppressed (only send when values change)
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
@@ -302,13 +308,14 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `ki_charge_up` | 0.011 | Integral gain: increase charge. |
 | `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
 | `deadband` | 25W | No action within this error range. |
-| `pv_sensor` | (empty) | PV entity (empty = FF disabled). |
-| `ff_pv_gain` | 0.6 | Fraction of PV change applied as FF correction. |
-| `ff_pv_deadband` | 20W | Ignore PV changes below this (MPPT noise filter). |
+| `feed_forward_sources` | (list) | Feed-forward sources: entity, gain, sign. |
+| `ff_enabled` | true | Master switch to enable/disable feed-forward. |
+| `ff_deadband` | 20W | Ignore total FF correction below this threshold. |
 | `target_grid_power` | 30W | Discharge target. Small grid draw as safety buffer. |
 | `charge_target_power` | 0W | Charge target. Absorb all surplus exactly. |
 | `mode_hysteresis` | 50W | Surplus band for mode switching. Increase if mode flaps. |
 | `charge_confirm` | 15s | Seconds surplus must hold before entering CHARGING. |
+| `relay_locked_sensor` | (none) | HA entity for relay lockout feedback from driver. |
 | `direction_lockout` | 5s | Min time between relay state changes. |
 | `max_output` | 800W | Legal BKW limit (2400W with electrician sign-off). |
 | `max_charge` | 2400W | AC charge limit. |

@@ -51,11 +51,11 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
 
 ```
 Controller (every 5s):
-  grid_power_sensor ────┐
-  soc_sensor ───────────┤──▸ PI + FF ──▸ sensor.zfi_desired_power
-  battery_power_sensor──┘               sensor.zfi_mode, surplus, etc.
-  pv_sensor (optional)──┘
-  battery_power_sensor┘         sensor.zfi_mode, surplus, etc.
+  grid_power_sensor ─────┐
+  soc_sensor ────────────┤
+  battery_power_sensor───┤──▸ PI + FF ──▸ sensor.zfi_desired_power
+  ff_sources (optional)──┤               sensor.zfi_mode, surplus, etc.
+  relay_locked_sensor────┘               (integral frozen when locked)
 
 Driver (every 2s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
@@ -153,15 +153,41 @@ pi_output = P + I
 
 NOT velocity/incremental form. Critical with the SolarFlow's 10-15 s response latency.
 
-### PV Feed-Forward
+### Multi-Source Feed-Forward
+
+The ``FeedForward`` class processes an arbitrary list of sensor sources.
+Each source has a sign (+1 for loads, -1 for generation) and a gain.
+A deadband is applied to the **total** correction, not per-source:
 
 ```
-ff_pv = -ff_pv_gain × (pv_power - previous_pv_power)   [deadband filtered]
-combined = pi_output + ff_pv
+total = 0
+for each source:
+    delta = current - previous
+    total += sign × gain × delta
+if |total| < ff_deadband:
+    total = 0
+combined = pi_output + total
 ```
 
-Reacts to PV changes (clouds, sunset) before they appear at the grid meter.
-PV drops → positive ff (increase discharge). PV rises → negative ff (increase charge).
+PV drops → positive ff (increase discharge). Load increases → positive ff.
+New sources are a YAML entry, no code changes required.
+Set ``ff_enabled: false`` to disable feed-forward without removing sources.
+
+Example configuration:
+```yaml
+ff_enabled: true
+ff_deadband: 20
+feed_forward_sources:
+  - entity: sensor.pv_power
+    gain: 0.6
+    sign: -1.0          # generation
+  - entity: sensor.wallbox_power
+    gain: 0.8
+    sign: 1.0           # load
+```
+
+Backward compatible: legacy ``pv_sensor`` / ``ff_pv_gain`` keys
+still work and create a single FF source automatically.
 
 ### Four-Quadrant Gains
 
@@ -185,6 +211,18 @@ Selection matrix:
 ### Anti-Windup (Back-Calculation)
 
 When output hits limits, `integral = limit - P_term`. Prevents windup during saturation.
+
+### Relay Lockout Anti-Windup
+
+When the driver’s relay state machine is clamping output (e.g. during a relay
+transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.
+The controller reads this via the optional `relay_locked_sensor` config and
+**freezes the integral**: no new integral is committed, and no back-calculation
+is performed. The normal output pipeline still runs (P + I + FF → clamp), so
+the driver sees the controller’s intent, but the integral does not wind up
+while the device cannot actuate.
+
+The reason string includes a " (relay locked)" suffix when active.
 
 ### Deadband
 
@@ -291,7 +329,7 @@ flowchart TD
     J -- No --> L["PI step: P + I"]
 
     K3 --> FF
-    L --> FF["PV feed-forward<br>ff_pv = -gain × PV delta"]
+    L --> FF["Feed-forward<br>sum(sign × gain × delta)<br>deadband on total"]
 
     FF --> N{"|raw| > 0?<br>(discharge)"}
     N -- Yes --> O{SOC ≤ min?}
@@ -399,9 +437,8 @@ Published only when `debug: true` in the controller config.
 | `zfi_error` | number | W | Regulation error |
 | `zfi_p_term` | number | W | Proportional component |
 | `zfi_i_term` | number | W | Integral component |
-| `zfi_ff_pv` | number | W | PV feed-forward component |
+| `zfi_ff` | number | W | Feed-forward component |
 | `zfi_integral` | number | W | Integral accumulator |
-| `zfi_pv_power` | number | W | PV production reading |
 | `zfi_reason` | text | — | Decision reason |
 
 ### Driver sensors (always published)
@@ -412,6 +449,7 @@ Published only when `debug: true` in the controller config.
 | `zfi_discharge_limit` | number | W | outputLimit sent (≥ 0) |
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
+| `zfi_relay_locked` | text | — | `true` when SM is clamping output (lockout active) |
 
 ### Driver sensors (debug only)
 
@@ -513,6 +551,8 @@ cards:
         name: Mode
       - entity: sensor.zfi_relay
         name: Relay
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
       - entity: sensor.zfi_surplus
         name: Surplus
       - entity: sensor.zfi_battery_power
@@ -585,6 +625,8 @@ cards:
     entities:
       - entity: sensor.zfi_mode
       - entity: sensor.zfi_reason
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
       - entity: sensor.hec4nencn492140_electriclevel
         name: SOC
       - entity: input_boolean.zfi_charge_enabled
@@ -631,6 +673,8 @@ cards:
         name: AC Mode (device)
       - entity: sensor.zfi_relay
         name: Relay (driver)
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
       - entity: sensor.zfi_desired_power
         name: Desired Power
       - entity: sensor.zfi_discharge_limit
@@ -664,6 +708,8 @@ cards:
         name: AC Mode (device)
       - entity: sensor.zfi_relay
         name: Relay (driver)
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
       - entity: sensor.zfi_desired_power
         name: Desired Power
       - entity: sensor.zfi_device_output
@@ -696,7 +742,7 @@ config/appdaemon/apps/
 | `grid_power_sensor` | Controller | `sensor.smart_meter_*` |
 | `soc_sensor` | Controller | `sensor.*_electriclevel` |
 | `battery_power_sensor` | Controller | `sensor.*_net_power` (template or helper) |
-| `pv_sensor` | Controller | `sensor.*_pv_power` (optional, enables feed-forward) |
+| `pv_sensor` | Controller | Legacy PV entity (use `feed_forward_sources` instead) |
 | `desired_power_sensor` | Driver | `sensor.zfi_desired_power` (from controller) |
 | `output_limit_entity` | Driver | `number.*_outputlimit` |
 | `input_limit_entity` | Driver | `number.*_inputlimit` |

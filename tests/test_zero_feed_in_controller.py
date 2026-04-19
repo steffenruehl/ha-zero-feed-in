@@ -12,6 +12,8 @@ from src.zero_feed_in_controller import (
     ControlLogic,
     ControlOutput,
     ControllerState,
+    FeedForward,
+    FeedForwardSource,
     Measurement,
     OperatingMode,
     PIController,
@@ -419,6 +421,47 @@ class TestStateUpdates:
 
 
 # ═══════════════════════════════════════════════════════════
+#  Relay lockout — integral freeze
+# ═══════════════════════════════════════════════════════════
+
+
+class TestRelayLocked:
+    def test_integral_frozen_when_relay_locked(self):
+        """Relay locked → integral does not change, output still computed."""
+        logic = make_logic(deadband_w=0)
+        logic.seed(None)
+        logic.state.integral = 50.0
+        m = make_measurement(grid_power_w=200, soc_pct=50, relay_locked=True)
+        output = logic.compute(m, now=0)
+        # Output is still computed (non-zero), but integral is frozen
+        assert output.desired_power_w > 0
+        assert logic.state.integral == 50.0
+        assert "relay locked" in output.reason
+
+    def test_integral_committed_when_relay_unlocked(self):
+        """Relay not locked → integral updates normally."""
+        logic = make_logic(deadband_w=0)
+        logic.seed(None)
+        logic.state.integral = 50.0
+        m = make_measurement(grid_power_w=200, soc_pct=50, relay_locked=False)
+        output = logic.compute(m, now=0)
+        assert output.desired_power_w > 0
+        assert logic.state.integral != 50.0
+        assert "relay locked" not in output.reason
+
+    def test_no_anti_windup_back_calc_when_locked(self):
+        """When relay is locked and output is clamped, integral should NOT
+        be back-calculated — just frozen."""
+        logic = make_logic(deadband_w=0, max_discharge_w=100)
+        logic.seed(None)
+        logic.state.integral = 50.0
+        # Big error → output > 100 → would be clamped + back-calculated
+        m = make_measurement(grid_power_w=500, soc_pct=50, relay_locked=True)
+        logic.compute(m, now=0)
+        assert logic.state.integral == 50.0
+
+
+# ═══════════════════════════════════════════════════════════
 #  Config.from_args
 # ═══════════════════════════════════════════════════════════
 
@@ -459,6 +502,7 @@ class TestConfigFromArgs:
         assert cfg.ac_mode_entity is None
         assert cfg.charge_switch is None
         assert cfg.discharge_switch is None
+        assert cfg.relay_locked_sensor is None
 
     def test_custom_args_override_defaults(self):
         args = {
@@ -539,7 +583,7 @@ class TestControlOutput:
         assert out.desired_power_w == 200.0
         assert out.p_term == 50.0
         assert out.i_term == 150.0
-        assert out.ff_pv_term == 5.0
+        assert out.ff_term == 5.0
         assert out.reason == "test"
 
     def test_idle(self):
@@ -547,7 +591,7 @@ class TestControlOutput:
         assert out.desired_power_w == 0.0
         assert out.p_term == 10.0
         assert out.i_term == 20.0
-        assert out.ff_pv_term == 3.0
+        assert out.ff_term == 3.0
         assert out.reason == "guard"
 
 
@@ -829,90 +873,121 @@ class TestControllerState:
         assert s.last_computed_w == 0.0
         assert s.mode == OperatingMode.DISCHARGING
         assert s.charge_pending_since is None
-        assert s.previous_pv_w is None
 
 
 # ═══════════════════════════════════════════════════════════
-#  PV Feed-Forward
+#  FeedForward class
 # ═══════════════════════════════════════════════════════════
 
 
-class TestPVFeedForward:
-    def test_ff_zero_when_no_pv_sensor(self):
-        """No PV sensor → ff_pv_term is always 0."""
-        logic = make_logic(ff_pv_gain=0.6, deadband_w=0)
-        logic.seed(None)
-        m = make_measurement(grid_power_w=100, soc_pct=50)
-        output = logic.compute(m, now=0)
-        assert output.ff_pv_term == 0.0
+PV_SOURCE = FeedForwardSource(
+    entity="sensor.pv", gain=0.6, sign=-1.0,
+)
+LOAD_SOURCE = FeedForwardSource(
+    entity="sensor.wallbox", gain=0.8, sign=1.0,
+)
 
-    def test_ff_zero_on_first_cycle(self):
-        """First cycle with PV → no previous → ff = 0."""
-        logic = make_logic(ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0)
-        logic.seed(None)
-        m = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
-        output = logic.compute(m, now=0)
-        assert output.ff_pv_term == 0.0
 
-    def test_ff_positive_on_pv_drop(self):
-        """PV drops → positive ff (need more discharge)."""
-        logic = make_logic(
-            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0,
-        )
-        logic.seed(None)
-        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
-        logic.compute(m1, now=0)
+class TestFeedForward:
+    def test_no_sources(self):
+        """Empty sources → always 0."""
+        ff = FeedForward((), deadband_w=0)
+        assert ff.compute({}) == 0.0
+        assert ff.entities == []
 
-        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=800)
-        output = logic.compute(m2, now=5)
-        # delta = 800 - 1000 = -200, ff = -0.6 * (-200) = 120
-        assert output.ff_pv_term == pytest.approx(120.0)
+    def test_entities_property(self):
+        ff = FeedForward((PV_SOURCE, LOAD_SOURCE), deadband_w=0)
+        assert ff.entities == ["sensor.pv", "sensor.wallbox"]
 
-    def test_ff_negative_on_pv_rise(self):
+    def test_first_cycle_returns_zero(self):
+        """No previous reading → ff = 0, but previous is stored."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        readings = {"sensor.pv": 1000.0}
+        assert ff.compute(readings) == 0.0
+        ff.update_previous(readings)
+        # Now previous is set
+        assert ff._sources[0].previous_w == 1000.0
+
+    def test_pv_drop_positive_correction(self):
+        """PV drops → positive ff (increase discharge)."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff.update_previous({"sensor.pv": 1000.0})
+        # delta = 800 - 1000 = -200, sign=-1.0, gain=0.6
+        # ff = -1.0 * 0.6 * (-200) = 120
+        assert ff.compute({"sensor.pv": 800.0}) == pytest.approx(120.0)
+
+    def test_pv_rise_negative_correction(self):
         """PV rises → negative ff (can charge more)."""
-        logic = make_logic(
-            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0,
+        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff.update_previous({"sensor.pv": 500.0})
+        # delta = 700 - 500 = 200, sign=-1.0, gain=0.6
+        # ff = -1.0 * 0.6 * 200 = -120
+        assert ff.compute({"sensor.pv": 700.0}) == pytest.approx(-120.0)
+
+    def test_deadband_filters_small_total(self):
+        """Total FF within deadband → ff = 0."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=20)
+        ff.update_previous({"sensor.pv": 1000.0})
+        # delta = 10, sign=-1.0, gain=0.6 → total = 6 < deadband 20
+        assert ff.compute({"sensor.pv": 1010.0}) == 0.0
+
+    def test_load_increase_positive_correction(self):
+        """Wallbox starts → positive ff (increase discharge)."""
+        ff = FeedForward((LOAD_SOURCE,), deadband_w=0)
+        ff.update_previous({"sensor.wallbox": 0.0})
+        # delta = 3000, sign=1.0, gain=0.8 → ff = 2400
+        assert ff.compute({"sensor.wallbox": 3000.0}) == pytest.approx(2400.0)
+
+    def test_multiple_sources_sum(self):
+        """Multiple sources are summed."""
+        ff = FeedForward((PV_SOURCE, LOAD_SOURCE), deadband_w=0)
+        ff.update_previous({"sensor.pv": 1000.0, "sensor.wallbox": 0.0})
+        # PV drops 200: -1.0 * 0.6 * (-200) = 120
+        # Load rises 500: 1.0 * 0.8 * 500 = 400
+        result = ff.compute({"sensor.pv": 800.0, "sensor.wallbox": 500.0})
+        assert result == pytest.approx(520.0)
+
+    def test_unavailable_sensor_skipped(self):
+        """None reading → source skipped, no crash."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff.update_previous({"sensor.pv": 1000.0})
+        assert ff.compute({"sensor.pv": None}) == 0.0
+
+    def test_update_previous_ignores_none(self):
+        """None reading does not overwrite previous."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff.update_previous({"sensor.pv": 1000.0})
+        ff.update_previous({"sensor.pv": None})
+        assert ff._sources[0].previous_w == 1000.0
+
+    def test_gain_zero_always_zero(self):
+        """gain=0 → ff is always 0 regardless of delta."""
+        src = FeedForwardSource(
+            entity="sensor.pv", gain=0.0, sign=-1.0,
         )
-        logic.seed(None)
-        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
-        logic.compute(m1, now=0)
+        ff = FeedForward((src,), deadband_w=0)
+        ff.update_previous({"sensor.pv": 1000.0})
+        assert ff.compute({"sensor.pv": 500.0}) == 0.0
 
-        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=700)
-        output = logic.compute(m2, now=5)
-        # delta = 700 - 500 = 200, ff = -0.6 * 200 = -120
-        assert output.ff_pv_term == pytest.approx(-120.0)
+    def test_disabled_returns_zero(self):
+        """enabled=False → ff always 0 even with large deltas."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, enabled=False)
+        ff.update_previous({"sensor.pv": 1000.0})
+        assert ff.compute({"sensor.pv": 500.0}) == 0.0
 
-    def test_ff_ignored_within_deadband(self):
-        """Small PV change within ff_pv_deadband → ff = 0."""
-        logic = make_logic(
-            ff_pv_gain=0.6, ff_pv_deadband_w=20, deadband_w=0,
-        )
-        logic.seed(None)
-        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
-        logic.compute(m1, now=0)
-
-        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1010)
-        output = logic.compute(m2, now=5)
-        assert output.ff_pv_term == 0.0
-
-    def test_ff_disabled_when_gain_zero(self):
-        """ff_pv_gain=0 → ff is always 0 regardless of PV change."""
-        logic = make_logic(
-            ff_pv_gain=0.0, ff_pv_deadband_w=20, deadband_w=0,
-        )
-        logic.seed(None)
-        m1 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=1000)
-        logic.compute(m1, now=0)
-
-        m2 = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
-        output = logic.compute(m2, now=5)
-        assert output.ff_pv_term == 0.0
-
+    def test_deadband_on_sum_not_per_source(self):
+        """Two small deltas that individually are below deadband but sum above."""
+        src_a = FeedForwardSource(entity="sensor.a", gain=1.0, sign=1.0)
+        src_b = FeedForwardSource(entity="sensor.b", gain=1.0, sign=1.0)
+        ff = FeedForward((src_a, src_b), deadband_w=20)
+        ff.update_previous({"sensor.a": 0.0, "sensor.b": 0.0})
+        # Each delta is 15, sum = 30 > deadband 20
+        assert ff.compute({"sensor.a": 15.0, "sensor.b": 15.0}) == pytest.approx(30.0)
 
 
 
 # ═══════════════════════════════════════════════════════════
-#  Config.from_args — new fields
+#  Config.from_args — feed-forward parsing
 # ═══════════════════════════════════════════════════════════
 
 
@@ -923,57 +998,115 @@ class TestConfigFromArgsNewFields:
         "battery_power_sensor": "sensor.battery",
     }
 
-    def test_defaults_for_new_fields(self):
+    def test_defaults_no_ff_sources(self):
+        """No FF config → empty ff_sources, ff_enabled=True, ff_deadband=20."""
         cfg = Config.from_args(self.MINIMAL_ARGS)
-        assert cfg.pv_sensor == ""
-        assert cfg.ff_pv_gain == 0.6
-        assert cfg.ff_pv_deadband_w == 20.0
+        assert cfg.ff_sources == ()
+        assert cfg.ff_enabled is True
+        assert cfg.ff_deadband_w == 20.0
 
-    def test_custom_new_fields(self):
+    def test_legacy_pv_sensor_compat(self):
+        """Legacy pv_sensor key creates one FF source."""
         args = {
             **self.MINIMAL_ARGS,
             "pv_sensor": "sensor.pv",
             "ff_pv_gain": 0.8,
-            "ff_pv_deadband": 30,
         }
         cfg = Config.from_args(args)
-        assert cfg.pv_sensor == "sensor.pv"
-        assert cfg.ff_pv_gain == 0.8
-        assert cfg.ff_pv_deadband_w == 30.0
+        assert len(cfg.ff_sources) == 1
+        src = cfg.ff_sources[0]
+        assert src.entity == "sensor.pv"
+        assert src.gain == 0.8
+        assert src.sign == -1.0
+
+    def test_new_feed_forward_sources(self):
+        """New feed_forward_sources list is parsed correctly."""
+        args = {
+            **self.MINIMAL_ARGS,
+            "feed_forward_sources": [
+                {"entity": "sensor.pv", "gain": 0.6, "sign": -1.0},
+                {"entity": "sensor.wallbox", "gain": 0.8, "sign": 1.0},
+            ],
+        }
+        cfg = Config.from_args(args)
+        assert len(cfg.ff_sources) == 2
+        assert cfg.ff_sources[0].entity == "sensor.pv"
+        assert cfg.ff_sources[0].sign == -1.0
+        assert cfg.ff_sources[1].entity == "sensor.wallbox"
+        assert cfg.ff_sources[1].sign == 1.0
+
+    def test_feed_forward_sources_takes_priority_over_pv_sensor(self):
+        """New-style key wins over legacy pv_sensor."""
+        args = {
+            **self.MINIMAL_ARGS,
+            "pv_sensor": "sensor.old_pv",
+            "feed_forward_sources": [
+                {"entity": "sensor.new_pv", "gain": 0.5, "sign": -1.0},
+            ],
+        }
+        cfg = Config.from_args(args)
+        assert len(cfg.ff_sources) == 1
+        assert cfg.ff_sources[0].entity == "sensor.new_pv"
+
+    def test_ff_enabled_flag(self):
+        """ff_enabled parsed from args."""
+        args = {**self.MINIMAL_ARGS, "ff_enabled": False}
+        cfg = Config.from_args(args)
+        assert cfg.ff_enabled is False
+
+    def test_ff_deadband_from_args(self):
+        """ff_deadband parsed from args."""
+        args = {**self.MINIMAL_ARGS, "ff_deadband": 50}
+        cfg = Config.from_args(args)
+        assert cfg.ff_deadband_w == 50.0
 
 
 # ═══════════════════════════════════════════════════════════
-#  Previous state updated each cycle
+#  FF previous state updated each cycle
 # ═══════════════════════════════════════════════════════════
+
+
+PV_FF = (FeedForwardSource(entity="sensor.pv", gain=0.6, sign=-1.0),)
 
 
 class TestPreviousStateUpdates:
-    def test_previous_pv_updated_after_compute(self):
-        logic = make_logic(deadband_w=0)
+    def test_previous_updated_after_compute(self):
+        """After a normal cycle the FF source tracks the reading."""
+        logic = make_logic(deadband_w=0, ff_sources=PV_FF)
         logic.seed(None)
-        m = make_measurement(grid_power_w=100, soc_pct=50, pv_power_w=500)
+        m = make_measurement(
+            grid_power_w=100, soc_pct=50,
+            ff_readings={"sensor.pv": 500.0},
+        )
         logic.compute(m, now=0)
-        assert logic.state.previous_pv_w == 500.0
+        assert logic.ff._sources[0].previous_w == 500.0
 
-    def test_previous_pv_none_when_no_sensor(self):
+    def test_previous_none_when_no_sources(self):
+        """No sources configured → nothing to track."""
         logic = make_logic(deadband_w=0)
         logic.seed(None)
         m = make_measurement(grid_power_w=100, soc_pct=50)
         logic.compute(m, now=0)
-        assert logic.state.previous_pv_w is None
+        assert logic.ff._sources == []
 
-    def test_previous_pv_updated_on_emergency(self):
+    def test_previous_updated_on_emergency(self):
         """Previous state is updated even when emergency fires."""
-        logic = make_logic(max_feed_in_w=800, pv_sensor="sensor.pv")
+        logic = make_logic(max_feed_in_w=800, ff_sources=PV_FF)
         logic.state.last_computed_w = 500.0
-        m = make_measurement(grid_power_w=-1000, soc_pct=50, pv_power_w=2000)
+        m = make_measurement(
+            grid_power_w=-1000, soc_pct=50,
+            ff_readings={"sensor.pv": 2000.0},
+        )
         logic.compute(m, now=0)
-        assert logic.state.previous_pv_w == 2000.0
+        assert logic.ff._sources[0].previous_w == 2000.0
 
-    def test_previous_pv_updated_on_guard(self):
+    def test_previous_updated_on_guard(self):
         """Previous state is updated even when a guard blocks output."""
-        logic = make_logic(min_soc_pct=10, deadband_w=0, pv_sensor="sensor.pv")
+        logic = make_logic(min_soc_pct=10, deadband_w=0, ff_sources=PV_FF)
         logic.seed(None)
-        m = make_measurement(grid_power_w=200, soc_pct=10, pv_power_w=500)
+        m = make_measurement(
+            grid_power_w=200, soc_pct=10,
+            ff_readings={"sensor.pv": 500.0},
+        )
         logic.compute(m, now=0)
-        assert logic.state.previous_pv_w == 500.0
+        assert logic.ff._sources[0].previous_w == 500.0
