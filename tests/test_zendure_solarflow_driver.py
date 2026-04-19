@@ -41,6 +41,7 @@ def make_sm(
     base_lockout_s: float = 30.0,
     idle_lockout_s: float = 5.0,
     ref_w: float = 200.0,
+    min_active_power_w: float = MIN_ACTIVE_POWER_W,
     log_fn=None,
 ) -> RelayStateMachine:
     """Create a RelayStateMachine with test defaults."""
@@ -49,6 +50,7 @@ def make_sm(
         charge_lockout=AdaptiveLockout(full_power_w=ref_w),
         discharge_lockout=AdaptiveLockout(full_power_w=ref_w),
         base_lockout_s=base_lockout_s,
+        min_active_power_w=min_active_power_w,
         log_fn=log_fn,
     )
 
@@ -429,9 +431,9 @@ class TestSafetyTimeout:
 
     def test_safety_timeout_forces_transition(self):
         """Even at low power, safety timeout fires after RELAY_SAFETY_TIMEOUT_S."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
-        # 11 W is above DIRECTION_THRESHOLD_W (10) but needs 6000/11 ≈ 545s
-        # to settle naturally — well above the 300s safety cap.
+        sm = make_sm(base_lockout_s=60.0, ref_w=200.0)
+        # 11 W is above DIRECTION_THRESHOLD_W (10) but needs 12000/11 ≈ 1091s
+        # to settle naturally — well above the safety cap.
         sm.update(11.0, now=T0)
         sm.update(11.0, now=T0 + RELAY_SAFETY_TIMEOUT_S - 1)
         assert sm.state == RelayState.IDLE
@@ -439,7 +441,7 @@ class TestSafetyTimeout:
         assert sm.state == RelayState.DISCHARGING
 
     def test_safety_timeout_on_charge(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm(base_lockout_s=60.0, ref_w=200.0)
         sm.update(-11.0, now=T0)
         sm.update(-11.0, now=T0 + RELAY_SAFETY_TIMEOUT_S)
         assert sm.state == RelayState.CHARGING

@@ -31,4 +31,4 @@ relay off: 4
 1200 -> 100 2; 4
 
 
-note: lower discharge chrage limit is 25 w, not 10
+large variance, maybe due to measurement updates

@@ -97,6 +97,7 @@ zendure_solarflow_driver:
   direction_lockout: 30        # base relay lockout (s)
   relay_sm_enabled: true        # set false to disable state machine
   adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
+  min_active_power_w: 25       # minimum power floor in active states (W)
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false

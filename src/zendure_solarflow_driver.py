@@ -38,6 +38,13 @@ AC_MODE_OUTPUT = "Output mode"
 AC_MODE_RETRY_S = 30
 """Re-send AC mode command if device hasn't confirmed after this many seconds."""
 
+MIN_ACTIVE_POWER_W = 25
+"""Default minimum power in CHARGING/DISCHARGING states (W).  Below this
+the relay may switch, so we clamp to this floor while in an active state."""
+
+RELAY_SAFETY_TIMEOUT_S = 600.0
+"""Never lock the relay for more than this many seconds (failsafe)."""
+
 
 
 class RelayDirection(Enum):
@@ -125,6 +132,9 @@ class Config:
     """If False, bypass the relay state machine entirely."""
     adaptive_lockout_ref_w: float = 200.0
     """Reference power for full-speed adaptive lockout (W)."""
+    min_active_power_w: float = MIN_ACTIVE_POWER_W
+    """Minimum power floor in active relay states (W). Below this the
+    device may idle, so the SM clamps to at least this value."""
     dry_run: bool = True
     """If True, compute but do not send commands to the device."""
     debug: bool = False
@@ -154,19 +164,15 @@ class Config:
             adaptive_lockout_ref_w=float(
                 args.get("adaptive_lockout_ref_w", cls.adaptive_lockout_ref_w)
             ),
+            min_active_power_w=float(
+                args.get("min_active_power_w", cls.min_active_power_w)
+            ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
             log_dir=args.get("log_dir", cls.log_dir),
         )
 
-
-RELAY_SAFETY_TIMEOUT_S = 300.0
-"""Never lock the relay for more than this many seconds (failsafe)."""
-
-MIN_ACTIVE_POWER_W = 10
-"""Minimum power in CHARGING/DISCHARGING states.  Below this the relay
-may switch, so we clamp to this floor while in an active state."""
 
 DRIVER_CSV_COLUMNS = [
     "desired_w", "allowed_w", "discharge_limit_w", "charge_limit_w",
@@ -189,8 +195,8 @@ class RelayState(Enum):
 class RelayStateMachine:
     """Guards relay transitions so the physical relay doesn't chatter.
 
-    Three states: IDLE (power=0), CHARGING (≥10 W charge),
-    DISCHARGING (≥10 W discharge).
+    Three states: IDLE (power=0), CHARGING (≥min_active_power_w charge),
+    DISCHARGING (≥min_active_power_w discharge).
 
     Transition rules:
       - → CHARGING:    adaptive energy integrator must reach threshold
@@ -217,6 +223,7 @@ class RelayStateMachine:
         charge_lockout: AdaptiveLockout,
         discharge_lockout: AdaptiveLockout,
         base_lockout_s: float,
+        min_active_power_w: float = MIN_ACTIVE_POWER_W,
         log_fn=None,
         publish_fn=None,
     ):
@@ -224,6 +231,7 @@ class RelayStateMachine:
         self.charge_lockout = charge_lockout
         self.discharge_lockout = discharge_lockout
         self.base_lockout_s = base_lockout_s
+        self.min_active_power_w = min_active_power_w
         self._log = log_fn
         self._publish = publish_fn
 
@@ -251,8 +259,8 @@ class RelayStateMachine:
 
         The returned power respects the current state constraints:
           - IDLE → always 0
-          - CHARGING → clamp to [-max, -MIN_ACTIVE_POWER_W]
-          - DISCHARGING → clamp to [+MIN_ACTIVE_POWER_W, +max]
+          - CHARGING → clamp to [-max, -min_active_power_w]
+          - DISCHARGING → clamp to [+min_active_power_w, +max]
 
         Each non-current state's accumulator is ticked independently;
         switching targets does not reset the other accumulators.
@@ -415,18 +423,17 @@ class RelayStateMachine:
 
     def _clamp(self, desired_w: float) -> float:
         """Clamp power to the current state's constraints."""
-        return self._clamp_for_state(self.state, desired_w)
+        return self._clamp_for_state(self.state, desired_w, self.min_active_power_w)
 
     @staticmethod
-    def _clamp_for_state(state: RelayState, desired_w: float) -> float:
+    def _clamp_for_state(state: RelayState, desired_w: float, min_power_w: float = MIN_ACTIVE_POWER_W) -> float:
+        """Clamp *desired_w* to the floor for *state*."""
         if state == RelayState.IDLE:
             return 0.0
         if state == RelayState.CHARGING:
-            # Charging: desired is negative; floor at -MIN_ACTIVE_POWER_W
-            return min(-MIN_ACTIVE_POWER_W, desired_w)
+            return min(-min_power_w, desired_w)
         if state == RelayState.DISCHARGING:
-            # Discharging: desired is positive; floor at +MIN_ACTIVE_POWER_W
-            return max(MIN_ACTIVE_POWER_W, desired_w)
+            return max(min_power_w, desired_w)
         return 0.0
 
     @staticmethod
@@ -509,6 +516,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
                 full_power_w=self.cfg.adaptive_lockout_ref_w,
             ),
             base_lockout_s=self.cfg.direction_lockout_s,
+            min_active_power_w=self.cfg.min_active_power_w,
             log_fn=self.log,
             publish_fn=self._set_sensor,
         )

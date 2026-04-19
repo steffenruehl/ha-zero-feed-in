@@ -230,7 +230,7 @@ IDLE transitions use an accumulated-time lockout (`idle_lockout_s`): time is onl
 
 A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
-During lockout, power is **clamped** to the current direction's minimum active power (`MIN_ACTIVE_POWER_W = 10 W`), keeping the device responsive while preventing relay chatter.
+During lockout, power is **clamped** to the current direction's minimum active power (`min_active_power_w`, default 25 W), keeping the device responsive while preventing relay chatter.
 
 ### 4. Rounding and Suppression
 
@@ -247,7 +247,7 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
-The `RelayStateMachine` gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`MIN_ACTIVE_POWER_W`), keeping the device responsive.
+... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
 
 ### 3. SOC Protection
 
