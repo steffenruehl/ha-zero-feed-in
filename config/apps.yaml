@@ -143,6 +143,26 @@ zero_feed_in_controller:
   log_dir: /config/logs          # CSV file logging (empty = disabled)
 
 # ──────────────────────────────────────────────────────────
+#  SolarFlow MQTT Watchdog
+# ──────────────────────────────────────────────────────────
+solarflow_mqtt_watchdog:
+  module: solarflow_mqtt_watchdog
+  class: SolarFlowMqttWatchdog
+
+  solarflow_ip:   !secret solarflow_ip
+  serial_number:  !secret solarflow_serial
+  mqtt_broker_ip: !secret mqtt_broker_ip
+  mqtt_port:      1883
+  mqtt_username:  !secret mqtt_username
+  mqtt_password:  !secret mqtt_password
+
+  watch_entity:          sensor.hec4nencn492140_electriclevel
+  unavailable_duration_s: 120          # Reconnect nach 2 min unavailable
+  startup_delay_s:        30           # Warten auf Mosquitto nach HA-Start
+
+  dry_run: false
+
+# ──────────────────────────────────────────────────────────
 #  Zendure SolarFlow Driver
 # ──────────────────────────────────────────────────────────
 zendure_solarflow_driver:
