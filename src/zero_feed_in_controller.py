@@ -41,7 +41,7 @@ DEFAULT_SENSOR_PREFIX = "sensor.zfi"
 CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w", "pv_power_w",
     "surplus_w", "mode", "desired_power_w",
-    "p_term", "d_term", "i_term", "ff_pv_term",
+    "p_term", "i_term", "ff_pv_term",
     "integral", "target_w", "error_w", "reason",
 ]
 """Column names for controller CSV log (excluding timestamp)."""
@@ -166,12 +166,6 @@ class Config:
     deadband_w: float = 25.0
     interval_s: int = 5
 
-    # D-term
-    kd: float = 0.3
-    """Derivative gain on grid power delta."""
-    kd_deadband_w: float = 30.0
-    """Ignore grid changes smaller than this (noise filter)."""
-
     # PV feed-forward
     pv_sensor: str = ""
     """HA entity for PV power (W). Empty = disabled."""
@@ -179,10 +173,6 @@ class Config:
     """Fraction of PV change applied as correction. 0 = disabled."""
     ff_pv_deadband_w: float = 20.0
     """Ignore PV changes below this (MPPT noise filter)."""
-
-    # Slew rate limiter
-    slew_rate_w_per_s: float = 0.0
-    """Maximum output change rate (W/s). 0 = disabled. Measure from step response."""
 
     # Power limits
     max_discharge_w: float = 800.0
@@ -254,15 +244,10 @@ class Config:
             emergency_kp_mult=float(
                 args.get("emergency_kp_multiplier", cls.emergency_kp_mult)
             ),
-            kd=float(args.get("kd", cls.kd)),
-            kd_deadband_w=float(args.get("kd_deadband", cls.kd_deadband_w)),
             pv_sensor=args.get("pv_sensor", cls.pv_sensor),
             ff_pv_gain=float(args.get("ff_pv_gain", cls.ff_pv_gain)),
             ff_pv_deadband_w=float(
                 args.get("ff_pv_deadband", cls.ff_pv_deadband_w)
-            ),
-            slew_rate_w_per_s=float(
-                args.get("slew_rate", cls.slew_rate_w_per_s)
             ),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
@@ -345,8 +330,6 @@ class ControlOutput:
     """Signed desired power (W).  +discharge / -charge."""
     p_term: float
     """Proportional term of the PI output (W)."""
-    d_term: float
-    """Derivative term of the PID output (W)."""
     i_term: float
     """Integral term of the PI output (W)."""
     ff_pv_term: float
@@ -358,7 +341,6 @@ class ControlOutput:
     def from_raw(
         raw: float,
         p_term: float,
-        d_term: float,
         i_term: float,
         ff_pv_term: float,
         reason: str,
@@ -367,7 +349,6 @@ class ControlOutput:
         return ControlOutput(
             desired_power_w=raw,
             p_term=p_term,
-            d_term=d_term,
             i_term=i_term,
             ff_pv_term=ff_pv_term,
             reason=reason,
@@ -375,10 +356,10 @@ class ControlOutput:
 
     @staticmethod
     def idle(
-        p_term: float, d_term: float, i_term: float, ff_pv_term: float, reason: str,
+        p_term: float, i_term: float, ff_pv_term: float, reason: str,
     ) -> ControlOutput:
         """Shorthand for a zero-power (idle) output with a guard reason."""
-        return ControlOutput.from_raw(0.0, p_term, d_term, i_term, ff_pv_term, reason)
+        return ControlOutput.from_raw(0.0, p_term, i_term, ff_pv_term, reason)
 
 
 @dataclass
@@ -401,8 +382,6 @@ class ControllerState:
     """Current operating mode (Schmitt trigger output)."""
     charge_pending_since: float | None = None
     """Monotonic timestamp when charge-mode candidacy started, or None."""
-    previous_grid_w: float | None = None
-    """Grid power from previous cycle (W). Used for D-term computation."""
     previous_pv_w: float | None = None
     """PV power from previous cycle (W). Used for PV feed-forward."""
 
@@ -501,7 +480,6 @@ class ControlLogic:
             output_max=cfg.max_discharge_w,
         )
         self._last_p = 0.0
-        self._last_d = 0.0
         self._last_i = 0.0
         self._last_ff_pv = 0.0
         self._log = log or (lambda msg: None)
@@ -530,7 +508,7 @@ class ControlLogic:
 
         Pipeline::
 
-            emergency check → mode update → PID + FF → slew → guards → clamp
+            emergency check → mode update → PI + FF → guards → clamp
 
         Args:
             m: Current sensor snapshot.
@@ -556,17 +534,15 @@ class ControlLogic:
         target = self.target_for_mode()
 
         error = m.grid_power_w - target
-        pid_out, p_term, d_term, new_integral = self._run_pid(error, m.grid_power_w)
+        pi_out, p_term, new_integral = self._run_pi(error)
         self._last_p = p_term
-        self._last_d = d_term
 
         ff_pv = self._compute_pv_feed_forward(m.pv_power_w)
         self._last_ff_pv = ff_pv
 
-        combined = pid_out + ff_pv
-        slew_limited = self._apply_slew_limit(combined)
+        combined = pi_out + ff_pv
 
-        guarded = self._apply_guards(slew_limited, m, surplus)
+        guarded = self._apply_guards(combined, m, surplus)
         if guarded is not None:
             # Don't commit integral — freeze PI while guard blocks output
             self._last_i = self.state.integral
@@ -578,16 +554,16 @@ class ControlLogic:
         self.state.integral = new_integral
         self._last_i = new_integral
 
-        clamped = self._clamp(slew_limited, surplus)
+        clamped = self._clamp(combined, surplus)
 
         # Anti-windup: back-calculate integral when surplus/power clamp active
-        if clamped != slew_limited:
+        if clamped != combined:
             self.state.integral = clamped - p_term
             self._last_i = self.state.integral
 
         reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name})"
         output = ControlOutput.from_raw(
-            clamped, self._last_p, self._last_d, self._last_i,
+            clamped, self._last_p, self._last_i,
             self._last_ff_pv, reason,
         )
         self.state.last_computed_w = output.desired_power_w
@@ -595,8 +571,7 @@ class ControlLogic:
         return output
 
     def _update_previous(self, m: Measurement) -> None:
-        """Update previous-cycle state for D-term and PV feed-forward."""
-        self.state.previous_grid_w = m.grid_power_w
+        """Update previous-cycle state for PV feed-forward."""
         self.state.previous_pv_w = m.pv_power_w
 
     def _check_emergency(self, m: Measurement) -> ControlOutput | None:
@@ -617,33 +592,22 @@ class ControlLogic:
         forced = max(0.0, self.state.last_computed_w - excess - EMERGENCY_SAFETY_MARGIN_W)
         # Back-calculate integral so PI resumes smoothly (p_term = 0)
         self.state.integral = forced
-        return ControlOutput.from_raw(forced, 0.0, 0.0, forced, 0.0, "EMERGENCY")
+        return ControlOutput.from_raw(forced, 0.0, forced, 0.0, "EMERGENCY")
 
-    def _run_pid(
-        self, error: float, grid_power: float,
-    ) -> tuple[float, float, float, float]:
-        """Compute PID output without committing state.
+    def _run_pi(
+        self, error: float,
+    ) -> tuple[float, float, float]:
+        """Compute PI output without committing state.
 
-        If the error is within the deadband, the PI is frozen but the
-        D-term can still fire on large grid deltas (load steps).
+        If the error is within the deadband, the PI is frozen and
+        the last computed output is held.
 
         Returns:
-            ``(output, p_term, d_term, new_integral)`` — caller decides
+            ``(output, p_term, new_integral)`` — caller decides
             whether to commit ``new_integral`` to ``self.state``.
         """
-        d_term = self._compute_d_term(grid_power)
-
         if abs(error) <= self.cfg.deadband_w:
-            # Even in deadband, D can fire (large load step)
-            if d_term == 0:
-                return self.state.last_computed_w, 0.0, 0.0, self.state.integral
-            # D-only correction while PI is frozen
-            return (
-                self.state.last_computed_w + d_term,
-                0.0,
-                d_term,
-                self.state.integral,
-            )
+            return self.state.last_computed_w, 0.0, self.state.integral
 
         gains = self.gains.select(self.state.mode, error)
         pi_output, p_term, new_integral = self.pi.update(
@@ -652,23 +616,7 @@ class ControlLogic:
             dt=self.cfg.interval_s,
             gains=gains,
         )
-        return pi_output + d_term, p_term, d_term, new_integral
-
-    def _compute_d_term(self, grid_power: float) -> float:
-        """Compute the derivative term from grid power change.
-
-        Reacts to rate-of-change of the grid signal — load steps
-        produce a large instantaneous delta that D catches immediately.
-        """
-        prev = self.state.previous_grid_w
-        if prev is None:
-            return 0.0
-
-        delta = grid_power - prev
-        if abs(delta) < self.cfg.kd_deadband_w:
-            return 0.0
-
-        return self.cfg.kd * delta
+        return pi_output, p_term, new_integral
 
     def _compute_pv_feed_forward(self, pv_power: float | None) -> float:
         """True feed-forward from PV production changes.
@@ -689,23 +637,6 @@ class ControlLogic:
 
         return -self.cfg.ff_pv_gain * delta
 
-    def _apply_slew_limit(self, raw: float) -> float:
-        """Limit output change rate to match device ramp capability.
-
-        Prevents PI integral windup when commanding steps larger than the
-        device can deliver in one cycle.
-        """
-        if self.cfg.slew_rate_w_per_s <= 0:
-            return raw
-
-        max_delta = self.cfg.slew_rate_w_per_s * self.cfg.interval_s
-        delta = raw - self.state.last_computed_w
-
-        if abs(delta) <= max_delta:
-            return raw
-
-        sign = 1.0 if delta > 0 else -1.0
-        return self.state.last_computed_w + sign * max_delta
 
     def _update_operating_mode(self, surplus: float, now: float) -> None:
         """Schmitt trigger with charge-confirmation delay.
@@ -775,30 +706,30 @@ class ControlLogic:
         """
         if raw_limit > 0 and not m.discharge_enabled:
             return ControlOutput.idle(
-                self._last_p, self._last_d, self._last_i,
+                self._last_p, self._last_i,
                 self._last_ff_pv, "Discharge disabled",
             )
         if raw_limit < 0 and not m.charge_enabled:
             return ControlOutput.idle(
-                self._last_p, self._last_d, self._last_i,
+                self._last_p, self._last_i,
                 self._last_ff_pv, "Charge disabled",
             )
 
         if raw_limit > 0 and m.soc_pct <= self.cfg.min_soc_pct:
             return ControlOutput.idle(
-                self._last_p, self._last_d, self._last_i,
+                self._last_p, self._last_i,
                 self._last_ff_pv, "SOC too low",
             )
 
         if raw_limit < 0:
             if surplus <= 0:
                 return ControlOutput.idle(
-                    self._last_p, self._last_d, self._last_i,
+                    self._last_p, self._last_i,
                     self._last_ff_pv, "No surplus, charge blocked",
                 )
             if m.soc_pct >= self.cfg.max_soc_pct:
                 return ControlOutput.idle(
-                    self._last_p, self._last_d, self._last_i,
+                    self._last_p, self._last_i,
                     self._last_ff_pv, "SOC full",
                 )
 
@@ -880,9 +811,7 @@ class ZeroFeedInController(_HASS_BASE):
             f"dis_dn=({self.cfg.kp_discharge_down:.2f},{self.cfg.ki_discharge_down:.3f}) "
             f"chg_up=({self.cfg.kp_charge_up:.2f},{self.cfg.ki_charge_up:.3f}) "
             f"chg_dn=({self.cfg.kp_charge_down:.2f},{self.cfg.ki_charge_down:.3f}) "
-            f"Kd={self.cfg.kd} "
             f"ff_pv_gain={self.cfg.ff_pv_gain} "
-            f"slew_rate={self.cfg.slew_rate_w_per_s} "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -1018,7 +947,7 @@ class ZeroFeedInController(_HASS_BASE):
             f"mode={self.logic.state.mode.name} "
             f"{power_str} | "
             f"P={output.p_term:.0f} I={output.i_term:.0f} "
-            f"D={output.d_term:.0f} FF={output.ff_pv_term:.0f} | "
+            f"FF={output.ff_pv_term:.0f} | "
             f"{output.reason}"
         )
 
@@ -1038,7 +967,6 @@ class ZeroFeedInController(_HASS_BASE):
             "mode": self.logic.state.mode.name,
             "desired_power_w": round(output.desired_power_w),
             "p_term": round(output.p_term),
-            "d_term": round(output.d_term),
             "i_term": round(output.i_term),
             "ff_pv_term": round(output.ff_pv_term),
             "integral": round(self.logic.state.integral),
@@ -1111,7 +1039,6 @@ class ZeroFeedInController(_HASS_BASE):
         # PI internals
         self._set_sensor("p_term", round(output.p_term), "W", "mdi:alpha-p-box")
         self._set_sensor("i_term", round(output.i_term), "W", "mdi:alpha-i-box")
-        self._set_sensor("d_term", round(output.d_term), "W", "mdi:delta")
         self._set_sensor(
             "ff_pv", round(output.ff_pv_term), "W", "mdi:solar-power-variant",
         )

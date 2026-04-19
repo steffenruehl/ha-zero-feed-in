@@ -52,8 +52,8 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
 ```
 Controller (every 5s):
   grid_power_sensor ────┐
-  soc_sensor ───────────┤──▸ PID + FF ──▸ sensor.zfi_desired_power
-  battery_power_sensor──┘    + slew        sensor.zfi_mode, surplus, etc.
+  soc_sensor ───────────┤──▸ PI + FF ──▸ sensor.zfi_desired_power
+  battery_power_sensor──┘               sensor.zfi_mode, surplus, etc.
   pv_sensor (optional)──┘
   battery_power_sensor┘         sensor.zfi_mode, surplus, etc.
 
@@ -137,7 +137,7 @@ Optional `input_boolean` entities for HA UI control:
 
 ---
 
-## Controller: PID Controller + Feed-Forward
+## Controller: PI Controller + Feed-Forward
 
 ### Position Form
 
@@ -147,9 +147,8 @@ error = grid_power - target
 gains = gain_set.select(mode, error)    # four-quadrant lookup
 P = gains.kp × error
 I = I_prev + gains.ki × error × dt
-D = Kd × (grid_power - previous_grid_power)   [deadband filtered]
 
-pid_output = P + I + D
+pi_output = P + I
 ```
 
 NOT velocity/incremental form. Critical with the SolarFlow's 10-15 s response latency.
@@ -158,22 +157,11 @@ NOT velocity/incremental form. Critical with the SolarFlow's 10-15 s response la
 
 ```
 ff_pv = -ff_pv_gain × (pv_power - previous_pv_power)   [deadband filtered]
-combined = pid_output + ff_pv
+combined = pi_output + ff_pv
 ```
 
 Reacts to PV changes (clouds, sunset) before they appear at the grid meter.
 PV drops → positive ff (increase discharge). PV rises → negative ff (increase charge).
-
-### Slew Rate Limiter
-
-```
-max_delta = slew_rate_w_per_s × interval_s
-if |combined - last_output| > max_delta:
-    limited = last_output + sign(delta) × max_delta
-```
-
-Prevents PI windup when commanding steps larger than the device can deliver.
-Disabled by default (slew_rate = 0). Enable after measuring device step response.
 
 ### Four-Quadrant Gains
 
@@ -299,18 +287,13 @@ flowchart TD
     H --> I["error = grid - target"]
 
     I --> J{"|error| ≤ deadband?"}
-    J -- Yes --> K{"D-term fires?"}
-    K -- Yes --> K2["D-only correction"]
-    K -- No --> K3["Freeze PI, keep output"]
-    J -- No --> L["PID step: P + I + D"]
+    J -- Yes --> K3["Freeze PI, keep output"]
+    J -- No --> L["PI step: P + I"]
 
-    K2 --> FF
     K3 --> FF
     L --> FF["PV feed-forward<br>ff_pv = -gain × PV delta"]
 
-    FF --> SL["Slew rate limit<br>(if enabled)"]
-
-    SL --> N{"raw > 0?<br>(discharge)"}
+    FF --> N{"|raw| > 0?<br>(discharge)"}
     N -- Yes --> O{SOC ≤ min?}
     O -- Yes --> P["Idle: SOC too low"]
     O -- No --> CL
@@ -416,7 +399,6 @@ Published only when `debug: true` in the controller config.
 | `zfi_error` | number | W | Regulation error |
 | `zfi_p_term` | number | W | Proportional component |
 | `zfi_i_term` | number | W | Integral component |
-| `zfi_d_term` | number | W | Derivative component |
 | `zfi_ff_pv` | number | W | PV feed-forward component |
 | `zfi_integral` | number | W | Integral accumulator |
 | `zfi_pv_power` | number | W | PV production reading |

@@ -73,17 +73,10 @@ zero_feed_in_controller:
   ki_charge_up: 0.011
   ki_charge_down: 0.021
 
-  # ── D-term ──────────────────────────────────────────────
-  kd: 0.3
-  kd_deadband: 30
-
   # ── PV feed-forward (optional) ─────────────────────────
   pv_sensor: sensor.solarstrom_switch_0_power
   ff_pv_gain: 0.6
   ff_pv_deadband: 20
-
-  # ── Slew rate limiter (0 = disabled, measure first) ────
-  slew_rate: 0
 
   # ── Power limits ────────────────────────────────────────
   max_output: 1200             # max discharge (W)

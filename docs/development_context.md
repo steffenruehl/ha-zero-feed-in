@@ -155,17 +155,15 @@ PIController:     — anti-windup back-calculation, gains supplied per call (PIG
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
   estimate_surplus()            — -battery_power_w - grid_power_w
-  compute()                     — emergency → mode → PID+FF → slew → guards → clamp
+  compute()                     — emergency → mode → PI+FF → guards → clamp
   target_for_mode()             — active grid-power target
   _update_operating_mode()      — Schmitt trigger with charge confirmation
   _apply_guards()               — switches + SOC + grid-charge protection
   _clamp()                      — limit enforcement + surplus cap
   _check_emergency()            — feed-in protection
-  _run_pid()                    — PID computation (without committing state)
-  _compute_d_term()             — derivative term on grid delta
+  _run_pi()                     — PI computation (without committing state)
   _compute_pv_feed_forward()    — PV feed-forward compensation
-  _apply_slew_limit()           — output change rate limiter
-  _update_previous()            — update previous_grid_w / previous_pv_w
+  _update_previous()            — update previous_pv_w
 
 ZeroFeedInController(hass.Hass): — thin HA adapter
   initialize()                  — config, seed, CsvLogger, schedule
@@ -221,7 +219,6 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_error` | W | Regulation error *(debug)* |
 | `zfi_p_term` | W | Proportional component *(debug)* |
 | `zfi_i_term` | W | Integral component *(debug)* |
-| `zfi_d_term` | W | Derivative component *(debug)* |
 | `zfi_ff_pv` | W | PV feed-forward component *(debug)* |
 | `zfi_integral` | W | Integral accumulator *(debug)* |
 | `zfi_pv_power` | W | PV production reading *(debug)* |
@@ -249,9 +246,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Two-app architecture: controller + Zendure driver
 - Controller publishes `sensor.zfi_desired_power`, driver reads it
 - PI controller uses position form with anti-windup back-calculation
-- PID: D-term on grid delta catches load steps immediately, fires even in PI deadband
 - PV feed-forward: compensates solar changes before they appear at the grid meter
-- Slew rate limiter: prevents PI windup from commanding beyond device ramp capability
 - Battery sensor convention: +discharge/-charge (read directly, no negation)
 - Surplus estimated from `battery_power_sensor`: `-battery_power_w - grid_power_w`
 - Driver sends AC mode once on intent change, retries after 30 s
@@ -307,12 +302,9 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `ki_charge_up` | 0.011 | Integral gain: increase charge. |
 | `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
 | `deadband` | 25W | No action within this error range. |
-| `kd` | 0.3 | Derivative gain on grid power delta. |
-| `kd_deadband` | 30W | Ignore grid changes below this (noise filter). |
 | `pv_sensor` | (empty) | PV entity (empty = FF disabled). |
 | `ff_pv_gain` | 0.6 | Fraction of PV change applied as FF correction. |
 | `ff_pv_deadband` | 20W | Ignore PV changes below this (MPPT noise filter). |
-| `slew_rate` | 0 | Max output change rate (W/s). 0 = disabled. |
 | `target_grid_power` | 30W | Discharge target. Small grid draw as safety buffer. |
 | `charge_target_power` | 0W | Charge target. Absorb all surplus exactly. |
 | `mode_hysteresis` | 50W | Surplus band for mode switching. Increase if mode flaps. |
