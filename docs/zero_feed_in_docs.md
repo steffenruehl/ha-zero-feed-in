@@ -221,17 +221,20 @@ When output hits limits, `integral = limit - P_term`. Prevents windup during sat
 ### Relay Lockout Anti-Windup
 
 When the driver’s relay state machine is clamping output (e.g. during a relay
-transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.Additionally, `relay_locked` stays `true` for 8 seconds after each SM
-transition (`RELAY_SWITCH_DELAY_S`) to account for the physical relay
-switching time. This prevents the controller from winding up the integral
-while the relay is physically switching and the device cannot yet actuate
-the new setpoint.The controller reads this via the optional `relay_locked_sensor` config and
+transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.
+
+Additionally, `relay_locked` stays `true` for `RELAY_SWITCH_DELAY_S` (8 s)
+after each SM transition to account for the physical relay switching time.
+This prevents the controller from winding up the integral while the relay is
+physically switching and the device cannot yet actuate the new setpoint.
+
+The controller reads this via the optional `relay_locked_sensor` config and
 **freezes the integral**: no new integral is committed, and no back-calculation
 is performed. The normal output pipeline still runs (P + I + FF → clamp), so
-the driver sees the controller’s intent, but the integral does not wind up
-while the device cannot actuate.
+the driver sees the controller’s intent, but the integral does not accumulate
+stale error while the device cannot actuate.
 
-The reason string includes a " (relay locked)" suffix when active.
+The reason string includes a `" (relay locked)"` suffix when active.
 
 ### Deadband
 
@@ -739,7 +742,19 @@ Settings → Add-ons → Add-on Store → AppDaemon → Install → Start
 config/appdaemon/apps/
 ├── zero_feed_in_controller.py
 ├── zendure_solarflow_driver.py
+├── solarflow_mqtt_watchdog.py
 └── apps.yaml
+```
+
+Create `config/appdaemon/secrets.yaml` with your device credentials (use
+`config/secrets.yaml.example` as a template — the real file is git-ignored):
+
+```yaml
+solarflow_ip:     "192.168.x.x"
+solarflow_serial: "XXXXXXXXXXX"
+mqtt_broker_ip:   "192.168.x.x"   # HA host IP
+mqtt_username:    "mqtt"
+mqtt_password:    "mqtt"
 ```
 
 **Important**: Remove any old `zero_feed_in.py` entry from apps.yaml — running both the old monolithic app and the new controller+driver simultaneously will cause conflicts.

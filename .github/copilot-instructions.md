@@ -13,8 +13,11 @@ Two AppDaemon apps for a Zendure SolarFlow 2400 AC+ implementing bidirectional z
 src/                          # Application source code
   zero_feed_in_controller.py  # Device-agnostic PI controller + ControlLogic
   zendure_solarflow_driver.py # Zendure SolarFlow driver with relay state machine
+  solarflow_mqtt_watchdog.py  # MQTT reconnect watchdog (HTTP API trigger)
 config/
-  apps.yaml                   # AppDaemon configuration for both apps
+  apps.yaml                   # AppDaemon configuration (uses !secret references)
+  secrets.yaml                # Device credentials — git-ignored, not committed
+  secrets.yaml.example        # Template for secrets.yaml
 tests/
   test_zero_feed_in_controller.py  # Unit tests for ControlLogic & PIController
 docs/

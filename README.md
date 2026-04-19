@@ -35,6 +35,7 @@ Two apps with clear separation of concerns:
 | --- | --- | --- |
 | Controller | `zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
 | Driver | `zendure_solarflow_driver.py` | AC mode, relay lockout, 10 W rounding, redundant-send suppression |
+| Watchdog | `solarflow_mqtt_watchdog.py` | Reconnects SolarFlow to MQTT broker after broker restarts |
 
 ### Key Features
 
@@ -61,7 +62,18 @@ Copy to your AppDaemon apps directory:
 config/appdaemon/apps/
 ├── zero_feed_in_controller.py
 ├── zendure_solarflow_driver.py
+├── solarflow_mqtt_watchdog.py
 └── apps.yaml
+```
+
+Create `config/appdaemon/secrets.yaml` with your device credentials (see `config/secrets.yaml.example`):
+
+```yaml
+solarflow_ip:     "192.168.x.x"
+solarflow_serial: "XXXXXXXXXXX"
+mqtt_broker_ip:   "192.168.x.x"
+mqtt_username:    "mqtt"
+mqtt_password:    "mqtt"
 ```
 
 ### 3. Configure Entity Names
@@ -107,8 +119,10 @@ Start with `max_output: 200` and increase over several days.
 | --- | --- | --- |
 | `target_grid_power` | 30 W | Discharge target (small grid draw as buffer) |
 | `charge_target_power` | 0 W | Charge target (absorb all surplus) |
-| `kp_up` / `kp_down` | 0.3 / 0.8 | Proportional gains (up = cautious, down = aggressive) |
-| `ki_up` / `ki_down` | 0.03 / 0.08 | Integral gains |
+| `kp_discharge_up` / `kp_discharge_down` | 0.25 / 0.35 | Proportional gain: increase / decrease discharge |
+| `kp_charge_up` / `kp_charge_down` | 0.17 / 0.23 | Proportional gain: increase / decrease charge |
+| `ki_discharge_up` / `ki_discharge_down` | 0.012 / 0.025 | Integral gain: increase / decrease discharge |
+| `ki_charge_up` / `ki_charge_down` | 0.006 / 0.010 | Integral gain: increase / decrease charge |
 | `deadband` | 25 W | Error range where PI freezes |
 | `interval` | 5 s | Control cycle interval |
 | `max_output` | 800 W | Maximum discharge power |
@@ -123,28 +137,49 @@ Start with `max_output: 200` and increase over several days.
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `interval` | 2 s | Poll interval (faster than controller) |
-| `direction_lockout` | 5 s | Min time between relay direction changes |
-| `relay_filter_enabled` | true | Enable/disable relay lockout |
+| `direction_lockout` | 30 s | Base lockout time between relay direction changes |
+| `relay_sm_enabled` | true | Enable/disable relay state machine |
+| `adaptive_lockout_ref_w` | 200 W | Reference power for full-speed lockout (low power → longer lockout) |
+| `min_active_power_w` | 25 W | Minimum power floor when relay is in an active state |
 
-See [apps.yaml](apps.yaml) for the full annotated configuration.
+### Watchdog
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `watch_entity` | — | HA entity to monitor (goes unavailable when MQTT drops) |
+| `unavailable_duration_s` | 120 s | Trigger reconnect after this many seconds unavailable |
+| `startup_delay_s` | 30 s | Wait after HA start before sending reconnect (lets Mosquitto start first) |
+
+See [apps.yaml](config/apps.yaml) for the full annotated configuration.
 
 ## Published HA Sensors
 
 Both apps publish `sensor.zfi_*` entities every cycle:
 
+Always published:
+
 | Sensor | Source | Description |
 | --- | --- | --- |
 | `zfi_desired_power` | Controller | Signed desired power (W): +discharge, -charge |
 | `zfi_mode` | Controller | Operating regime (charging/discharging) |
-| `zfi_surplus` | Controller | Estimated solar surplus (W) |
-| `zfi_battery_power` | Controller | Actual battery power (W) |
-| `zfi_error` | Controller | Regulation error (W) |
-| `zfi_p_term` / `zfi_i_term` | Controller | PI components (W) |
-| `zfi_reason` | Controller | Human-readable decision reason |
 | `zfi_device_output` | Driver | Signed power sent to device (W) |
 | `zfi_discharge_limit` | Driver | outputLimit sent (W) |
 | `zfi_charge_limit` | Driver | inputLimit sent (W) |
 | `zfi_relay` | Driver | Physical relay state |
+| `zfi_relay_locked` | Driver | `true` while SM is clamping or relay is physically switching |
+
+Published when `debug: true`:
+
+| Sensor | Source | Description |
+| --- | --- | --- |
+| `zfi_surplus` | Controller | Estimated solar surplus (W) |
+| `zfi_battery_power` | Controller | Actual battery power (W) |
+| `zfi_error` | Controller | Regulation error (W) |
+| `zfi_p_term` / `zfi_i_term` / `zfi_ff` | Controller | PI and feed-forward components (W) |
+| `zfi_integral` | Controller | PI integral accumulator (W) |
+| `zfi_reason` | Controller | Human-readable decision reason |
+| `zfi_relay_sm_state` / `zfi_relay_sm_pending` | Driver | Relay state machine state and pending target |
+| `zfi_relay_sm_lockout_pct` | Driver | Transition progress (%) |
 
 ## Documentation
 
