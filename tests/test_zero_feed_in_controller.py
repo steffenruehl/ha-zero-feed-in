@@ -15,6 +15,8 @@ from src.zero_feed_in_controller import (
     Measurement,
     OperatingMode,
     PIController,
+    PIGains,
+    PIGainSet,
 )
 
 
@@ -59,52 +61,42 @@ def make_logic(log=None, **config_overrides) -> ControlLogic:
 class TestPIController:
     def test_proportional_positive_error(self):
         pi = PIController(
-            kp=0.5,
-            ki=0.0,
             output_min=-1000, output_max=1000,
         )
-        output, p_term, _ = pi.update(error=100, integral=0.0, dt=5)
+        output, p_term, _ = pi.update(error=100, integral=0.0, dt=5, gains=PIGains(0.5, 0.0))
         assert p_term == pytest.approx(50.0)
         assert output == pytest.approx(50.0)
 
     def test_proportional_negative_error(self):
         pi = PIController(
-            kp=0.5,
-            ki=0.0,
             output_min=-1000, output_max=1000,
         )
-        output, p_term, _ = pi.update(error=-100, integral=0.0, dt=5)
+        output, p_term, _ = pi.update(error=-100, integral=0.0, dt=5, gains=PIGains(0.5, 0.0))
         assert p_term == pytest.approx(-50.0)
         assert output == pytest.approx(-50.0)
 
     def test_integral_accumulation(self):
         pi = PIController(
-            kp=0.0,
-            ki=0.1,
             output_min=-1000, output_max=1000,
         )
-        output, _, new_integral = pi.update(error=100, integral=0.0, dt=5)
+        output, _, new_integral = pi.update(error=100, integral=0.0, dt=5, gains=PIGains(0.0, 0.1))
         assert new_integral == pytest.approx(50.0)  # 0.1 * 100 * 5
         assert output == pytest.approx(50.0)
 
     def test_anti_windup_upper_clamp(self):
         pi = PIController(
-            kp=1.0,
-            ki=0.1,
             output_min=-500, output_max=500,
         )
-        output, p_term, new_integral = pi.update(error=600, integral=0.0, dt=5)
+        output, p_term, new_integral = pi.update(error=600, integral=0.0, dt=5, gains=PIGains(1.0, 0.1))
         assert output == pytest.approx(500)
         # Back-calculated: integral = output_max - p_term
         assert new_integral == pytest.approx(500 - 600)
 
     def test_anti_windup_lower_clamp(self):
         pi = PIController(
-            kp=1.0,
-            ki=0.1,
             output_min=-500, output_max=500,
         )
-        output, p_term, new_integral = pi.update(error=-600, integral=0.0, dt=5)
+        output, p_term, new_integral = pi.update(error=-600, integral=0.0, dt=5, gains=PIGains(1.0, 0.1))
         assert output == pytest.approx(-500)
         assert new_integral == pytest.approx(-500 - (-600))
 
@@ -447,8 +439,14 @@ class TestConfigFromArgs:
         assert cfg.battery_power_sensor == "sensor.battery"
         assert cfg.discharge_target_w == 30.0
         assert cfg.charge_target_w == 0.0
-        assert cfg.kp == 0.3
-        assert cfg.ki == 0.03
+        assert cfg.kp_discharge_up == 0.50
+        assert cfg.kp_discharge_down == 0.71
+        assert cfg.kp_charge_up == 0.33
+        assert cfg.kp_charge_down == 0.45
+        assert cfg.ki_discharge_up == 0.025
+        assert cfg.ki_discharge_down == 0.051
+        assert cfg.ki_charge_up == 0.011
+        assert cfg.ki_charge_down == 0.021
         assert cfg.deadband_w == 25.0
         assert cfg.interval_s == 5
         assert cfg.max_discharge_w == 800.0
@@ -490,8 +488,14 @@ class TestConfigFromArgs:
         cfg = Config.from_args(args)
         assert cfg.discharge_target_w == 50.0
         assert cfg.charge_target_w == -10.0
-        assert cfg.kp == 0.5
-        assert cfg.ki == 0.05
+        assert cfg.kp_discharge_up == 0.5
+        assert cfg.kp_discharge_down == 0.5
+        assert cfg.kp_charge_up == 0.5
+        assert cfg.kp_charge_down == 0.5
+        assert cfg.ki_discharge_up == 0.05
+        assert cfg.ki_discharge_down == 0.05
+        assert cfg.ki_charge_up == 0.05
+        assert cfg.ki_charge_down == 0.05
         assert cfg.deadband_w == 30.0
         assert cfg.interval_s == 3
         assert cfg.max_discharge_w == 600.0
@@ -511,11 +515,17 @@ class TestConfigFromArgs:
         assert cfg.discharge_switch == "input_boolean.discharge"
 
     def test_kp_ki_from_args(self):
-        """Single kp/ki keys are mapped to config fields."""
+        """Single kp/ki keys are mapped to all four quadrants."""
         args = {**self.MINIMAL_ARGS, "kp": 0.7, "ki": 0.04}
         cfg = Config.from_args(args)
-        assert cfg.kp == 0.7
-        assert cfg.ki == 0.04
+        assert cfg.kp_discharge_up == 0.7
+        assert cfg.kp_discharge_down == 0.7
+        assert cfg.kp_charge_up == 0.7
+        assert cfg.kp_charge_down == 0.7
+        assert cfg.ki_discharge_up == 0.04
+        assert cfg.ki_discharge_down == 0.04
+        assert cfg.ki_charge_up == 0.04
+        assert cfg.ki_charge_down == 0.04
 
 
 # ═══════════════════════════════════════════════════════════
@@ -551,45 +561,39 @@ class TestControlOutput:
 class TestPIControllerEdgeCases:
     def test_zero_error_no_change(self):
         pi = PIController(
-            kp=0.5,
-            ki=0.1,
             output_min=-1000, output_max=1000,
         )
-        output, p_term, new_integral = pi.update(error=0.0, integral=50.0, dt=5)
+        output, p_term, new_integral = pi.update(error=0.0, integral=50.0, dt=5, gains=PIGains(0.5, 0.1))
         assert p_term == 0.0
         assert new_integral == 50.0
         assert output == 50.0
 
     def test_zero_dt_no_integral_change(self):
         pi = PIController(
-            kp=0.5,
-            ki=0.1,
             output_min=-1000, output_max=1000,
         )
-        output, _, new_integral = pi.update(error=100, integral=0.0, dt=0)
+        output, _, new_integral = pi.update(error=100, integral=0.0, dt=0, gains=PIGains(0.5, 0.1))
         assert new_integral == 0.0
         assert output == pytest.approx(50.0)
 
     def test_symmetric_gains_same_magnitude(self):
         pi = PIController(
-            kp=0.5,
-            ki=0.0,
             output_min=-1000, output_max=1000,
         )
-        out_pos, _, _ = pi.update(error=100, integral=0, dt=1)
-        out_neg, _, _ = pi.update(error=-100, integral=0, dt=1)
+        gains = PIGains(0.5, 0.0)
+        out_pos, _, _ = pi.update(error=100, integral=0, dt=1, gains=gains)
+        out_neg, _, _ = pi.update(error=-100, integral=0, dt=1, gains=gains)
         assert out_pos == pytest.approx(-out_neg)
 
     def test_integral_only_accumulates(self):
         """Multiple updates with ki-only accumulate integral correctly."""
         pi = PIController(
-            kp=0.0,
-            ki=0.1,
             output_min=-1000, output_max=1000,
         )
-        _, _, integral = pi.update(error=100, integral=0.0, dt=5)
+        gains = PIGains(0.0, 0.1)
+        _, _, integral = pi.update(error=100, integral=0.0, dt=5, gains=gains)
         assert integral == pytest.approx(50.0)
-        _, _, integral = pi.update(error=100, integral=integral, dt=5)
+        _, _, integral = pi.update(error=100, integral=integral, dt=5, gains=gains)
         assert integral == pytest.approx(100.0)
 
 
@@ -681,10 +685,10 @@ class TestAntiWindupSurplusClamp:
         m = make_measurement(grid_power_w=100, soc_pct=50)
         output = logic.compute(m, now=0)
         # error = grid - target = 100 - 30 = 70
-        # kp=0.3 → p_term=21, ki=0.03 → integral = 0.03*70*5 = 10.5
-        # output = 31.5, well below 800 → no clamp
-        assert output.desired_power_w == pytest.approx(31.5)
-        assert logic.state.integral == pytest.approx(10.5)
+        # kp_discharge_up=0.50 → p_term=35, ki_discharge_up=0.025 → integral = 0.025*70*5 = 8.75
+        # output = 43.75, well below 800 → no clamp
+        assert output.desired_power_w == pytest.approx(43.75)
+        assert logic.state.integral == pytest.approx(8.75)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -695,7 +699,13 @@ class TestAntiWindupSurplusClamp:
 class TestMultiCycle:
     def test_integral_accumulates_over_cycles(self):
         """PI integral grows across multiple compute cycles."""
-        logic = make_logic(deadband_w=0, kp=0.0, ki=0.1)
+        logic = make_logic(
+            deadband_w=0,
+            kp_discharge_up=0.0, kp_discharge_down=0.0,
+            kp_charge_up=0.0, kp_charge_down=0.0,
+            ki_discharge_up=0.1, ki_discharge_down=0.1,
+            ki_charge_up=0.1, ki_charge_down=0.1,
+        )
         logic.seed(None)
         m = make_measurement(grid_power_w=100, soc_pct=50)
         logic.compute(m, now=0)

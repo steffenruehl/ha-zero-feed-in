@@ -19,7 +19,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-from src.csv_logger import CsvLogger
+try:
+    from src.csv_logger import CsvLogger
+except ModuleNotFoundError:
+    from csv_logger import CsvLogger  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     import appdaemon.plugins.hass.hassapi as hass

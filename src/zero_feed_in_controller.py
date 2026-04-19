@@ -19,7 +19,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-from src.csv_logger import CsvLogger
+try:
+    from src.csv_logger import CsvLogger
+except ModuleNotFoundError:
+    from csv_logger import CsvLogger  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     import appdaemon.plugins.hass.hassapi as hass
@@ -66,6 +69,47 @@ class OperatingMode(Enum):
 
 
 @dataclass
+class PIGains:
+    """Kp/Ki pair for one physical quadrant."""
+
+    kp: float
+    """Proportional gain."""
+    ki: float
+    """Integral gain."""
+
+
+@dataclass
+class PIGainSet:
+    """Four gain sets indexed by mode × error-sign quadrant.
+
+    Selection logic::
+
+                      error >= 0           error < 0
+        DISCHARGING   discharge_up         discharge_down
+        CHARGING      charge_down          charge_up
+
+    Note CHARGING is flipped: error >= 0 means "charging too much,
+    reduce" → charge_down.  Error < 0 means "surplus available,
+    charge more" → charge_up.
+    """
+
+    discharge_up: PIGains
+    """Increase discharge (error >= 0 in DISCHARGING)."""
+    discharge_down: PIGains
+    """Decrease discharge (error < 0 in DISCHARGING)."""
+    charge_up: PIGains
+    """Increase charge (error < 0 in CHARGING)."""
+    charge_down: PIGains
+    """Decrease charge (error >= 0 in CHARGING)."""
+
+    def select(self, mode: OperatingMode, error: float) -> PIGains:
+        """Return the gain pair for the current mode and error sign."""
+        if mode == OperatingMode.DISCHARGING:
+            return self.discharge_up if error >= 0 else self.discharge_down
+        return self.charge_up if error < 0 else self.charge_down
+
+
+@dataclass
 class Config:
     """Typed, validated configuration loaded from ``apps.yaml``.
 
@@ -103,10 +147,22 @@ class Config:
     # Controller tuning
     discharge_target_w: float = 30.0
     charge_target_w: float = 0.0
-    kp: float = 0.3
-    """Proportional gain."""
-    ki: float = 0.03
-    """Integral gain."""
+    kp_discharge_up: float = 0.50
+    """Kp for increasing discharge (DISCHARGING, error >= 0)."""
+    kp_discharge_down: float = 0.71
+    """Kp for decreasing discharge (DISCHARGING, error < 0)."""
+    kp_charge_up: float = 0.33
+    """Kp for increasing charge (CHARGING, error < 0)."""
+    kp_charge_down: float = 0.45
+    """Kp for decreasing charge (CHARGING, error >= 0)."""
+    ki_discharge_up: float = 0.025
+    """Ki for increasing discharge."""
+    ki_discharge_down: float = 0.051
+    """Ki for decreasing discharge."""
+    ki_charge_up: float = 0.011
+    """Ki for increasing charge."""
+    ki_charge_down: float = 0.021
+    """Ki for decreasing charge."""
     deadband_w: float = 25.0
     interval_s: int = 5
 
@@ -159,7 +215,12 @@ class Config:
         Maps apps.yaml keys (e.g. ``target_grid_power``) to dataclass
         fields (``discharge_target_w``).  Falls back to class-level
         defaults for any omitted key.
+
+        Backward compatibility: if old-style ``kp``/``ki`` keys are
+        present (without quadrant suffixes), they are mapped to all
+        four quadrants.
         """
+        gains = cls._parse_gains(args)
         return cls(
             grid_sensor=args["grid_power_sensor"],
             soc_sensor=args["soc_sensor"],
@@ -176,8 +237,7 @@ class Config:
             charge_target_w=float(
                 args.get("charge_target_power", cls.charge_target_w)
             ),
-            kp=float(args.get("kp", cls.kp)),
-            ki=float(args.get("ki", cls.ki)),
+            **gains,
             deadband_w=float(args.get("deadband", cls.deadband_w)),
             interval_s=int(args.get("interval", cls.interval_s)),
             max_discharge_w=float(args.get("max_output", cls.max_discharge_w)),
@@ -209,6 +269,40 @@ class Config:
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
             log_dir=args.get("log_dir", cls.log_dir),
         )
+
+    @classmethod
+    def _parse_gains(cls, args: dict[str, object]) -> dict[str, float]:
+        """Extract four-quadrant PI gains from args, with legacy fallback.
+
+        New-style keys (``kp_discharge_up``, etc.) take priority.
+        If absent, falls back to legacy ``kp``/``ki`` applied uniformly.
+        """
+        if "kp_discharge_up" in args:
+            return {
+                "kp_discharge_up": float(args.get("kp_discharge_up", cls.kp_discharge_up)),
+                "kp_discharge_down": float(args.get("kp_discharge_down", cls.kp_discharge_down)),
+                "kp_charge_up": float(args.get("kp_charge_up", cls.kp_charge_up)),
+                "kp_charge_down": float(args.get("kp_charge_down", cls.kp_charge_down)),
+                "ki_discharge_up": float(args.get("ki_discharge_up", cls.ki_discharge_up)),
+                "ki_discharge_down": float(args.get("ki_discharge_down", cls.ki_discharge_down)),
+                "ki_charge_up": float(args.get("ki_charge_up", cls.ki_charge_up)),
+                "ki_charge_down": float(args.get("ki_charge_down", cls.ki_charge_down)),
+            }
+        if "kp" not in args and "ki" not in args:
+            return {}
+        # Legacy: single kp/ki applied to all quadrants
+        kp = float(args.get("kp", cls.kp_discharge_up))
+        ki = float(args.get("ki", cls.ki_discharge_up))
+        return {
+            "kp_discharge_up": kp,
+            "kp_discharge_down": kp,
+            "kp_charge_up": kp,
+            "kp_charge_down": kp,
+            "ki_discharge_up": ki,
+            "ki_discharge_down": ki,
+            "ki_charge_up": ki,
+            "ki_charge_down": ki,
+        }
 
 
 @dataclass
@@ -328,17 +422,16 @@ class PIController:
     ``output_min`` or ``output_max``, the integral term is
     back-calculated so that ``p_term + integral == saturated_output``.
     This prevents integral build-up during sustained saturation.
+
+    Gains are supplied per call via ``PIGains`` so the caller can
+    switch gains every cycle (four-quadrant selection).
     """
 
     def __init__(
         self,
-        kp: float,
-        ki: float,
         output_min: float,
         output_max: float,
     ) -> None:
-        self.kp: float = kp
-        self.ki: float = ki
         self.output_min: float = output_min
         self.output_max: float = output_max
 
@@ -347,6 +440,7 @@ class PIController:
         error: float,
         integral: float,
         dt: float,
+        gains: PIGains,
     ) -> tuple[float, float, float]:
         """Compute one PI step.
 
@@ -354,14 +448,15 @@ class PIController:
             error: Regulation error (W).  Positive = grid importing.
             integral: Current integral accumulator value (W).
             dt: Time since last update (s).
+            gains: Kp/Ki pair for this cycle.
 
         Returns:
             ``(output, p_term, new_integral)`` — the clamped output
             power, the proportional contribution, and the
             (possibly back-calculated) new integral value.
         """
-        p_term = self.kp * error
-        new_integral = integral + self.ki * error * dt
+        p_term = gains.kp * error
+        new_integral = integral + gains.ki * error * dt
 
         output = p_term + new_integral
 
@@ -395,9 +490,13 @@ class ControlLogic:
     def __init__(self, cfg: Config, log: Callable[[str], None] | None = None) -> None:
         self.cfg = cfg
         self.state = ControllerState()
+        self.gains = PIGainSet(
+            discharge_up=PIGains(cfg.kp_discharge_up, cfg.ki_discharge_up),
+            discharge_down=PIGains(cfg.kp_discharge_down, cfg.ki_discharge_down),
+            charge_up=PIGains(cfg.kp_charge_up, cfg.ki_charge_up),
+            charge_down=PIGains(cfg.kp_charge_down, cfg.ki_charge_down),
+        )
         self.pi = PIController(
-            kp=cfg.kp,
-            ki=cfg.ki,
             output_min=-cfg.max_charge_w,
             output_max=cfg.max_discharge_w,
         )
@@ -546,10 +645,12 @@ class ControlLogic:
                 self.state.integral,
             )
 
+        gains = self.gains.select(self.state.mode, error)
         pi_output, p_term, new_integral = self.pi.update(
             error=error,
             integral=self.state.integral,
             dt=self.cfg.interval_s,
+            gains=gains,
         )
         return pi_output + d_term, p_term, d_term, new_integral
 
@@ -775,8 +876,10 @@ class ZeroFeedInController(_HASS_BASE):
             f"discharge_target={self.cfg.discharge_target_w}W "
             f"charge_target={self.cfg.charge_target_w}W "
             f"hysteresis={self.cfg.mode_hysteresis_w}W "
-            f"Kp={self.cfg.kp_up}/{self.cfg.kp_down} "
-            f"Ki={self.cfg.ki_up}/{self.cfg.ki_down} "
+            f"Gains | dis_up=({self.cfg.kp_discharge_up:.2f},{self.cfg.ki_discharge_up:.3f}) "
+            f"dis_dn=({self.cfg.kp_discharge_down:.2f},{self.cfg.ki_discharge_down:.3f}) "
+            f"chg_up=({self.cfg.kp_charge_up:.2f},{self.cfg.ki_charge_up:.3f}) "
+            f"chg_dn=({self.cfg.kp_charge_down:.2f},{self.cfg.ki_charge_down:.3f}) "
             f"Kd={self.cfg.kd} "
             f"ff_pv_gain={self.cfg.ff_pv_gain} "
             f"slew_rate={self.cfg.slew_rate_w_per_s} "

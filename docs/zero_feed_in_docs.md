@@ -144,8 +144,9 @@ Optional `input_boolean` entities for HA UI control:
 ```
 error = grid_power - target
 
-P = Kp × error
-I = I_prev + Ki × error × dt
+gains = gain_set.select(mode, error)    # four-quadrant lookup
+P = gains.kp × error
+I = I_prev + gains.ki × error × dt
 D = Kd × (grid_power - previous_grid_power)   [deadband filtered]
 
 pid_output = P + I + D
@@ -174,12 +175,24 @@ if |combined - last_output| > max_delta:
 Prevents PI windup when commanding steps larger than the device can deliver.
 Disabled by default (slew_rate = 0). Enable after measuring device step response.
 
-### Gains
+### Four-Quadrant Gains
 
-| Parameter | Default | Rationale |
+Gains are selected per cycle based on operating mode × error sign.
+Derived from step response measurements (SIMC: Kp = interval / (2×T1), Ki = Kp / (4×T1)).
+
+| Quadrant | Physical action | T1 (s) | Kp | Ki |
+| --- | --- | --- | --- | --- |
+| `discharge_up` | increase discharge | 5.0 | 0.50 | 0.025 |
+| `discharge_down` | decrease discharge | 3.5 | 0.71 | 0.051 |
+| `charge_up` | increase charge | 7.5 | 0.33 | 0.011 |
+| `charge_down` | decrease charge | 5.5 | 0.45 | 0.021 |
+
+Selection matrix:
+
+|  | error ≥ 0 | error < 0 |
 | --- | --- | --- |
-| `kp` | 0.3 | Proportional gain |
-| `ki` | 0.03 | Integral gain |
+| DISCHARGING | discharge_up | discharge_down |
+| CHARGING | charge_down | charge_up |
 
 ### Anti-Windup (Back-Calculation)
 
@@ -807,9 +820,9 @@ PI wants to charge → guard: SOC ≥ max → idle
 
 | Problem | Action |
 | --- | --- |
-| Output oscillates | Reduce kp (try 0.2), increase deadband |
-| Persistent offset | Increase ki (try 0.05) |
-| Sluggish on load changes | Increase kp (try 0.5), reduce interval |
+| Output oscillates | Reduce Kp for the relevant quadrant, increase deadband |
+| Persistent offset | Increase Ki for the relevant quadrant |
+| Sluggish on load changes | Increase Kp for the relevant quadrant, reduce interval |
 | Relay clicks frequently | Increase direction_lockout (30+ s), lower adaptive_lockout_ref_w (100 W), increase deadband |
 | Mode flaps | Increase mode_hysteresis (80–100 W), increase charge_confirm (25 s) |
 | Relay switches on marginal surplus | Lower adaptive_lockout_ref_w, increase adaptive_lockout_max_mult |

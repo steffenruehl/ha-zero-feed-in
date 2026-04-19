@@ -24,16 +24,8 @@ zero_feed_in_controller:
 
   # Battery power: +discharge/-charge (signed sensor, no negation needed)
   battery_power_sensor: sensor.energy_battery_hec4nencn492140_outputhomepower_hec4nencn492140_gridinputpower_net_power
-
-  # Battery sensor mode: "signed" (default) or "unsigned"
-  #   signed   – sensor has correct sign (+discharge/-charge), no extra entity needed
-  #   unsigned – sensor is always positive; sign derived from ac_mode_entity
   battery_sensor_mode: signed
   # ac_mode_entity: select.hec4nencn492140_acmode   # required for unsigned mode
-  # Alternative unsigned sensor:
-  #battery_power_sensor: sensor.battery_plug_power
-  #battery_sensor_mode: unsigned
-  #ac_mode_entity: select.hec4nencn492140_acmode
 
   # ── Direction switches (optional) ───────────────────────
   charge_switch: input_boolean.zfi_charge_enabled
@@ -44,12 +36,12 @@ zero_feed_in_controller:
   charge_target_power: 0       # charge target (W)
   mode_hysteresis: 50          # Schmitt trigger band (W)
   charge_confirm: 20           # seconds surplus must hold before CHARGING
-  deadband: 35
+  deadband: 30
   interval: 5
 
   # ── Four-quadrant PI gains ─────────────────────────────
   #
-  # Derived from step response measurements (April 2025).
+  # Derived from step response measurements (April 2026).
   # Formula: Kp = interval / (2 × T1), Ki = Kp / (4 × T1)
   #
   #   Quadrant          Physical action      T1     Kp    Ki
@@ -73,21 +65,9 @@ zero_feed_in_controller:
   ki_charge_up: 0.011
   ki_charge_down: 0.021
 
-  # ── D-term ──────────────────────────────────────────────
-  kd: 0.3
-  kd_deadband: 30
-
-  # ── PV feed-forward (optional) ─────────────────────────
-  pv_sensor: sensor.solarstrom_switch_0_power
-  ff_pv_gain: 0.6
-  ff_pv_deadband: 20
-
-  # ── Slew rate limiter (0 = disabled, measure first) ────
-  slew_rate: 0
-
   # ── Power limits ────────────────────────────────────────
   max_output: 1200             # max discharge (W)
-  max_charge: 800             # max charge (W)
+  max_charge: 800              # max charge (W)
   min_soc: 10
   max_soc: 85
 
@@ -97,12 +77,11 @@ zero_feed_in_controller:
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false
-  debug: true                   # publish PI internals (p_term, i_term, etc.)
+  debug: true
   sensor_prefix: sensor.zfi
-  log_dir: /config/logs          # CSV file logging (empty = disabled)
 
 # ──────────────────────────────────────────────────────────
-#  Zendure SolarFlow Driver
+#  Zendure SolarFlow Driver (unchanged)
 # ──────────────────────────────────────────────────────────
 zendure_solarflow_driver:
   module: zendure_solarflow_driver
@@ -117,14 +96,12 @@ zendure_solarflow_driver:
   ac_mode_entity: select.hec4nencn492140_acmode
 
   # ── Driver settings ────────────────────────────────────
-  interval: 2                  # poll interval (s) — faster than controller
-  direction_lockout: 30        # base relay lockout (s)
-  relay_sm_enabled: true        # set false to disable state machine
-  adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
-  min_active_power_w: 25       # minimum power floor in active states (W)
+  interval: 2
+  direction_lockout: 30
+  relay_sm_enabled: true
+  adaptive_lockout_ref_w: 200
 
   # ── Debug ───────────────────────────────────────────────
   dry_run: false
-  debug: true                   # publish relay SM internals (lockout %, etc.)
+  debug: true
   sensor_prefix: sensor.zfi
-  log_dir: /config/logs          # CSV file logging (empty = disabled)

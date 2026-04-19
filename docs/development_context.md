@@ -150,7 +150,7 @@ Dataclasses:
   ControllerState — integral, last_computed_w, mode, charge_pending_since,
                     previous_grid_w, previous_pv_w
 
-PIController:     — anti-windup back-calculation
+PIController:     — anti-windup back-calculation, gains supplied per call (PIGains)\n  PIGains:          — Kp/Ki pair for one quadrant\n  PIGainSet:        — four quadrant gain sets with select(mode, error)
 
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
@@ -298,8 +298,14 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `kp` | 0.3 | Proportional gain. |
-| `ki` | 0.03 | Integral gain. |
+| `kp_discharge_up` | 0.50 | Proportional gain: increase discharge. |
+| `kp_discharge_down` | 0.71 | Proportional gain: decrease discharge. |
+| `kp_charge_up` | 0.33 | Proportional gain: increase charge. |
+| `kp_charge_down` | 0.45 | Proportional gain: decrease charge. |
+| `ki_discharge_up` | 0.025 | Integral gain: increase discharge. |
+| `ki_discharge_down` | 0.051 | Integral gain: decrease discharge. |
+| `ki_charge_up` | 0.011 | Integral gain: increase charge. |
+| `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
 | `deadband` | 25W | No action within this error range. |
 | `kd` | 0.3 | Derivative gain on grid power delta. |
 | `kd_deadband` | 30W | Ignore grid changes below this (noise filter). |
@@ -318,8 +324,9 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
 
 ### Gain tuning
-Start with kp=0.3, ki=0.03.  The device has 10-15s response latency;
-Kp values above 1.0 risk oscillation with this latency.
+Gains are derived from step response measurements per quadrant using SIMC rules.
+See the gain table above and the selection matrix in the main docs.
+Kp values above 1.0 risk oscillation with the device's 10-15s latency.
 
 ### Device latency
 Measured at 10-15 seconds.  This is the time from sending a new
