@@ -144,6 +144,18 @@ zero_feed_in_controller:
   log_dir: /config/logs          # CSV file logging (empty = disabled)
 
 # ──────────────────────────────────────────────────────────
+#  Relay Switch Counter
+# ──────────────────────────────────────────────────────────
+relay_switch_counter:
+  module: relay_switch_counter
+  class: RelaySwitchCounter
+
+  desired_power_sensor: sensor.zfi_desired_power
+  min_active_w: 25
+  sensor_prefix: sensor.zfi
+  counter_file: /addon_configs/a0d7b954_appdaemon/apps/relay_switch_count.json
+
+# ──────────────────────────────────────────────────────────
 #  SolarFlow MQTT Watchdog
 # ──────────────────────────────────────────────────────────
 solarflow_mqtt_watchdog:
