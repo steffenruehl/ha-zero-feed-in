@@ -656,7 +656,7 @@ class TestDriverConfig:
         assert cfg.output_entity == "number.output_limit"
         assert cfg.input_entity == "number.input_limit"
         assert cfg.ac_mode_entity == "select.ac_mode"
-        assert cfg.interval_s == 2
+        assert cfg.watchdog_s == 15
         assert cfg.direction_lockout_s == 5.0
         assert cfg.relay_sm_enabled is True
         assert cfg.adaptive_lockout_ref_w == 200.0
@@ -669,7 +669,7 @@ class TestDriverConfig:
 
         args = {
             **self.MINIMAL_ARGS,
-            "interval": 5,
+            "watchdog_s": 5,
             "direction_lockout": 10.0,
             "relay_sm_enabled": False,
             "adaptive_lockout_ref_w": 400.0,
@@ -678,7 +678,7 @@ class TestDriverConfig:
             "sensor_prefix": "sensor.test",
         }
         cfg = DriverConfig.from_args(args)
-        assert cfg.interval_s == 5
+        assert cfg.watchdog_s == 5
         assert cfg.direction_lockout_s == 10.0
         assert cfg.relay_sm_enabled is False
         assert cfg.adaptive_lockout_ref_w == 400.0

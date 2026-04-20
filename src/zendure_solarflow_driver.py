@@ -141,8 +141,8 @@ class Config:
     """HA number entity for ``inputLimit`` (charge power, W)."""
     ac_mode_entity: str
     """HA select entity for AC mode ('Input mode' / 'Output mode')."""
-    interval_s: int = 2
-    """Poll interval in seconds (should be faster than the controller)."""
+    watchdog_s: int = 15
+    """Watchdog interval (s): re-run even when desired_power hasn't changed."""
     direction_lockout_s: float = 5.0
     """Base lockout duration before allowing a relay direction change (s).""" 
     relay_sm_enabled: bool = True
@@ -171,7 +171,7 @@ class Config:
             output_entity=args["output_limit_entity"],
             input_entity=args["input_limit_entity"],
             ac_mode_entity=args["ac_mode_entity"],
-            interval_s=int(args.get("interval", cls.interval_s)),
+            watchdog_s=int(args.get("watchdog_s", cls.watchdog_s)),
             direction_lockout_s=float(
                 args.get("direction_lockout", cls.direction_lockout_s)
             ),
@@ -534,13 +534,15 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         )
 
         self._seed_from_device()
-        self.run_every(self._on_tick, "now", self.cfg.interval_s)
+        self.listen_state(self._on_desired_power_change, self.cfg.desired_power_sensor)
+        self.run_every(self._on_watchdog_tick, "now", self.cfg.watchdog_s)
 
         self.log(
             f"Started | desired_power={self.cfg.desired_power_sensor} "
             f"relay_sm={self.cfg.relay_sm_enabled} "
             f"lockout={self.cfg.direction_lockout_s}s "
             f"adaptive_ref={self.cfg.adaptive_lockout_ref_w}W "
+            f"watchdog={self.cfg.watchdog_s}s "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -583,8 +585,18 @@ class ZendureSolarFlowDriver(_HASS_BASE):
 
     # ─── Tick ─────────────────────────────────────────────
 
-    def _on_tick(self, _kwargs: dict) -> None:
-        """Called every ``interval_s`` seconds: read desired power, apply SM, send."""
+    def _on_desired_power_change(
+        self, entity: str, attribute: str, old: object, new: object, kwargs: dict
+    ) -> None:
+        """Called by AppDaemon when desired_power sensor changes value."""
+        self._run()
+
+    def _on_watchdog_tick(self, _kwargs: dict) -> None:
+        """Called periodically to keep the SM ticking even when desired_power is stable."""
+        self._run()
+
+    def _run(self) -> None:
+        """Read desired power, apply SM, send commands."""
         desired = self._read_float(self.cfg.desired_power_sensor)
         if desired is None:
             self.log(

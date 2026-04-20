@@ -88,40 +88,40 @@ zero_feed_in_controller:
       gain: 0.6
       sign: -1.0          # PV drop → increase discharge
     - entity: sensor.power_waschmaschine_active_power_3
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_trockner_active_power_4
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_sat_active_power_2
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_drucker_active_power
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_geschirrspuler_active_power_5
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_dampfgarer_active_power_6
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.power_office_steffen_active_power_7
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.solar_plug_1_active_power_8
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.solar_outlet_keller_active_power
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.heating_outlet_switch_0_power
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.car_power
       gain: 0.7
       sign: 1.0          # Load increase → increase discharge
     - entity: sensor.brunnen_plug_power
-      gain: 0.9
+      gain: 0.7
       sign: 1.0          # Load increase → increase discharge
 
 
@@ -178,7 +178,7 @@ zendure_solarflow_driver:
   ac_mode_entity: select.hec4nencn492140_acmode
 
   # ── Driver settings ────────────────────────────────────
-  interval: 2                  # poll interval (s) — faster than controller
+  watchdog_s: 5                # re-run even when desired_power hasn't changed
   direction_lockout: 30        # base relay lockout (s)
   relay_sm_enabled: true        # set false to disable state machine
   adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
