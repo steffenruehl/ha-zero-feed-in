@@ -80,48 +80,49 @@ zero_feed_in_controller:
   # Each source tracks a sensor and applies sign × gain × delta.
   # sign: -1.0 for generation (PV), +1.0 for loads (wallbox, dryer).
   # Deadband is applied to the total sum, not per source.
-  ff_enabled: false              # set true to enable feed-forward
+  ff_enabled: true               # PV source only; load sources disabled pending evaluation
   ff_deadband: 30               # ignore total FF below this (W)
   feed_forward_sources:
     - entity: sensor.solarstrom_switch_0_power
       gain: 0.6
       sign: -1.0          # PV drop → increase discharge
-    - entity: sensor.power_waschmaschine_active_power_3
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_trockner_active_power_4
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_sat_active_power_2
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_drucker_active_power
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_geschirrspuler_active_power_5
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_dampfgarer_active_power_6
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.power_office_steffen_active_power_7
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.solar_plug_1_active_power_8
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.solar_outlet_keller_active_power
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.heating_outlet_switch_0_power
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.car_power
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
-    - entity: sensor.brunnen_plug_power
-      gain: 0.7
-      sign: 1.0          # Load increase → increase discharge
+  # Load sources disabled – add back individually once PV FF is validated:
+  #  - entity: sensor.power_waschmaschine_active_power_3
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_trockner_active_power_4
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_sat_active_power_2
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_drucker_active_power
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_geschirrspuler_active_power_5
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_dampfgarer_active_power_6
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.power_office_steffen_active_power_7
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.solar_plug_1_active_power_8
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.solar_outlet_keller_active_power
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.heating_outlet_switch_0_power
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.car_power
+  #    gain: 0.7
+  #    sign: 1.0
+  #  - entity: sensor.brunnen_plug_power
+  #    gain: 0.7
+  #    sign: 1.0
 
 
 
