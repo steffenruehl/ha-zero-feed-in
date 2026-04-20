@@ -8,7 +8,7 @@ Zendure SolarFlow 2400 AC+.
 Handles:
   - AC mode switching (Input mode / Output mode)
   - Relay direction lockout (configurable, prevents relay chatter)
-  - Power rounding to device step size (10 W)
+  - Power rounding to device step size (5 W)
   - Redundant-send suppression
 """
 
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════
 
 DIRECTION_THRESHOLD_W = 10
-ROUNDING_STEP_W = 10
+ROUNDING_STEP_W = 5
 UNAVAILABLE_STATES = {None, "unknown", "unavailable"}
 
 AC_MODE_INPUT = "Input mode"
