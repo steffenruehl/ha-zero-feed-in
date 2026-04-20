@@ -56,7 +56,7 @@ zero_feed_in_controller:
   # Formula: Kp = interval / (2 × T1), Ki = Kp / (4 × T1)
   #
   #   Quadrant          Physical action      T1     Kp    Ki
-  #   discharge_up      increase discharge   5.0s   0.25  0.012
+  #   discharge_up      increase discharge   5.0s   0.25  0.025
   #   discharge_down    decrease discharge   3.5s   0.35  0.025
   #   charge_up         increase charge      3.5s   0.17  0.036
   #   charge_down       decrease charge      3.2s   0.23  0.036
@@ -71,7 +71,7 @@ zero_feed_in_controller:
   kp_charge_up: 0.17
   kp_charge_down: 0.23
 
-  ki_discharge_up: 0.012
+  ki_discharge_up: 0.025  # was 0.012, Ti: 21s → 10s (2×T1)
   ki_discharge_down: 0.025
   ki_charge_up: 0.036   # was 0.012, Ti: 14s → 4.7s
   ki_charge_down: 0.036 # was 0.018, Ti: 13s → 6.4s
