@@ -58,8 +58,8 @@ zero_feed_in_controller:
   #   Quadrant          Physical action      T1     Kp    Ki
   #   discharge_up      increase discharge   5.0s   0.25  0.012
   #   discharge_down    decrease discharge   3.5s   0.35  0.025
-  #   charge_up         increase charge      3.5s   0.17  0.012
-  #   charge_down       decrease charge      3.2s   0.23  0.018
+  #   charge_up         increase charge      3.5s   0.17  0.036
+  #   charge_down       decrease charge      3.2s   0.23  0.036
   #
   # Selection:
   #                     error >= 0            error < 0
@@ -73,8 +73,8 @@ zero_feed_in_controller:
 
   ki_discharge_up: 0.012
   ki_discharge_down: 0.025
-  ki_charge_up: 0.012
-  ki_charge_down: 0.018
+  ki_charge_up: 0.036   # was 0.012, Ti: 14s → 4.7s
+  ki_charge_down: 0.036 # was 0.018, Ti: 13s → 6.4s
 
   # ── Feed-forward sources (optional) ─────────────────────
   # Each source tracks a sensor and applies sign × gain × delta.
