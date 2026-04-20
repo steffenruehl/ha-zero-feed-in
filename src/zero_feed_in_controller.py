@@ -215,6 +215,14 @@ class Config:
     ki_charge_down: float = 0.021
     """Ki for decreasing charge."""
     deadband_w: float = 25.0
+    deadband_leak_ws: float = 500.0
+    """Error×time threshold (W·s) for in-deadband leak correction.
+
+    Accumulates ``error × dt`` while the PI is frozen inside the deadband.
+    When the magnitude reaches this threshold the PI is allowed to run
+    once (bypassing the deadband) and the accumulator resets.  Set to 0
+    to disable.  Default 500 W·s ≈ 26 s at a persistent 19 W error.
+    """
     interval_s: int = 5
 
     # Feed-forward
@@ -283,6 +291,7 @@ class Config:
             ),
             **gains,
             deadband_w=float(args.get("deadband", cls.deadband_w)),
+            deadband_leak_ws=float(args.get("deadband_leak_ws", cls.deadband_leak_ws)),
             interval_s=int(args.get("interval", cls.interval_s)),
             max_discharge_w=float(args.get("max_output", cls.max_discharge_w)),
             max_charge_w=float(args.get("max_charge", cls.max_charge_w)),
@@ -674,6 +683,7 @@ class ControlLogic:
         self._last_in_deadband: bool = False
         self._last_kp: float = 0.0
         self._last_ki: float = 0.0
+        self._db_acc: float = 0.0
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -730,7 +740,7 @@ class ControlLogic:
         target = self.target_for_mode()
 
         error = m.grid_power_w - target
-        pi_out, p_term, new_integral = self._run_pi(error)
+        pi_out, p_term, new_integral = self._run_pi(error, self.cfg.interval_s)
         self._last_p = p_term
 
         ff = self.ff.compute(m.ff_readings)
@@ -797,12 +807,15 @@ class ControlLogic:
         return ControlOutput.from_raw(forced, 0.0, forced, 0.0, "EMERGENCY")
 
     def _run_pi(
-        self, error: float,
+        self, error: float, dt: float,
     ) -> tuple[float, float, float]:
         """Compute PI output without committing state.
 
         If the error is within the deadband, the PI is frozen and
-        the last computed output is held.
+        the last computed output is held.  A secondary accumulator
+        tracks ``error × dt`` while frozen; when its magnitude reaches
+        ``deadband_leak_ws`` the deadband is bypassed for one tick so
+        the integral can correct a persistent steady-state offset.
 
         Returns:
             ``(output, p_term, new_integral)`` — caller decides
@@ -810,7 +823,17 @@ class ControlLogic:
         """
         if abs(error) <= self.cfg.deadband_w:
             self._last_in_deadband = True
-            return self.state.last_computed_w, 0.0, self.state.integral
+            leak = self.cfg.deadband_leak_ws
+            if leak > 0:
+                self._db_acc += error * dt
+                if abs(self._db_acc) < leak:
+                    return self.state.last_computed_w, 0.0, self.state.integral
+                self._db_acc = 0.0
+                self._last_in_deadband = False  # leak fired — allow PI this tick
+            else:
+                return self.state.last_computed_w, 0.0, self.state.integral
+        else:
+            self._db_acc = 0.0
 
         gains = self.gains.select(self.state.mode, error)
         self._last_kp = gains.kp
@@ -860,6 +883,7 @@ class ControlLogic:
 
         if self.state.mode != old_mode:
             self.state.charge_pending_since = None
+            self._db_acc = 0.0
             old_integral = self.state.integral
             if self.state.mode == OperatingMode.CHARGING:
                 # Seed the integral to the expected steady-state value so we

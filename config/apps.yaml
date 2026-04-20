@@ -49,6 +49,7 @@ zero_feed_in_controller:
   charge_confirm: 20           # seconds surplus must hold before CHARGING
   deadband: 35
   interval: 5
+  deadband_leak_ws: 250
 
   # ── Four-quadrant PI gains ─────────────────────────────
   #
