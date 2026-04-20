@@ -1,0 +1,61 @@
+# Feed-Forward Debug Dashboard
+#
+# Add as a new view in your Lovelace dashboard (raw YAML mode).
+# Requires debug: true in apps.yaml (already set).
+#
+# Sensors published when debug=true:
+#   sensor.zfi_ff              - total FF term (post-deadband)
+#   sensor.zfi_ff_pv_raw       - live PV sensor reading
+#   sensor.zfi_ff_pv_ema       - EMA filter state (τ=30s)
+#   sensor.zfi_ff_pv_contrib   - PV contribution before deadband
+#   sensor.zfi_ff_others_contrib - all load sources summed, before deadband
+
+title: FF Debug
+icon: mdi:flash-triangle
+cards:
+  - type: entities
+    title: Feed-Forward State
+    entities:
+      - entity: sensor.zfi_ff_pv_raw
+        name: PV raw (W)
+      - entity: sensor.zfi_ff_pv_ema
+        name: PV EMA / τ=30s (W)
+      - entity: sensor.zfi_ff_pv_contrib
+        name: PV contrib pre-deadband (W)
+      - entity: sensor.zfi_ff_others_contrib
+        name: Loads contrib pre-deadband (W)
+      - entity: sensor.zfi_ff
+        name: FF total post-deadband (W)
+
+  - type: history-graph
+    title: PV Filter — Raw vs EMA
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_ff_pv_raw
+        name: PV raw
+      - entity: sensor.zfi_ff_pv_ema
+        name: PV EMA (τ=30s)
+
+  - type: history-graph
+    title: FF Contribution Chain
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_ff_pv_contrib
+        name: PV contrib (pre-deadband)
+      - entity: sensor.zfi_ff_others_contrib
+        name: Loads contrib (pre-deadband)
+      - entity: sensor.zfi_ff
+        name: FF total (post-deadband)
+
+  - type: history-graph
+    title: PI + FF Decomposition
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_desired_power
+        name: Desired power
+      - entity: sensor.zfi_p_term
+        name: P term
+      - entity: sensor.zfi_i_term
+        name: I term
+      - entity: sensor.zfi_ff
+        name: FF term

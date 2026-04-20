@@ -135,6 +135,24 @@ class FeedForwardSource:
     """+1.0 for loads, -1.0 for generation."""
     filtered_w: float | None = None
     """EMA filter state. None until first reading; bootstrapped on first cycle."""
+    name: str | None = None
+    """Short label used for HA sensor names (e.g. 'pv'). Defaults to 'src{index}'."""
+
+
+@dataclass
+class FeedForwardSourceDebug:
+    """Per-source feed-forward snapshot after one control cycle."""
+
+    name: str
+    """Source label (matches FeedForwardSource.name)."""
+    raw_w: float | None
+    """Current sensor reading (W)."""
+    ema_w: float | None
+    """EMA filter state before this cycle's update (W)."""
+    delta_w: float
+    """EMA derivative: α × (raw − EMA). Zero when EMA not seeded."""
+    contrib_w: float
+    """Per-source contribution: sign × gain × delta_w (pre-deadband, W)."""
 
 
 @dataclass
@@ -341,6 +359,7 @@ class Config:
                     entity=src["entity"],
                     gain=float(src.get("gain", 0.6)),
                     sign=float(src.get("sign", -1.0)),
+                    name=src.get("name"),
                 )
                 for src in raw
             )
@@ -487,12 +506,14 @@ class FeedForward:
                 entity=s.entity,
                 gain=s.gain,
                 sign=s.sign,
+                name=s.name if s.name is not None else f"src{i}",
             )
-            for s in sources
+            for i, s in enumerate(sources)
         ]
         self._deadband_w = deadband_w
         self._enabled = enabled
         self._alpha = interval_s / (filter_tau_s + interval_s)
+        self.last_debug: list[FeedForwardSourceDebug] = []
 
     @property
     def entities(self) -> list[str]:
@@ -507,14 +528,32 @@ class FeedForward:
         total. Returns 0.0 when disabled or on first cycle (EMA not seeded).
         """
         if not self._enabled:
+            self.last_debug = []
             return 0.0
+        debug: list[FeedForwardSourceDebug] = []
         total = 0.0
         for src in self._sources:
             current = readings.get(src.entity)
             if current is None or src.filtered_w is None:
+                debug.append(FeedForwardSourceDebug(
+                    name=src.name,
+                    raw_w=current,
+                    ema_w=src.filtered_w,
+                    delta_w=0.0,
+                    contrib_w=0.0,
+                ))
                 continue
             delta = self._alpha * (current - src.filtered_w)
-            total += src.sign * src.gain * delta
+            contrib = src.sign * src.gain * delta
+            debug.append(FeedForwardSourceDebug(
+                name=src.name,
+                raw_w=current,
+                ema_w=src.filtered_w,
+                delta_w=delta,
+                contrib_w=contrib,
+            ))
+            total += contrib
+        self.last_debug = debug
         if abs(total) < self._deadband_w:
             return 0.0
         return total
@@ -1212,6 +1251,21 @@ class ZeroFeedInController(_HASS_BASE):
         self._set_sensor(
             "ff", round(output.ff_term), "W", "mdi:flash",
         )
+        pv = next((d for d in self.logic.ff.last_debug if d.name == "pv"), None)
+        if pv is not None:
+            self._set_sensor(
+                "ff_pv_raw",
+                round(pv.raw_w) if pv.raw_w is not None else "unavailable",
+                "W", "mdi:solar-power-variant",
+            )
+            self._set_sensor(
+                "ff_pv_ema",
+                round(pv.ema_w) if pv.ema_w is not None else "unavailable",
+                "W", "mdi:chart-bell-curve",
+            )
+            self._set_sensor("ff_pv_contrib", round(pv.contrib_w), "W", "mdi:flash-outline")
+        others = sum(d.contrib_w for d in self.logic.ff.last_debug if d.name != "pv")
+        self._set_sensor("ff_others_contrib", round(others), "W", "mdi:flash-outline")
         self._set_sensor(
             "integral", round(self.logic.state.integral), "W", "mdi:sigma"
         )
