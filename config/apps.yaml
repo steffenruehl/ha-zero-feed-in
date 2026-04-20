@@ -80,7 +80,7 @@ zero_feed_in_controller:
   # Each source tracks a sensor and applies sign × gain × delta.
   # sign: -1.0 for generation (PV), +1.0 for loads (wallbox, dryer).
   # Deadband is applied to the total sum, not per source.
-  ff_enabled: true              # set true to enable feed-forward
+  ff_enabled: false              # set true to enable feed-forward
   ff_deadband: 30               # ignore total FF below this (W)
   feed_forward_sources:
     - entity: sensor.solarstrom_switch_0_power
@@ -178,7 +178,7 @@ zendure_solarflow_driver:
 
   # ── Driver settings ────────────────────────────────────
   watchdog_s: 5                # re-run even when desired_power hasn't changed
-  direction_lockout: 30        # base relay lockout (s)
+  direction_lockout: 10        # base relay lockout (s)
   relay_sm_enabled: true        # set false to disable state machine
   adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
   min_active_power_w: 25       # minimum power floor in active states (W)

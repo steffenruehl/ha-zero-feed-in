@@ -807,10 +807,17 @@ class ControlLogic:
         if self.state.mode != old_mode:
             self.state.charge_pending_since = None
             old_integral = self.state.integral
-            self.state.integral = 0.0
+            if self.state.mode == OperatingMode.CHARGING:
+                # Seed the integral to the expected steady-state value so we
+                # don't waste minutes winding up from zero.  The surplus has
+                # been stable for charge_confirm_s seconds, so -surplus is a
+                # reliable estimate of the charge rate we'll need.
+                self.state.integral = max(-surplus, -self.cfg.max_charge_w)
+            else:
+                self.state.integral = 0.0
             self._log(
                 f"Mode {old_mode.name} → {self.state.mode.name} "
-                f"(integral reset: {old_integral:.0f} → 0)"
+                f"(integral: {old_integral:.0f} → {self.state.integral:.0f})"
             )
 
     def target_for_mode(self) -> float:
