@@ -80,8 +80,9 @@ zero_feed_in_controller:
   # Each source tracks a sensor and applies sign × gain × delta.
   # sign: -1.0 for generation (PV), +1.0 for loads (wallbox, dryer).
   # Deadband is applied to the total sum, not per source.
-  ff_enabled: true               # PV source only; load sources disabled pending evaluation
+  ff_enabled: true
   ff_deadband: 30               # ignore total FF below this (W)
+  ff_filter_tau_s: 30           # EMA time constant for filtered derivative (s); α=5/35≈0.14
   feed_forward_sources:
     - entity: sensor.solarstrom_switch_0_power
       gain: 0.6

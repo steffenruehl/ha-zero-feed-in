@@ -133,8 +133,8 @@ class FeedForwardSource:
     """Fraction of delta to apply (0.0–1.0)."""
     sign: float
     """+1.0 for loads, -1.0 for generation."""
-    previous_w: float | None = None
-    """Sensor reading from the previous cycle. None until first reading."""
+    filtered_w: float | None = None
+    """EMA filter state. None until first reading; bootstrapped on first cycle."""
 
 
 @dataclass
@@ -204,6 +204,8 @@ class Config:
     """Master switch to enable/disable feed-forward compensation."""
     ff_deadband_w: float = 20.0
     """Ignore total FF correction below this threshold (W)."""
+    ff_filter_tau_s: float = 30.0
+    """EMA filter time constant for the FF derivative (s). Higher = smoother but slower response."""
     ff_sources: tuple[FeedForwardSource, ...] = ()
     """Feed-forward input sources (PV, loads, etc.). Empty = FF disabled."""
 
@@ -280,6 +282,7 @@ class Config:
             ),
             ff_enabled=bool(args.get("ff_enabled", cls.ff_enabled)),
             ff_deadband_w=float(args.get("ff_deadband", cls.ff_deadband_w)),
+            ff_filter_tau_s=float(args.get("ff_filter_tau_s", cls.ff_filter_tau_s)),
             ff_sources=cls._parse_ff_sources(args),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
@@ -456,15 +459,19 @@ class ControllerState:
 
 
 class FeedForward:
-    """Multi-source feed-forward compensation.
+    """Multi-source feed-forward compensation using a filtered derivative.
 
-    Tracks an arbitrary number of ``FeedForwardSource`` instances.
-    Each cycle, the HA adapter passes a ``{entity: reading}`` dict and
-    this class computes the total correction (sign × gain × delta).
-    A deadband is applied to the **sum** of all sources, not per-source.
+    Each source tracks an EMA of its sensor value. The FF term for each
+    source is ``sign × gain × α × (current − EMA_state)``, i.e. the EMA
+    derivative scaled by gain. This is the standard derivative-with-filter
+    form (ISA PID D-filter) and attenuates high-frequency noise by
+    1/(1 + jωτ) while preserving slow ramps.
 
-    First-cycle bootstrap: sources whose ``previous_w`` is still
-    ``None`` contribute 0 and are silently initialised.
+    ``τ = filter_tau_s``, ``α = interval_s / (τ + interval_s)``.
+
+    A deadband is applied to the sum of all sources after filtering.
+    First-cycle bootstrap: the EMA is seeded from the first reading to
+    produce zero delta on the second cycle.
     """
 
     def __init__(
@@ -472,6 +479,8 @@ class FeedForward:
         sources: tuple[FeedForwardSource, ...],
         deadband_w: float = 20.0,
         enabled: bool = True,
+        filter_tau_s: float = 30.0,
+        interval_s: float = 5.0,
     ) -> None:
         self._sources: list[FeedForwardSource] = [
             FeedForwardSource(
@@ -483,6 +492,7 @@ class FeedForward:
         ]
         self._deadband_w = deadband_w
         self._enabled = enabled
+        self._alpha = interval_s / (filter_tau_s + interval_s)
 
     @property
     def entities(self) -> list[str]:
@@ -492,31 +502,34 @@ class FeedForward:
     def compute(self, readings: dict[str, float | None]) -> float:
         """Compute total feed-forward correction.
 
-        For each source, the delta from the previous reading is
-        scaled by ``sign × gain`` and added to the total.
-        A deadband is applied to the sum: if ``|total| < deadband_w``
-        the correction is suppressed to zero.
-        Returns 0.0 when disabled.
+        For each source, the filtered derivative (α × (current − EMA_state))
+        is scaled by ``sign × gain`` and summed. A deadband is applied to the
+        total. Returns 0.0 when disabled or on first cycle (EMA not seeded).
         """
         if not self._enabled:
             return 0.0
         total = 0.0
         for src in self._sources:
             current = readings.get(src.entity)
-            if current is None or src.previous_w is None:
+            if current is None or src.filtered_w is None:
                 continue
-            delta = current - src.previous_w
+            delta = self._alpha * (current - src.filtered_w)
             total += src.sign * src.gain * delta
         if abs(total) < self._deadband_w:
             return 0.0
         return total
 
     def update_previous(self, readings: dict[str, float | None]) -> None:
-        """Update previous-cycle readings for all sources."""
+        """Advance the EMA filter state for all sources."""
         for src in self._sources:
             current = readings.get(src.entity)
             if current is not None:
-                src.previous_w = current
+                if src.filtered_w is None:
+                    src.filtered_w = current  # bootstrap: zero delta next cycle
+                else:
+                    src.filtered_w = (
+                        self._alpha * current + (1.0 - self._alpha) * src.filtered_w
+                    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -613,6 +626,8 @@ class ControlLogic:
             cfg.ff_sources,
             deadband_w=cfg.ff_deadband_w,
             enabled=cfg.ff_enabled,
+            filter_tau_s=cfg.ff_filter_tau_s,
+            interval_s=cfg.interval_s,
         )
         self._last_p = 0.0
         self._last_i = 0.0
