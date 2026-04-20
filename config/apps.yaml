@@ -179,9 +179,12 @@ zendure_solarflow_driver:
 
   # ── Driver settings ────────────────────────────────────
   watchdog_s: 5                # re-run even when desired_power hasn't changed
-  direction_lockout: 10        # base relay lockout (s)
+  relay_lockout_ws: 6000       # W·s the accumulator must reach before a direction change
+                               # (was: adaptive_lockout_ref_w × direction_lockout = 200×10)
+  relay_lockout_cutoff_w: 25   # floor on power used in accumulator (W); max wait = ws/cutoff
+  relay_lockout_idle_s: 60     # time (s) before switching to idle
+
   relay_sm_enabled: true        # set false to disable state machine
-  adaptive_lockout_ref_w: 200  # full-speed lockout at this power (W)
   min_active_power_w: 25       # minimum power floor in active states (W)
 
   # ── Debug ───────────────────────────────────────────────

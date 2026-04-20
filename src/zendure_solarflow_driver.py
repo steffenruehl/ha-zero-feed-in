@@ -71,20 +71,22 @@ class RelayDirection(Enum):
 class AdaptiveLockout:
     """Integrates |power| × dt to decide when relay lockout expires.
 
-    Instead of using instantaneous power to scale a fixed duration,
-    each tick contributes ``|power| × dt`` to an accumulator.  The
-    lockout expires when the accumulated energy reaches::
+    Each tick contributes ``effective_power × dt`` to an accumulator, where
+    ``effective_power = max(|power_w|, cutoff_w)``.  The cutoff prevents an
+    infinitely long lockout when commanded power is near zero.
 
-        threshold = full_power_w × base_lockout_s
+    The lockout expires when the accumulated energy reaches ``threshold_ws``
+    (passed in from outside so a single config value is shared across all
+    AdaptiveLockout instances in the state machine).
 
-    Examples with full_power_w=200, base=30 s (threshold = 6000 W·s):
-        200 W sustained → 30 s
-        100 W sustained → 60 s
-        50 W sustained  → 120 s
-        Variable power  → each slice contributes proportionally
+    Examples with threshold_ws=2000, cutoff_w=25:
+        400 W sustained →  5 s
+        200 W sustained → 10 s
+        100 W sustained → 20 s
+         25 W (or less) → 80 s  ← floor prevents infinite wait
     """
 
-    full_power_w: float = 200.0
+    cutoff_w: float = 1.0
     _accumulated_ws: float = 0.0
     _last_tick_t: float = 0.0
 
@@ -103,16 +105,16 @@ class AdaptiveLockout:
         self._last_tick_t = 0.0
 
     def tick(self, power_w: float, now: float) -> None:
-        """Accumulate a time slice of |power| × dt."""
+        """Accumulate a time slice of effective_power × dt."""
         if self._last_tick_t > 0.0:
             dt = now - self._last_tick_t
             if dt > 0:
-                self._accumulated_ws += abs(power_w) * dt
+                effective_w = max(abs(power_w), self.cutoff_w)
+                self._accumulated_ws += effective_w * dt
         self._last_tick_t = now
 
-    def is_settled(self, base_s: float) -> bool:
-        """True if accumulated energy has reached the threshold."""
-        threshold_ws = self.full_power_w * base_s
+    def is_settled(self, threshold_ws: float) -> bool:
+        """True if accumulated energy has reached threshold_ws."""
         return self._accumulated_ws >= threshold_ws
 
     @property
@@ -120,9 +122,9 @@ class AdaptiveLockout:
         """Accumulated energy (W·s)."""
         return self._accumulated_ws
 
-    def threshold(self, base_s: float) -> float:
-        """Energy threshold (W·s) that must be accumulated before the lockout expires."""
-        return self.full_power_w * base_s
+    def threshold(self, threshold_ws: float) -> float:
+        """Return the threshold (pass-through for logging symmetry)."""
+        return threshold_ws
 
 
 @dataclass
@@ -143,12 +145,15 @@ class Config:
     """HA select entity for AC mode ('Input mode' / 'Output mode')."""
     watchdog_s: int = 15
     """Watchdog interval (s): re-run even when desired_power hasn't changed."""
-    direction_lockout_s: float = 5.0
-    """Base lockout duration before allowing a relay direction change (s).""" 
+    relay_lockout_ws: float = 1000.0
+    """Energy threshold (W·s) that the adaptive accumulator must reach before a
+    relay direction change is allowed.  Higher = less frequent switching."""
+    relay_lockout_cutoff_w: float = 1.0
+    """Floor on the power used in the accumulator (W).  Prevents an infinitely
+    long lockout when commanded power is near zero."""
+    relay_lockout_idle_s: float = 5.0
+    """Time (s) the controller must request IDLE before the relay goes idle."""
     relay_sm_enabled: bool = True
-    """If False, bypass the relay state machine entirely."""
-    adaptive_lockout_ref_w: float = 200.0
-    """Reference power for full-speed adaptive lockout (W)."""
     min_active_power_w: float = MIN_ACTIVE_POWER_W
     """Minimum power floor in active relay states (W). Below this the
     device may idle, so the SM clamps to at least this value."""
@@ -172,14 +177,17 @@ class Config:
             input_entity=args["input_limit_entity"],
             ac_mode_entity=args["ac_mode_entity"],
             watchdog_s=int(args.get("watchdog_s", cls.watchdog_s)),
-            direction_lockout_s=float(
-                args.get("direction_lockout", cls.direction_lockout_s)
+            relay_lockout_ws=float(
+                args.get("relay_lockout_ws", cls.relay_lockout_ws)
+            ),
+            relay_lockout_cutoff_w=float(
+                args.get("relay_lockout_cutoff_w", cls.relay_lockout_cutoff_w)
+            ),
+            relay_lockout_idle_s=float(
+                args.get("relay_lockout_idle_s", cls.relay_lockout_idle_s)
             ),
             relay_sm_enabled=bool(
                 args.get("relay_sm_enabled", cls.relay_sm_enabled)
-            ),
-            adaptive_lockout_ref_w=float(
-                args.get("adaptive_lockout_ref_w", cls.adaptive_lockout_ref_w)
             ),
             min_active_power_w=float(
                 args.get("min_active_power_w", cls.min_active_power_w)
@@ -239,7 +247,7 @@ class RelayStateMachine:
         idle_lockout_s: float,
         charge_lockout: AdaptiveLockout,
         discharge_lockout: AdaptiveLockout,
-        base_lockout_s: float,
+        threshold_ws: float,
         min_active_power_w: float = MIN_ACTIVE_POWER_W,
         log_fn=None,
         publish_fn=None,
@@ -247,7 +255,7 @@ class RelayStateMachine:
         self.idle_lockout_s = idle_lockout_s
         self.charge_lockout = charge_lockout
         self.discharge_lockout = discharge_lockout
-        self.base_lockout_s = base_lockout_s
+        self.threshold_ws = threshold_ws
         self.min_active_power_w = min_active_power_w
         self._log = log_fn
         self._publish = publish_fn
@@ -333,12 +341,12 @@ class RelayStateMachine:
 
         # Per-direction transition progress (always shown independently)
         al = self.charge_lockout
-        threshold = al.threshold(self.base_lockout_s)
+        threshold = al.threshold(self.threshold_ws)
         pct = min(100, al.progress / max(1, threshold) * 100)
         self._publish("relay_sm_charge_pct", f"{pct:.0f}", "%", "mdi:battery-charging")
 
         al = self.discharge_lockout
-        threshold = al.threshold(self.base_lockout_s)
+        threshold = al.threshold(self.threshold_ws)
         pct = min(100, al.progress / max(1, threshold) * 100)
         self._publish("relay_sm_discharge_pct", f"{pct:.0f}", "%", "mdi:battery-arrow-down")
 
@@ -380,7 +388,7 @@ class RelayStateMachine:
             if self._last_target == RelayState.CHARGING
             else self.discharge_lockout
         )
-        threshold = al.threshold(self.base_lockout_s)
+        threshold = al.threshold(self.threshold_ws)
         pct = min(100, al.progress / max(1, threshold) * 100)
         return pct, al.progress, threshold
 
@@ -418,9 +426,9 @@ class RelayStateMachine:
         if target == RelayState.IDLE:
             return self._idle_accumulated_s >= self.idle_lockout_s
         if target == RelayState.CHARGING:
-            return self.charge_lockout.is_settled(self.base_lockout_s)
+            return self.charge_lockout.is_settled(self.threshold_ws)
         if target == RelayState.DISCHARGING:
-            return self.discharge_lockout.is_settled(self.base_lockout_s)
+            return self.discharge_lockout.is_settled(self.threshold_ws)
         return False
 
     def _reset_all_transitions(self) -> None:
@@ -520,14 +528,14 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             self.log(f"CSV logging to {self.cfg.log_dir}/zfi_driver_*.csv")
 
         self.relay_sm = RelayStateMachine(
-            idle_lockout_s=self.cfg.direction_lockout_s,
+            idle_lockout_s=self.cfg.relay_lockout_idle_s,
             charge_lockout=AdaptiveLockout(
-                full_power_w=self.cfg.adaptive_lockout_ref_w,
+                cutoff_w=self.cfg.relay_lockout_cutoff_w,
             ),
             discharge_lockout=AdaptiveLockout(
-                full_power_w=self.cfg.adaptive_lockout_ref_w,
+                cutoff_w=self.cfg.relay_lockout_cutoff_w,
             ),
-            base_lockout_s=self.cfg.direction_lockout_s,
+            threshold_ws=self.cfg.relay_lockout_ws,
             min_active_power_w=self.cfg.min_active_power_w,
             log_fn=self.log,
             publish_fn=self._set_sensor,
@@ -540,8 +548,9 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         self.log(
             f"Started | desired_power={self.cfg.desired_power_sensor} "
             f"relay_sm={self.cfg.relay_sm_enabled} "
-            f"lockout={self.cfg.direction_lockout_s}s "
-            f"adaptive_ref={self.cfg.adaptive_lockout_ref_w}W "
+            f"lockout_ws={self.cfg.relay_lockout_ws}W·s "
+            f"cutoff_w={self.cfg.relay_lockout_cutoff_w}W "
+            f"idle_s={self.cfg.relay_lockout_idle_s}s "
             f"watchdog={self.cfg.watchdog_s}s "
             f"dry_run={self.cfg.dry_run}"
         )
