@@ -56,11 +56,10 @@ zero_feed_in_controller:
   # Formula: Kp = interval / (2 × T1), Ki = Kp / (4 × T1)
   #
   #   Quadrant          Physical action      T1     Kp    Ki
-  #   Quadrant          Physical action      T1     Kp    Ki
   #   discharge_up      increase discharge   5.0s   0.25  0.012
   #   discharge_down    decrease discharge   3.5s   0.35  0.025
-  #   charge_up         increase charge      7.5s   0.17  0.006
-  #   charge_down       decrease charge      5.5s   0.23  0.010
+  #   charge_up         increase charge      3.5s   0.17  0.012
+  #   charge_down       decrease charge      3.2s   0.23  0.018
   #
   # Selection:
   #                     error >= 0            error < 0
@@ -74,8 +73,8 @@ zero_feed_in_controller:
 
   ki_discharge_up: 0.012
   ki_discharge_down: 0.025
-  ki_charge_up: 0.006
-  ki_charge_down: 0.010
+  ki_charge_up: 0.012
+  ki_charge_down: 0.018
 
   # ── Feed-forward sources (optional) ─────────────────────
   # Each source tracks a sensor and applies sign × gain × delta.
@@ -129,7 +128,7 @@ zero_feed_in_controller:
   # ── Power limits ────────────────────────────────────────
   max_output: 1200             # max discharge (W)
   max_charge: 800             # max charge (W)
-  min_soc: 10
+  min_soc: 15
   max_soc: 85
 
   # ── Protection ──────────────────────────────────────────

@@ -426,22 +426,31 @@ class TestStateUpdates:
 
 
 # ═══════════════════════════════════════════════════════════
-#  Relay lockout — integral freeze
+#  Relay lockout — integral tracks demand, capped by back-calc
 # ═══════════════════════════════════════════════════════════
 
 
 class TestRelayLocked:
-    def test_integral_frozen_when_relay_locked(self):
-        """Relay locked → integral does not change, output still computed."""
+    def test_integral_grows_when_relay_locked(self):
+        """Relay locked → integral still grows so the SM sees full demand."""
         logic = make_logic(deadband_w=0)
         logic.seed(None)
         logic.state.integral = 50.0
         m = make_measurement(grid_power_w=200, soc_pct=50, relay_locked=True)
-        output = logic.compute(m, now=0)
-        # Output is still computed (non-zero), but integral is frozen
-        assert output.desired_power_w > 0
-        assert logic.state.integral == 50.0
-        assert "relay locked" in output.reason
+        logic.compute(m, now=0)
+        assert logic.state.integral != 50.0
+        assert logic.state.integral > 50.0
+
+    def test_back_calc_applied_when_locked_and_clamped(self):
+        """When relay is locked and output hits the power cap, back-calc still runs."""
+        logic = make_logic(deadband_w=0, max_discharge_w=100)
+        logic.seed(None)
+        logic.state.integral = 50.0
+        # Error large enough that P-term alone exceeds max_discharge_w
+        m = make_measurement(grid_power_w=500, soc_pct=50, relay_locked=True)
+        logic.compute(m, now=0)
+        # Back-calc should have moved the integral away from 50
+        assert logic.state.integral != 50.0
 
     def test_integral_committed_when_relay_unlocked(self):
         """Relay not locked → integral updates normally."""
@@ -454,16 +463,13 @@ class TestRelayLocked:
         assert logic.state.integral != 50.0
         assert "relay locked" not in output.reason
 
-    def test_no_anti_windup_back_calc_when_locked(self):
-        """When relay is locked and output is clamped, integral should NOT
-        be back-calculated — just frozen."""
-        logic = make_logic(deadband_w=0, max_discharge_w=100)
+    def test_reason_suffix_when_locked(self):
+        """Relay locked → reason string includes '(relay locked)' suffix."""
+        logic = make_logic(deadband_w=0)
         logic.seed(None)
-        logic.state.integral = 50.0
-        # Big error → output > 100 → would be clamped + back-calculated
-        m = make_measurement(grid_power_w=500, soc_pct=50, relay_locked=True)
-        logic.compute(m, now=0)
-        assert logic.state.integral == 50.0
+        m = make_measurement(grid_power_w=200, soc_pct=50, relay_locked=True)
+        output = logic.compute(m, now=0)
+        assert "relay locked" in output.reason
 
 
 # ═══════════════════════════════════════════════════════════

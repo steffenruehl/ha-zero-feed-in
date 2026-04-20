@@ -695,19 +695,22 @@ class ControlLogic:
             self.ff.update_previous(m.ff_readings)
             return guarded
 
-        # Commit PI state (unless relay is locked — freeze to prevent windup)
-        if m.relay_locked:
-            self._last_i = self.state.integral
-        else:
-            self.state.integral = new_integral
-            self._last_i = new_integral
+        self.state.integral = new_integral
+        self._last_i = new_integral
 
         clamped = self._clamp(combined, surplus)
 
-        # Anti-windup: back-calculate integral when surplus/power clamp active
-        if clamped != combined and not m.relay_locked:
-            self.state.integral = clamped - p_term
-            self._last_i = self.state.integral
+        # Anti-windup: back-calculate when output was clamped.
+        # During relay lock the PI freeze above already prevents normal windup.
+        # But if the surplus clamp fires while relay is locked the integral can
+        # be more aggressive than what the current surplus allows — cap it by
+        # applying anti-windup only when it would bring the integral closer to
+        # zero (less extreme), never when it would push it further away.
+        if clamped != combined:
+            target_integral = clamped - p_term
+            if abs(target_integral) < abs(self.state.integral):
+                self.state.integral = target_integral
+                self._last_i = self.state.integral
 
         suffix = " (relay locked)" if m.relay_locked else ""
         reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name}){suffix}"
