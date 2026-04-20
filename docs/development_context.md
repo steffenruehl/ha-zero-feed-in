@@ -123,12 +123,9 @@ if raw < 0:  # wants to charge
 src/
 ├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
-├── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
 └── csv_logger.py                 # shared daily-rotating CSV file logger
 config/
-├── apps.yaml                     # AppDaemon configuration (references !secret)
-├── secrets.yaml                  # device credentials (git-ignored, not committed)
-└── secrets.yaml.example          # template for secrets.yaml
+└── apps.yaml                     # AppDaemon configuration for both apps
 tests/
 ├── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController
 ├── test_zendure_solarflow_driver.py  # unit tests for AdaptiveLockout & RelayStateMachine
@@ -143,7 +140,6 @@ docs/
 ```
 Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX, EMERGENCY_SAFETY_MARGIN_W,
             CONTROLLER_CSV_COLUMNS
-
 
 Enums:      OperatingMode (CHARGING, DISCHARGING)
 
@@ -182,22 +178,11 @@ ZeroFeedInController(hass.Hass): — thin HA adapter
   _log_csv()                    — append row to CSV file (if log_dir set)
 ```
 
-### Watchdog Code Organization (src/solarflow_mqtt_watchdog.py)
-
-```
-SolarFlowMqttWatchdog(_HASS_BASE):
-  initialize()          — register HA startup event + entity unavailable listener
-  _on_ha_start()        — schedule reconnect after startup_delay_s
-  _on_entity_stale()    — trigger reconnect when watch_entity unavailable too long
-  _trigger_reconnect()  — POST HA.Mqtt.SetConfig to SolarFlow HTTP API
-```
-
 ### Driver Code Organization (src/zendure_solarflow_driver.py)
 
 ```
 Constants:  DIRECTION_THRESHOLD_W, ROUNDING_STEP_W, AC_MODE_*,
-            AC_MODE_RETRY_S, RELAY_SAFETY_TIMEOUT_S, RELAY_SWITCH_DELAY_S,
-            MIN_ACTIVE_POWER_W
+            AC_MODE_RETRY_S, RELAY_SAFETY_TIMEOUT_S, MIN_ACTIVE_POWER_W
 
 Enums:      RelayDirection (CHARGE, IDLE, DISCHARGE)
             RelayState     (IDLE, CHARGING, DISCHARGING)
@@ -300,7 +285,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 
 - **No persistence across restarts**: integral, mode reset. Startup seeding mitigates.
 - **No unit tests**: PIController, compute pipeline, guards are testable pure functions  
-  → **Resolved**: 188 tests covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, CsvLogger
+  → **Resolved**: 88 tests (32 controller + 56 driver) covering ControlLogic, PIController, AdaptiveLockout, RelayStateMachine
 - **No time-of-use / dynamic tariff support**: could charge from grid during negative prices
 - **Emergency only curtails discharge**: doesn't start charging to absorb existing PV surplus
 - **Single-instance only**: no multi-device HEMS support

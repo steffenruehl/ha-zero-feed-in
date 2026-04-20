@@ -45,7 +45,10 @@ CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
     "p_term", "i_term", "ff_term",
-    "integral", "target_w", "error_w", "reason",
+    "integral", "target_w", "error_w",
+    "in_deadband", "relay_locked", "charge_pending",
+    "kp_used", "ki_used",
+    "reason",
 ]
 """Column names for controller CSV log (excluding timestamp)."""
 
@@ -614,6 +617,9 @@ class ControlLogic:
         self._last_p = 0.0
         self._last_i = 0.0
         self._last_ff = 0.0
+        self._last_in_deadband: bool = False
+        self._last_kp: float = 0.0
+        self._last_ki: float = 0.0
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -653,6 +659,10 @@ class ControlLogic:
         """
         if now is None:
             now = time.monotonic()
+
+        self._last_in_deadband = False
+        self._last_kp = 0.0
+        self._last_ki = 0.0
 
         surplus = self.estimate_surplus(m)
 
@@ -742,9 +752,12 @@ class ControlLogic:
             whether to commit ``new_integral`` to ``self.state``.
         """
         if abs(error) <= self.cfg.deadband_w:
+            self._last_in_deadband = True
             return self.state.last_computed_w, 0.0, self.state.integral
 
         gains = self.gains.select(self.state.mode, error)
+        self._last_kp = gains.kp
+        self._last_ki = gains.ki
         pi_output, p_term, new_integral = self.pi.update(
             error=error,
             integral=self.state.integral,
@@ -1099,6 +1112,11 @@ class ZeroFeedInController(_HASS_BASE):
             "integral": round(self.logic.state.integral),
             "target_w": round(target),
             "error_w": round(m.grid_power_w - target),
+            "in_deadband": int(self.logic._last_in_deadband),
+            "relay_locked": int(m.relay_locked),
+            "charge_pending": int(self.logic.state.charge_pending_since is not None),
+            "kp_used": self.logic._last_kp,
+            "ki_used": self.logic._last_ki,
             "reason": output.reason,
         })
 
