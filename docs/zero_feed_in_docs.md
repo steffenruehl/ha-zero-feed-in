@@ -163,30 +163,45 @@ NOT velocity/incremental form. Critical with the SolarFlow's 10-15 s response la
 
 The ``FeedForward`` class processes an arbitrary list of sensor sources.
 Each source has a sign (+1 for loads, -1 for generation) and a gain.
-A deadband is applied to the **total** correction, not per-source:
+
+Instead of a raw delta, the derivative is taken on an **EMA-filtered** value
+(ISA PID D-filter). This attenuates high-frequency sensor noise while preserving
+slow ramps that merit a feed-forward response:
 
 ```
-total = 0
+α = interval_s / (filter_tau_s + interval_s)   # e.g. 5/(30+5) ≈ 0.14
+
 for each source:
-    delta = current - previous
-    total += sign × gain × delta
-if |total| < ff_deadband:
-    total = 0
-combined = pi_output + total
+    EMA_t = α × current + (1−α) × EMA_{t-1}    # update filter state
+    delta = α × (current − EMA_{t-1})           # filtered derivative
+    contrib += sign × gain × delta
+
+if |contrib| < ff_deadband:
+    contrib = 0
+combined = pi_output + contrib
 ```
+
+With τ=30 s a 200 W spike produces a 28 W FF impulse — below the 30 W deadband,
+so short cloud transients are ignored. Sustained slow ramps exceed the deadband
+and do trigger a feed-forward response.
 
 PV drops → positive ff (increase discharge). Load increases → positive ff.
 New sources are a YAML entry, no code changes required.
 Set ``ff_enabled: false`` to disable feed-forward without removing sources.
 
+Each source can carry an optional ``name`` that is used for HA debug sensor
+names (e.g. ``name: pv`` → ``sensor.zfi_ff_pv_raw``).
+
 Example configuration:
 ```yaml
 ff_enabled: true
-ff_deadband: 20
+ff_deadband: 30
+ff_filter_tau_s: 30     # EMA time constant (s); α = interval/(tau+interval)
 feed_forward_sources:
   - entity: sensor.pv_power
     gain: 0.6
     sign: -1.0          # generation
+    name: pv            # → sensor.zfi_ff_pv_raw / _ema / _contrib
   - entity: sensor.wallbox_power
     gain: 0.8
     sign: 1.0           # load
@@ -282,7 +297,7 @@ During lockout, power is **clamped** to the current direction's minimum active p
 
 ### 4. Rounding and Suppression
 
-- Power rounded to 10 W steps (`ROUNDING_STEP_W`)
+- Power rounded to 5 W steps (`ROUNDING_STEP_W`)
 - Redundant sends suppressed (only send when values change)
 
 ---
@@ -373,7 +388,7 @@ flowchart TD
     SMU --> RND
     PASS --> RND
 
-    RND["Round to 10W steps<br>discharge_w, charge_w"]
+    RND["Round to 5W steps<br>discharge_w, charge_w"]
 
     RND --> DRY{dry_run?}
     DRY -- Yes --> PUB
@@ -446,7 +461,11 @@ Published only when `debug: true` in the controller config.
 | `zfi_error` | number | W | Regulation error |
 | `zfi_p_term` | number | W | Proportional component |
 | `zfi_i_term` | number | W | Integral component |
-| `zfi_ff` | number | W | Feed-forward component |
+| `zfi_ff` | number | W | Feed-forward component (post-deadband) |
+| `zfi_ff_pv_raw` | number | W | Live PV sensor reading |
+| `zfi_ff_pv_ema` | number | W | PV EMA filter state (τ = 30 s) |
+| `zfi_ff_pv_contrib` | number | W | PV contribution before deadband |
+| `zfi_ff_others_contrib` | number | W | All non-PV load sources summed, before deadband |
 | `zfi_integral` | number | W | Integral accumulator |
 | `zfi_reason` | text | — | Decision reason |
 

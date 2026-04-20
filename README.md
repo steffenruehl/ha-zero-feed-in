@@ -34,7 +34,7 @@ Two apps with clear separation of concerns:
 | App | File | Responsibility |
 | --- | --- | --- |
 | Controller | `zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
-| Driver | `zendure_solarflow_driver.py` | AC mode, relay lockout, 10 W rounding, redundant-send suppression |
+| Driver | `zendure_solarflow_driver.py` | AC mode, relay lockout, 5 W rounding, redundant-send suppression |
 | Watchdog | `solarflow_mqtt_watchdog.py` | Reconnects SolarFlow to MQTT broker after broker restarts |
 
 ### Key Features
@@ -121,8 +121,8 @@ Start with `max_output: 200` and increase over several days.
 | `charge_target_power` | 0 W | Charge target (absorb all surplus) |
 | `kp_discharge_up` / `kp_discharge_down` | 0.25 / 0.35 | Proportional gain: increase / decrease discharge |
 | `kp_charge_up` / `kp_charge_down` | 0.17 / 0.23 | Proportional gain: increase / decrease charge |
-| `ki_discharge_up` / `ki_discharge_down` | 0.012 / 0.025 | Integral gain: increase / decrease discharge |
-| `ki_charge_up` / `ki_charge_down` | 0.006 / 0.010 | Integral gain: increase / decrease charge |
+| `ki_discharge_up` / `ki_discharge_down` | 0.025 / 0.025 | Integral gain: increase / decrease discharge |
+| `ki_charge_up` / `ki_charge_down` | 0.036 / 0.036 | Integral gain: increase / decrease charge |
 | `deadband` | 25 W | Error range where PI freezes |
 | `interval` | 5 s | Control cycle interval |
 | `max_output` | 800 W | Maximum discharge power |
@@ -131,6 +131,9 @@ Start with `max_output: 200` and increase over several days.
 | `mode_hysteresis` | 50 W | Surplus band for mode switching |
 | `charge_confirm` | 15 s | Seconds surplus must hold before charging |
 | `max_feed_in` | 800 W | Emergency curtailment threshold |
+| `ff_enabled` | false | Enable multi-source feed-forward |
+| `ff_deadband` | 30 W | Ignore total FF term below this magnitude |
+| `ff_filter_tau_s` | 30 s | EMA time constant for FF derivative filter |
 
 ### Driver
 
@@ -176,6 +179,8 @@ Published when `debug: true`:
 | `zfi_battery_power` | Controller | Actual battery power (W) |
 | `zfi_error` | Controller | Regulation error (W) |
 | `zfi_p_term` / `zfi_i_term` / `zfi_ff` | Controller | PI and feed-forward components (W) |
+| `zfi_ff_pv_raw` / `zfi_ff_pv_ema` / `zfi_ff_pv_contrib` | Controller | PV FF: live reading, EMA state, contribution pre-deadband (W) |
+| `zfi_ff_others_contrib` | Controller | Non-PV load sources FF contribution pre-deadband (W) |
 | `zfi_integral` | Controller | PI integral accumulator (W) |
 | `zfi_reason` | Controller | Human-readable decision reason |
 | `zfi_relay_sm_state` / `zfi_relay_sm_pending` | Driver | Relay state machine state and pending target |
