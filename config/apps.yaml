@@ -153,7 +153,6 @@ relay_switch_counter:
   desired_power_sensor: sensor.zfi_desired_power
   min_active_w: 25
   sensor_prefix: sensor.zfi
-  counter_file: /addon_configs/a0d7b954_appdaemon/apps/relay_switch_count.json
 
 # ──────────────────────────────────────────────────────────
 #  SolarFlow MQTT Watchdog
