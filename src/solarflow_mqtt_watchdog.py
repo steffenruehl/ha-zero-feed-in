@@ -71,6 +71,18 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             duration=self._unavailable_s,
         )
 
+        # Trigger 3: entity already unavailable at AppDaemon start
+        # (covers the case where SolarFlow dropped during HA restart,
+        # before AppDaemon reconnected — listen_state misses this because
+        # it never sees the transition)
+        current = self.get_state(self._watch_entity)
+        if current in (None, "unavailable", "unknown"):
+            self.log(
+                f"{self._watch_entity} is already {current!r} at startup — "
+                f"scheduling reconnect in {self._startup_delay_s}s"
+            )
+            self.run_in(self._trigger_reconnect, self._startup_delay_s)
+
         self.log(
             f"Started | watch={self._watch_entity} "
             f"stale_after={self._unavailable_s}s "

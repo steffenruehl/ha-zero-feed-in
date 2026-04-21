@@ -275,6 +275,53 @@ class TestGuards:
         assert output.desired_power_w == 0.0
         assert output.reason == "No surplus, charge blocked"
 
+    def test_dynamic_min_soc_overrides_config(self):
+        """Dynamic min SOC from input_number overrides the static config value."""
+        logic = make_logic(min_soc_pct=10, deadband_w=0)
+        logic.seed(None)
+        # SOC at 25% — above static min (10%) but below dynamic min (30%)
+        m = make_measurement(
+            grid_power_w=200, soc_pct=25, dynamic_min_soc_pct=30,
+        )
+        output = logic.compute(m, now=0)
+        assert output.desired_power_w == 0.0
+        assert output.reason == "SOC too low"
+
+    def test_dynamic_min_soc_none_uses_config(self):
+        """When dynamic_min_soc_pct is None, the static config value applies."""
+        logic = make_logic(min_soc_pct=10, deadband_w=0)
+        logic.seed(None)
+        # SOC at 25% — above static min (10%), no dynamic override
+        m = make_measurement(
+            grid_power_w=200, soc_pct=25, dynamic_min_soc_pct=None,
+        )
+        output = logic.compute(m, now=0)
+        assert output.desired_power_w > 0.0
+
+    def test_dynamic_min_soc_clamped_to_config_floor(self):
+        """Dynamic min SOC cannot go below the static config min_soc_pct."""
+        logic = make_logic(min_soc_pct=10, deadband_w=0)
+        logic.seed(None)
+        # Dynamic says 5%, but config floor is 10%. SOC at 8% → blocked.
+        m = make_measurement(
+            grid_power_w=200, soc_pct=8, dynamic_min_soc_pct=5,
+        )
+        output = logic.compute(m, now=0)
+        assert output.desired_power_w == 0.0
+        assert output.reason == "SOC too low"
+
+    def test_dynamic_min_soc_clamped_to_max_soc(self):
+        """Dynamic min SOC cannot exceed max_soc_pct."""
+        logic = make_logic(min_soc_pct=10, max_soc_pct=85, deadband_w=0)
+        logic.seed(None)
+        # Dynamic says 90%, clamped to 85%. SOC at 84% → blocked.
+        m = make_measurement(
+            grid_power_w=200, soc_pct=84, dynamic_min_soc_pct=90,
+        )
+        output = logic.compute(m, now=0)
+        assert output.desired_power_w == 0.0
+        assert output.reason == "SOC too low"
+
 
 # ═══════════════════════════════════════════════════════════
 #  Emergency feed-in protection

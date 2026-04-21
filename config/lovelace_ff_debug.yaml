@@ -9,6 +9,7 @@
 #   sensor.zfi_ff_pv_ema       - EMA filter state (τ=30s)
 #   sensor.zfi_ff_pv_contrib   - PV contribution before deadband
 #   sensor.zfi_ff_others_contrib - all load sources summed, before deadband
+#   sensor.zfi_effective_min_soc - effective min SOC after forecast clamping
 
 title: FF Debug
 icon: mdi:flash-triangle
@@ -59,3 +60,28 @@ cards:
         name: I term
       - entity: sensor.zfi_ff
         name: FF term
+
+  - type: entities
+    title: Forecast Min SOC
+    entities:
+      - entity: input_number.zfi_min_soc
+        name: Dynamic min SOC (input_number)
+      - entity: sensor.zfi_effective_min_soc
+        name: Effective min SOC (clamped)
+      - entity: sensor.pv_forecast_tomorrow_total
+        name: PV forecast tomorrow (kWh)
+      - entity: sensor.energy_production_tomorrow
+        name: Forecast plane 1 (kWh)
+      - entity: sensor.energy_production_tomorrow_2
+        name: Forecast plane 2 (kWh)
+
+  - type: history-graph
+    title: Min SOC & Forecast History
+    hours_to_show: 48
+    entities:
+      - entity: input_number.zfi_min_soc
+        name: Dynamic min SOC
+      - entity: sensor.zfi_effective_min_soc
+        name: Effective min SOC
+      - entity: sensor.pv_forecast_tomorrow_total
+        name: PV forecast tomorrow (kWh)

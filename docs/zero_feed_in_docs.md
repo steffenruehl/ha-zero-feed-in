@@ -51,11 +51,12 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
 
 ```
 Controller (every 5s):
-  grid_power_sensor ─────┐
-  soc_sensor ────────────┤
-  battery_power_sensor───┤──▸ PI + FF ──▸ sensor.zfi_desired_power
-  ff_sources (optional)──┤               sensor.zfi_mode, surplus, etc.
-  relay_locked_sensor────┘               (integral frozen when locked)
+  grid_power_sensor ─────────┐
+  soc_sensor ────────────────┤
+  battery_power_sensor───────┤──▸ PI + FF ──▸ sensor.zfi_desired_power
+  ff_sources (optional)──────┤               sensor.zfi_mode, surplus, etc.
+  relay_locked_sensor────────┤               (integral frozen when locked)
+  dynamic_min_soc_entity ────┘               (forecast-adjusted min SOC)
 
 Driver (every 2s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
@@ -316,8 +317,16 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 
 | Condition | Effect |
 | --- | --- |
-| SOC ≤ min_soc (10%) | Discharge blocked |
+| SOC ≤ effective min_soc | Discharge blocked |
 | SOC ≥ max_soc | Charge blocked |
+
+**Dynamic min SOC (forecast-based):** When `dynamic_min_soc_entity` is configured (default: `input_number.zfi_min_soc`), the controller reads it every cycle. The effective min SOC is clamped to `[Config.min_soc_pct, Config.max_soc_pct]` so it can never violate the hard limits from `apps.yaml`. When the entity is unavailable, the static `min_soc_pct` applies.
+
+A HA automation runs at 06:00, 15:00, and 20:00. If the PV forecast for tomorrow (summed across all Forecast.Solar planes) is below 1.5 kWh:
+- **06:00 (morning)**: sets `input_number.zfi_min_soc` to **50%** — prevents daytime discharge when PV won't recharge.
+- **15:00 / 20:00 (evening)**: sets it to **30%** — preserves a night buffer.
+
+Otherwise resets to 10%. This prevents pointless deep discharge on days when PV won't deliver enough to recharge.
 
 ### 4. Grid-Charge Protection
 

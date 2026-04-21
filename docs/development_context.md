@@ -117,6 +117,20 @@ if raw < 0:  # wants to charge
 2. **Surplus clamp**: charge capped at available surplus (clamp)
 3. **Asymmetric target**: target = 0 prevents PI from requesting grid power (PI)
 
+### Forecast-Based Dynamic min_soc
+
+Prevents pointless deep discharge on days when PV won't recharge the battery.
+A HA automation (06:00, 15:00, 20:00) reads the summed PV forecast for tomorrow
+(`sensor.pv_forecast_tomorrow_total`, template sensor summing Forecast.Solar planes).
+If forecast < 1.5 kWh: morning (06:00) sets `input_number.zfi_min_soc` to 50%
+(prevent daytime discharge), evening (15:00/20:00) sets it to 30% (night buffer).
+Otherwise resets to 10%.
+
+The controller reads this entity every cycle via `dynamic_min_soc_entity` config key.
+The dynamic value is clamped to `[Config.min_soc_pct, Config.max_soc_pct]` so it
+can never violate the hard safety limits from apps.yaml. Falls back to static
+`min_soc_pct` when the entity is unavailable.
+
 ## File Structure
 
 ```
@@ -146,7 +160,7 @@ Enums:      OperatingMode (CHARGING, DISCHARGING)
 Dataclasses:
   Config          — typed config from apps.yaml
   FeedForwardSource — entity, gain, sign, previous_w
-  Measurement     — grid_power_w, soc_pct, battery_power_w, ff_readings, switch states, relay_locked
+  Measurement     — grid_power_w, soc_pct, battery_power_w, ff_readings, switch states, relay_locked, dynamic_min_soc_pct
   ControlOutput   — desired_power_w, p/i/ff terms, reason
   ControllerState — integral, last_computed_w, mode, charge_pending_since
 

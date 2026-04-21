@@ -1,0 +1,16 @@
+# Template sensors added to configuration.yaml under the `template:` key.
+# Deploy: append this as another list entry under `template:` in configuration.yaml.
+
+- sensor:
+  - name: "PV Forecast Tomorrow Total"
+    unique_id: pv_forecast_tomorrow_total
+    unit_of_measurement: "kWh"
+    state: >
+      {{
+        (states('sensor.energy_production_tomorrow') | float(0))
+        + (states('sensor.energy_production_tomorrow_2') | float(0))
+      }}
+    availability: >
+      {{
+        states('sensor.energy_production_tomorrow') not in ['unknown', 'unavailable']
+      }}

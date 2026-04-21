@@ -195,6 +195,15 @@ class Config:
     """HA entity published by the driver when the relay SM is clamping output.
     When 'true', the controller freezes the integral to prevent windup."""
 
+    # Dynamic min SOC from forecast automation
+    dynamic_min_soc_entity: str | None = None
+    """``input_number`` entity that carries the forecast-adjusted min SOC (%).
+
+    Read every cycle.  When unavailable, falls back to the static
+    ``min_soc_pct`` from apps.yaml.  The dynamic value is clamped to
+    ``[min_soc_pct, max_soc_pct]`` so it can never violate hard limits.
+    """
+
     # Controller tuning
     discharge_target_w: float = 30.0
     charge_target_w: float = 0.0
@@ -283,6 +292,7 @@ class Config:
             charge_switch=args.get("charge_switch"),
             discharge_switch=args.get("discharge_switch"),
             relay_locked_sensor=args.get("relay_locked_sensor"),
+            dynamic_min_soc_entity=args.get("dynamic_min_soc_entity"),
             discharge_target_w=float(
                 args.get("target_grid_power", cls.discharge_target_w)
             ),
@@ -412,6 +422,14 @@ class Measurement:
     """Whether the user's charge switch (``input_boolean``) is on."""
     relay_locked: bool = False
     """Whether the driver's relay SM is clamping output (lockout active)."""
+    dynamic_min_soc_pct: float | None = None
+    """Dynamic minimum SOC (%) from ``input_number.zfi_min_soc``.
+
+    When set, overrides ``Config.min_soc_pct`` for the SOC-too-low guard.
+    Clamped to ``[Config.min_soc_pct, Config.max_soc_pct]`` so the
+    dynamic value can never violate the hard safety limits from apps.yaml.
+    ``None`` means no dynamic override — use ``Config.min_soc_pct``.
+    """
 
 
 @dataclass
@@ -931,7 +949,13 @@ class ControlLogic:
                 self._last_ff, "Charge disabled",
             )
 
-        if raw_limit > 0 and m.soc_pct <= self.cfg.min_soc_pct:
+        effective_min_soc = self.cfg.min_soc_pct
+        if m.dynamic_min_soc_pct is not None:
+            effective_min_soc = max(
+                self.cfg.min_soc_pct,
+                min(m.dynamic_min_soc_pct, self.cfg.max_soc_pct),
+            )
+        if raw_limit > 0 and m.soc_pct <= effective_min_soc:
             return ControlOutput.idle(
                 self._last_p, self._last_i,
                 self._last_ff, "SOC too low",
@@ -1141,6 +1165,9 @@ class ZeroFeedInController(_HASS_BASE):
             discharge_enabled=self._is_switch_on(self.cfg.discharge_switch),
             charge_enabled=self._is_switch_on(self.cfg.charge_switch),
             relay_locked=self._is_relay_locked(),
+            dynamic_min_soc_pct=self._read_float(self.cfg.dynamic_min_soc_entity)
+            if self.cfg.dynamic_min_soc_entity
+            else None,
         )
 
     def _is_relay_locked(self) -> bool:
@@ -1299,3 +1326,15 @@ class ZeroFeedInController(_HASS_BASE):
             "error", round(m.grid_power_w - target_w), "W", "mdi:delta"
         )
         self._set_sensor("reason", output.reason, icon="mdi:information-outline")
+
+        # Dynamic min SOC (shows effective value after clamping)
+        if m.dynamic_min_soc_pct is not None:
+            effective = max(
+                self.cfg.min_soc_pct,
+                min(m.dynamic_min_soc_pct, self.cfg.max_soc_pct),
+            )
+        else:
+            effective = self.cfg.min_soc_pct
+        self._set_sensor(
+            "effective_min_soc", round(effective), "%", "mdi:battery-low",
+        )

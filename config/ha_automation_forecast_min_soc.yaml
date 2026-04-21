@@ -1,0 +1,47 @@
+# Automation: adjust min SOC based on PV forecast.
+# Deploy: append to automations.yaml (or paste via HA UI).
+#
+# Schedule:
+#   06:00 — morning check: bad forecast → 50% (prevent daytime discharge)
+#   15:00 — afternoon check: bad forecast → 30% (night buffer)
+#   20:00 — evening check: bad forecast → 30% (final adjustment)
+#
+# "Bad forecast" = tomorrow's PV total < 1.5 kWh.
+
+- alias: "ZFI: Adjust min SOC from forecast"
+  id: zfi_forecast_min_soc
+  trigger:
+  - platform: time
+    at: '06:00'
+  - platform: time
+    at: '15:00'
+  - platform: time
+    at: '20:00'
+  condition:
+  - condition: not
+    conditions:
+    - condition: state
+      entity_id: sensor.pv_forecast_tomorrow_total
+      state:
+      - unknown
+      - unavailable
+  action:
+  - variables:
+      forecast_kwh: "{{ states('sensor.pv_forecast_tomorrow_total') | float(3) }}"
+      is_morning: "{{ now().hour < 12 }}"
+      min_soc: >
+        {% if forecast_kwh < 1.5 %}
+          {{ 50 if is_morning else 30 }}
+        {% else %}
+          10
+        {% endif %}
+  - service: input_number.set_value
+    target:
+      entity_id: input_number.zfi_min_soc
+    data:
+      value: "{{ min_soc }}"
+  - service: logbook.log
+    data:
+      name: ZFI Forecast
+      message: "forecast={{ forecast_kwh }}kWh → min_soc={{ min_soc }}%"
+  mode: single
