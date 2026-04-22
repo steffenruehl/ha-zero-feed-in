@@ -64,11 +64,11 @@ cards:
   - type: entities
     title: Forecast Min SOC
     entities:
-      - entity: input_number.zfi_min_soc
-        name: Dynamic min SOC (input_number)
+      - entity: sensor.zfi_dynamic_min_soc
+        name: Dynamic min SOC
       - entity: sensor.zfi_effective_min_soc
         name: Effective min SOC (clamped)
-      - entity: sensor.pv_forecast_tomorrow_total
+      - entity: sensor.zfi_pv_forecast_total
         name: PV forecast tomorrow (kWh)
       - entity: sensor.energy_production_tomorrow
         name: Forecast plane 1 (kWh)
@@ -79,9 +79,9 @@ cards:
     title: Min SOC & Forecast History
     hours_to_show: 48
     entities:
-      - entity: input_number.zfi_min_soc
+      - entity: sensor.zfi_dynamic_min_soc
         name: Dynamic min SOC
       - entity: sensor.zfi_effective_min_soc
         name: Effective min SOC
-      - entity: sensor.pv_forecast_tomorrow_total
+      - entity: sensor.zfi_pv_forecast_total
         name: PV forecast tomorrow (kWh)
