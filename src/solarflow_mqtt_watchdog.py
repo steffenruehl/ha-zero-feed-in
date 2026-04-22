@@ -43,6 +43,7 @@ Config (apps.yaml):
       - sensor.zfi_device_output         # driver heartbeat
     heartbeat_stale_s: 60                # max age before notification (s)
     heartbeat_check_s: 30                # check interval (s)
+    heartbeat_grace_s: 120               # ignore stale checks for N s after start
     # Safe-state: device entities to zero when any heartbeat is stale
     output_limit_entity: number.YOUR_SOLARFLOW_OUTPUTLIMIT
     input_limit_entity: number.YOUR_SOLARFLOW_INPUTLIMIT
@@ -51,7 +52,7 @@ Config (apps.yaml):
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta as _timedelta, timezone
 
 try:
     import requests as _requests
@@ -89,6 +90,12 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         )
         self._heartbeat_check_s: int = int(
             self.args.get("heartbeat_check_s", 30)
+        )
+        self._heartbeat_grace_s: int = int(
+            self.args.get("heartbeat_grace_s", 120)
+        )
+        self._grace_until: datetime = datetime.now(timezone.utc) + _timedelta(
+            seconds=self._heartbeat_grace_s,
         )
         self._stale_notified: set[str] = set()
 
@@ -139,6 +146,7 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             f"target=http://{self._solarflow_ip}/rpc "
             f"heartbeat_entities={len(self._heartbeat_entities)} "
             f"heartbeat_stale_s={self._heartbeat_stale_s} "
+            f"heartbeat_grace_s={self._heartbeat_grace_s} "
             f"safe_state={safe_state_cfg} "
             f"dry_run={self._dry_run}"
         )
@@ -167,7 +175,13 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         and dismisses it when the entity recovers.  When any entity is
         stale and device entities are configured, sends safe state (0 W)
         to both outputLimit and inputLimit.
+
+        During the startup grace period (``heartbeat_grace_s``), all
+        checks are skipped so the other apps have time to boot.
         """
+        if datetime.now(timezone.utc) < self._grace_until:
+            return
+
         any_stale = False
         for entity in self._heartbeat_entities:
             stale = self._is_entity_stale(entity)

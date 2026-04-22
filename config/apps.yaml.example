@@ -245,6 +245,7 @@ solarflow_mqtt_watchdog:
   #   - sensor.zfi_device_output    # driver output
   # heartbeat_stale_s: 60           # max age before notification (s)
   # heartbeat_check_s: 30           # check interval (s)
+  # heartbeat_grace_s: 120          # ignore stale checks for N s after start
   #
   # Safe-state device entities (optional).  When set, the watchdog sends
   # 0W to both limits when any heartbeat entity is stale.

@@ -377,6 +377,11 @@ monitor a list of HA entities for staleness.  When any entity's
 - Entities to monitor are configured via `heartbeat_entities` (e.g.
   `sensor.zfi_desired_power`, `sensor.zfi_device_output`).
 
+A **startup grace period** (`heartbeat_grace_s`, default 120 s)
+suppresses all stale checks after the watchdog starts, giving the
+controller, driver, and device time to boot without triggering
+spurious notifications or safe-state enforcement.
+
 The future ESP32 watchdog runs independently of HA — it subscribes to
 the MQTT heartbeat topics and only needs to **notify** the user.
 Safe-state enforcement lives in the HA watchdog because it has direct

@@ -113,6 +113,8 @@ class TestCheckHeartbeats:
                 self._output_limit_entity = output_limit_entity
                 self._input_limit_entity = input_limit_entity
                 self._safe_state_active: bool = False
+                # Grace period expired by default so tests run normally
+                self._grace_until = datetime(2000, 1, 1, tzinfo=timezone.utc)
                 self._attrs: dict[str, dict[str, str | None]] = {}
                 self.service_calls: list[tuple[str, dict]] = []
                 self.log_messages: list[str] = []
@@ -198,6 +200,28 @@ class TestCheckHeartbeats:
         wd._check_heartbeats({})
         notif_id = wd.service_calls[0][1]["notification_id"]
         assert notif_id == "zfi_heartbeat_sensor_zfi_desired_power"
+
+    def test_grace_period_skips_checks(self):
+        """During grace period, stale entities are ignored."""
+        wd = self._make_watchdog(["sensor.a"])
+        # Entity is stale
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "0", "last_updated": ts}
+        # But grace period is still active
+        wd._grace_until = datetime.now(timezone.utc) + timedelta(seconds=60)
+        wd._check_heartbeats({})
+        assert wd.service_calls == []
+        assert "sensor.a" not in wd._stale_notified
+
+    def test_grace_period_expired_checks_run(self):
+        """After grace period expires, stale checks resume normally."""
+        wd = self._make_watchdog(["sensor.a"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "0", "last_updated": ts}
+        # Grace period already expired
+        wd._grace_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        wd._check_heartbeats({})
+        assert "sensor.a" in wd._stale_notified
 
 
 # ═══════════════════════════════════════════════════════════
