@@ -1249,3 +1249,270 @@ class TestEnsureSmartMode:
         drv._ensure_smart_mode()
         drv._ensure_smart_mode()
         assert drv.service_calls == []
+
+
+# ═══════════════════════════════════════════════════════════
+#  _is_controller_stale
+# ═══════════════════════════════════════════════════════════
+
+
+class TestIsControllerStale:
+    """Tests for the controller stale-check logic.
+
+    Uses a minimal mock to exercise _is_controller_stale without AppDaemon.
+    """
+
+    @staticmethod
+    def _make_driver(controller_stale_s: float = 30.0) -> object:
+        """Create a minimal driver-like object with _is_controller_stale bound."""
+        from datetime import datetime, timezone
+
+        from src.zendure_solarflow_driver import (
+            Config as DriverConfig,
+            ZendureSolarFlowDriver,
+        )
+
+        class FakeDriver:
+            """Minimal stand-in for ZendureSolarFlowDriver."""
+
+            def __init__(self, stale_s: float) -> None:
+                self.cfg = DriverConfig(
+                    desired_power_sensor="sensor.zfi_desired_power",
+                    output_entity="number.output",
+                    input_entity="number.input",
+                    ac_mode_entity="select.ac_mode",
+                    controller_stale_s=stale_s,
+                )
+                self._attrs: dict[str, dict[str, str | None]] = {}
+
+            def get_state(
+                self, entity_id: str, attribute: str | None = None,
+            ) -> str | None:
+                """Return state or attribute for the entity."""
+                if attribute is not None:
+                    return self._attrs.get(entity_id, {}).get(attribute)
+                return self._attrs.get(entity_id, {}).get("state")
+
+        drv = FakeDriver(controller_stale_s)
+        drv._is_controller_stale = ZendureSolarFlowDriver._is_controller_stale.__get__(drv)
+        return drv
+
+    def test_disabled_when_zero(self):
+        """Stale check disabled when controller_stale_s=0."""
+        drv = self._make_driver(0.0)
+        assert drv._is_controller_stale() is False
+
+    def test_fresh_entity_not_stale(self):
+        """Entity updated 5s ago is not stale (threshold=30s)."""
+        from datetime import datetime, timezone, timedelta
+
+        drv = self._make_driver(30.0)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        assert drv._is_controller_stale() is False
+
+    def test_old_entity_is_stale(self):
+        """Entity updated 60s ago is stale (threshold=30s)."""
+        from datetime import datetime, timezone, timedelta
+
+        drv = self._make_driver(30.0)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        assert drv._is_controller_stale() is True
+
+    def test_no_last_updated_is_stale(self):
+        """Missing last_updated attribute → stale."""
+        drv = self._make_driver(30.0)
+        drv._attrs["sensor.zfi_desired_power"] = {}
+        assert drv._is_controller_stale() is True
+
+    def test_invalid_timestamp_is_stale(self):
+        """Unparseable timestamp → stale."""
+        drv = self._make_driver(30.0)
+        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": "not-a-date"}
+        assert drv._is_controller_stale() is True
+
+    def test_entity_at_exact_boundary_not_stale(self):
+        """Entity updated exactly at the threshold boundary is not stale."""
+        from datetime import datetime, timezone, timedelta
+
+        drv = self._make_driver(30.0)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=29)).isoformat()
+        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        assert drv._is_controller_stale() is False
+
+
+# ═══════════════════════════════════════════════════════════
+#  _send_safe_state
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSendSafeState:
+    """Tests for _send_safe_state zero-limit failsafe."""
+
+    @staticmethod
+    def _make_driver() -> object:
+        """Create a driver with _send_safe_state and driver_state."""
+        from src.zendure_solarflow_driver import (
+            Config as DriverConfig,
+            DriverState,
+            ZendureSolarFlowDriver,
+        )
+
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.cfg = DriverConfig(
+                    desired_power_sensor="sensor.zfi_desired_power",
+                    output_entity="number.output",
+                    input_entity="number.input",
+                    ac_mode_entity="select.ac_mode",
+                )
+                self.driver_state = DriverState()
+                self.service_calls: list[tuple[str, dict]] = []
+
+            def call_service(self, service: str, **kwargs: object) -> None:
+                self.service_calls.append((service, kwargs))
+
+        drv = FakeDriver()
+        drv._send_safe_state = ZendureSolarFlowDriver._send_safe_state.__get__(drv)
+        return drv
+
+    def test_sends_zero_when_nonzero(self):
+        """Both limits are sent to 0 when they were previously nonzero."""
+        drv = self._make_driver()
+        drv.driver_state.last_sent_discharge_w = 200
+        drv.driver_state.last_sent_charge_w = 100
+        drv._send_safe_state()
+        assert len(drv.service_calls) == 2
+        assert drv.driver_state.last_sent_discharge_w == 0
+        assert drv.driver_state.last_sent_charge_w == 0
+
+    def test_skips_when_already_zero(self):
+        """No service calls when both limits are already 0."""
+        drv = self._make_driver()
+        drv.driver_state.last_sent_discharge_w = 0
+        drv.driver_state.last_sent_charge_w = 0
+        drv._send_safe_state()
+        assert drv.service_calls == []
+
+    def test_sends_only_nonzero_limit(self):
+        """Only the non-zero limit is sent."""
+        drv = self._make_driver()
+        drv.driver_state.last_sent_discharge_w = 200
+        drv.driver_state.last_sent_charge_w = 0
+        drv._send_safe_state()
+        assert len(drv.service_calls) == 1
+        assert drv.service_calls[0] == (
+            "number/set_value",
+            {"entity_id": "number.output", "value": 0},
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+#  _publish_heartbeat (driver)
+# ═══════════════════════════════════════════════════════════
+
+
+class TestDriverHeartbeat:
+    """Tests for driver MQTT heartbeat publishing."""
+
+    @staticmethod
+    def _make_driver(topic: str = "") -> object:
+        from src.zendure_solarflow_driver import (
+            Config as DriverConfig,
+            ZendureSolarFlowDriver,
+        )
+
+        class FakeDriver:
+            def __init__(self, t: str) -> None:
+                self.cfg = DriverConfig(
+                    desired_power_sensor="sensor.zfi_desired_power",
+                    output_entity="number.output",
+                    input_entity="number.input",
+                    ac_mode_entity="select.ac_mode",
+                    heartbeat_mqtt_topic=t,
+                )
+                self.service_calls: list[tuple[str, dict]] = []
+                self.log_messages: list[str] = []
+
+            def call_service(self, service: str, **kwargs: object) -> None:
+                self.service_calls.append((service, kwargs))
+
+            def log(self, msg: str, **_kwargs: object) -> None:
+                self.log_messages.append(msg)
+
+        drv = FakeDriver(topic)
+        drv._publish_heartbeat = ZendureSolarFlowDriver._publish_heartbeat.__get__(drv)
+        return drv
+
+    def test_no_topic_no_publish(self):
+        """When topic is empty, no MQTT publish happens."""
+        drv = self._make_driver("")
+        drv._publish_heartbeat()
+        assert drv.service_calls == []
+
+    def test_publishes_to_configured_topic(self):
+        """MQTT publish is called with the configured topic."""
+        drv = self._make_driver("zfi/heartbeat/driver")
+        drv._publish_heartbeat()
+        assert len(drv.service_calls) == 1
+        svc, kwargs = drv.service_calls[0]
+        assert svc == "mqtt/publish"
+        assert kwargs["topic"] == "zfi/heartbeat/driver"
+        assert kwargs["retain"] is False
+        # Payload should be a parseable ISO timestamp
+        from datetime import datetime
+        datetime.fromisoformat(kwargs["payload"])
+
+    def test_exception_does_not_propagate(self):
+        """Heartbeat failure is caught and logged, not raised."""
+        drv = self._make_driver("zfi/heartbeat/driver")
+
+        def failing_service(service, **kwargs):
+            raise RuntimeError("MQTT down")
+
+        drv.call_service = failing_service
+        drv._publish_heartbeat()  # should not raise
+        assert any("Heartbeat publish failed" in m for m in drv.log_messages)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Config — new fields
+# ═══════════════════════════════════════════════════════════
+
+
+class TestDriverConfigNewFields:
+    """Tests for controller_stale_s and heartbeat_mqtt_topic in Config."""
+
+    MINIMAL_ARGS = {
+        "desired_power_sensor": "sensor.zfi_desired_power",
+        "output_limit_entity": "number.output_limit",
+        "input_limit_entity": "number.input_limit",
+        "ac_mode_entity": "select.ac_mode",
+    }
+
+    def test_defaults(self):
+        from src.zendure_solarflow_driver import Config as DriverConfig
+
+        cfg = DriverConfig.from_args(self.MINIMAL_ARGS)
+        assert cfg.controller_stale_s == 30.0
+        assert cfg.heartbeat_mqtt_topic == ""
+
+    def test_custom_values(self):
+        from src.zendure_solarflow_driver import Config as DriverConfig
+
+        args = {
+            **self.MINIMAL_ARGS,
+            "controller_stale_s": 60,
+            "heartbeat_mqtt_topic": "zfi/heartbeat/driver",
+        }
+        cfg = DriverConfig.from_args(args)
+        assert cfg.controller_stale_s == 60.0
+        assert cfg.heartbeat_mqtt_topic == "zfi/heartbeat/driver"
+
+    def test_stale_check_disabled(self):
+        from src.zendure_solarflow_driver import Config as DriverConfig
+
+        args = {**self.MINIMAL_ARGS, "controller_stale_s": 0}
+        cfg = DriverConfig.from_args(args)
+        assert cfg.controller_stale_s == 0.0

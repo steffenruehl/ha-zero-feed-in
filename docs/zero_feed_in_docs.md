@@ -335,6 +335,41 @@ Three layers:
 2. **Surplus clamp**: charge capped at available surplus
 3. **Asymmetric target**: target = 0 prevents PI from requesting grid power
 
+### 5. Controller Stale-Check (driver)
+
+If the controller app dies but AppDaemon continues running, the driver
+would perpetually act on a stale `sensor.zfi_desired_power`. The driver
+checks the entity's `last_updated` timestamp on every tick:
+
+- **Fresh** (age ≤ `controller_stale_s`, default 30 s): normal operation.
+- **Stale** (age > threshold): driver sends both `outputLimit` and
+  `inputLimit` to **0 W** (safe state) and publishes
+  `sensor.zfi_controller_stale = true`.
+- Logs a WARNING on the stale → fresh transition and vice versa.
+- Set `controller_stale_s: 0` to disable the check.
+
+### 6. MQTT Heartbeat Publishing
+
+Both the controller and driver can publish an ISO-8601 UTC timestamp to
+a configurable MQTT topic on every tick.  This enables external
+monitoring by an independent device (e.g. an ESP32 fallback controller)
+that watches the heartbeat topic and takes action when it goes stale.
+
+- Controller: `heartbeat_mqtt_topic: zfi/heartbeat/controller`
+- Driver: `heartbeat_mqtt_topic: zfi/heartbeat/driver`
+- Omit or leave empty to disable.
+
+### 7. Watchdog Heartbeat Monitoring
+
+The MQTT Watchdog app (`solarflow_mqtt_watchdog.py`) can optionally
+monitor a list of HA entities for staleness.  When any entity's
+`last_updated` exceeds `heartbeat_stale_s` (default 60 s):
+
+- A HA **persistent notification** is created (one per entity).
+- When the entity recovers, the notification is dismissed.
+- Entities to monitor are configured via `heartbeat_entities` (e.g.
+  `sensor.zfi_desired_power`, `sensor.zfi_device_output`).
+
 ---
 
 ## Flowcharts
@@ -391,7 +426,10 @@ flowchart TD
 flowchart TD
     A([Tick: every 2s]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
-    B -- Yes --> SM{SM enabled?}
+    B -- Yes --> STALE{Controller stale?<br>last_updated > 30s}
+    STALE -- Yes --> SAFE["Safe state: 0W out, 0W in<br>Publish controller_stale=true"]
+    SAFE --> Z2([Done])
+    STALE -- No --> SM{SM enabled?}
     SM -- Yes --> SMU["RelayStateMachine.update()<br>clamps power to current state"]
     SM -- No --> PASS["allowed = desired"]
     SMU --> RND
@@ -487,6 +525,7 @@ Published only when `debug: true` in the controller config.
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
 | `zfi_relay_locked` | text | — | `true` when SM is clamping output or relay is physically switching (8 s holdoff) |
+| `zfi_controller_stale` | text | — | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver sends safe state (0 W) |
 
 ### Driver sensors (debug only)
 

@@ -29,11 +29,15 @@ zero_feed_in_controller:
   module: zero_feed_in_controller
   class: ZeroFeedInController
 
-  # ── GLOBAL (shared via YAML anchors) ────────────────────────────────────
+  # ══════ GLOBAL (shared via YAML anchors) ────────────────────────────────────
   dry_run:        &dry_run        false    # true = compute but don't actuate
   debug:          &debug          false    # true = publish internal sensors
   sensor_prefix:  &sensor_prefix  sensor.zfi
   log_dir:        &log_dir        ""       # CSV log directory (empty = disabled)
+
+  # MQTT heartbeat topic (optional).  When set, the controller publishes an
+  # ISO-8601 UTC timestamp on every tick for external monitoring (e.g. ESP).
+  # heartbeat_mqtt_topic: zfi/heartbeat/controller
 
   # ══════ MANDATORY — edit these for your installation ══════════════════════
 
@@ -148,11 +152,16 @@ zendure_solarflow_driver:
   # ══════ TUNING ════════════════════════════════════════════════════════════
 
   watchdog_s: 5                # re-apply command interval (s)
+  controller_stale_s: 30       # max age of desired_power before safe-state (s), 0=disabled
   relay_lockout_ws: 10000      # energy accumulator threshold for direction change (W·s)
   relay_lockout_cutoff_w: 25   # floor on power used in accumulator (W)
   relay_lockout_idle_s: 90     # holdoff time before switching to idle (s)
   relay_sm_enabled: true       # false = bypass relay state machine
   min_active_power_w: 25       # minimum power floor in active states (W)
+
+  # MQTT heartbeat topic (optional).  When set, the driver publishes an
+  # ISO-8601 UTC timestamp on every watchdog tick for external monitoring.
+  # heartbeat_mqtt_topic: zfi/heartbeat/driver
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -226,3 +235,11 @@ solarflow_mqtt_watchdog:
   mqtt_port: 1883
   unavailable_duration_s: 120    # seconds before triggering reconnect
   startup_delay_s: 30            # wait for Mosquitto after HA start (s)
+
+  # Heartbeat monitoring (optional).  Periodically checks last_updated of
+  # each entity.  Sends a HA persistent notification when any goes stale.
+  # heartbeat_entities:
+  #   - sensor.zfi_desired_power    # controller output
+  #   - sensor.zfi_device_output    # driver output
+  # heartbeat_stale_s: 60           # max age before notification (s)
+  # heartbeat_check_s: 30           # check interval (s)

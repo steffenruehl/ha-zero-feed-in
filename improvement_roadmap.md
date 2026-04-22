@@ -51,7 +51,10 @@ Three AppDaemon apps:
 - State persistence: controller + driver save/restore state across restarts (JSON)
 - Relay switch counter (persists to JSON, publishes `sensor.zfi_relay_switches_today`)
 - smartMode flash wear protection (RAM-only device writes, auto-reenabled after reboot)
-- 233 unit tests (101 controller, 107 driver, 17 PV forecast, 8 CSV logger) — all passing
+- Driver stale-check: sends safe state (0 W) when controller hasn't updated in 30 s
+- MQTT heartbeat publishing: controller + driver publish ISO-8601 timestamps for ESP monitoring
+- Watchdog heartbeat monitoring: checks entity last_updated, HA persistent notifications on stale
+- 263 unit tests (103 controller, 127 driver, 17 PV forecast, 8 CSV logger, 8 watchdog) — all passing
 - CSV file logging (controller + driver)
 - Lovelace dashboard
 
@@ -154,24 +157,21 @@ is cloned into `config/apps/zero_feed_in/` on the HA host.
   and a short inline comment explaining each
 - Add a `README` section: "Installation in 3 steps"
 
-### 3. Driver Stale-Check — SMALL
+### 3. Driver Stale-Check — DONE
 
 **Problem**: If the controller dies but AppDaemon lives, the driver
 keeps acting on a stale `sensor.zfi_desired_power`.
 
-**Solution**: In driver `_run`, check `last_updated` age:
-```python
-last_update = self.get_state(self.cfg.desired_power_sensor,
-                             attribute="last_updated")
-age = (now_wall - parse(last_update)).total_seconds()
-if age > 30:  # controller hasn't updated in 30s
-    self._send_safe_state()  # 0W output, 0W input
-    return
-```
+**Solution**: In driver `_run()`, check `last_updated` timestamp of
+`sensor.zfi_desired_power` using `datetime.fromisoformat()` and wall
+clock comparison.  If age > `controller_stale_s` (default 30 s):
+- Both `outputLimit` and `inputLimit` sent to **0 W** (safe state).
+- `sensor.zfi_controller_stale` published as `true`.
+- WARNING logged on stale→fresh and fresh→stale transitions.
 
-Note: use wall time for this check (not `time.monotonic()`).
+Config: `controller_stale_s: 30` (set to `0` to disable).
 
-### 4. Watchdog (ESP32) — OPEN
+### 4. Watchdog (ESP32) — OPEN (MQTT heartbeats ready)
 
 **Problem**: If HA/AppDaemon dies entirely, SolarFlow continues
 executing the last command indefinitely. The MQTT watchdog
@@ -181,20 +181,24 @@ it runs inside AppDaemon and dies with it.
 **Defense layers currently in place:**
 - Layer 1: SolarFlow BMS (hardware, always active)
 - Layer 2: Driver stale-check (see #3 above)
-- Layer 3: ESP32 watchdog (not yet implemented)
+- Layer 3: MQTT heartbeat publishing (ready for ESP32 consumer)
+- Layer 4: Watchdog heartbeat monitoring (HA notifications)
+- Layer 5: ESP32 watchdog (not yet implemented)
 
-**Solution**: ESP32 (ESPHome) running independently of HA. Polls
-HA API every 30s to check if `sensor.zfi_desired_power` is fresh.
-If stale for >2 minutes, sends HTTP POST to SolarFlow local API
-to set output/input to 0W.
+**MQTT heartbeats implemented**: Both controller and driver can publish
+ISO-8601 UTC timestamps to configurable MQTT topics on every tick:
+- `heartbeat_mqtt_topic: zfi/heartbeat/controller`
+- `heartbeat_mqtt_topic: zfi/heartbeat/driver`
 
-```
-ESP32 checks:
-  1. HTTP GET http://HA_IP:8123/api/states/sensor.zfi_desired_power
-  2. Parse last_updated, check age
-  3. If age > 120s for 4 consecutive checks:
-     HTTP POST http://SOLARFLOW_IP/rpc → safe state (0W)
-```
+**Watchdog heartbeat monitoring implemented**: The MQTT watchdog
+optionally checks `last_updated` of configured HA entities (e.g.
+`sensor.zfi_desired_power`, `sensor.zfi_device_output`) every
+`heartbeat_check_s` seconds.  Creates HA persistent notifications
+when stale, dismisses on recovery.
+
+**Remaining**: ESP32 (ESPHome) running independently of HA.  Subscribes
+to MQTT heartbeat topics.  If stale for >2 minutes, sends HTTP POST
+to SolarFlow local API to set output/input to 0W.
 
 ### 5. Persistence — DONE
 

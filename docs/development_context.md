@@ -154,6 +154,7 @@ tests/
 ├── __init__.py
 ├── test_zero_feed_in_controller.py
 ├── test_zendure_solarflow_driver.py
+├── test_solarflow_mqtt_watchdog.py
 ├── test_pv_forecast_manager.py
 └── test_csv_logger.py
 docs/
@@ -201,9 +202,10 @@ ControlLogic:     — pure-computation control logic (no HA dependency)
 ZeroFeedInController(hass.Hass): — thin HA adapter
   initialize()                  — config, seed, restore state, CsvLogger, schedule
   terminate()                   — save state to JSON on shutdown
-  _on_tick()                    — read → compute → log → publish → csv → periodic save
+  _on_tick()                    — read → compute → log → publish → heartbeat → csv → periodic save
   _read_measurement()           — assemble Measurement from HA sensors
   _publish_ha_sensors()         — publishes sensor.zfi_* entities
+  _publish_heartbeat()          — MQTT heartbeat for external monitoring
   _log_csv()                    — append row to CSV file (if log_dir set)
   _save_state()                 — atomically write state snapshot to JSON
   _restore_state()              — restore ControlLogic state from JSON file
@@ -240,6 +242,10 @@ ZendureSolarFlowDriver(_HASS_BASE):
   _send_limits()            — AC mode + power limits
   _set_ac_mode()            — send-once with 30 s retry timeout
   _set_sensor()             — publish sensor.zfi_* driver states
+  _ensure_smart_mode()      — turn on smartMode switch if off (RAM-only writes)
+  _is_controller_stale()    — check desired_power entity last_updated age
+  _send_safe_state()        — zero both limits (controller stale failsafe)
+  _publish_heartbeat()      — MQTT heartbeat for external monitoring
   _save_state()             — atomically write SM state snapshot to JSON
   _restore_state()          — restore RelayStateMachine state from JSON file
 ```
@@ -273,6 +279,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_charge_limit` | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | Physical relay state from AC mode entity |
 | `zfi_relay_locked` | text | `true` when SM is clamping output or relay is physically switching (8 s holdoff after SM transition) |
+| `zfi_controller_stale` | text | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver sends safe state (0 W) |
 | `zfi_relay_sm_state` | text | Current SM state (idle/charging/discharging) *(debug)* |
 | `zfi_relay_sm_pending` | text | Pending transition target (or "none") *(debug)* |
 | `zfi_relay_sm_lockout_pct` | % | Unified lockout progress for active transition *(debug)* |
@@ -300,6 +307,9 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
+- Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver sends 0 W to both limits and publishes `sensor.zfi_controller_stale = true`
+- MQTT heartbeat publishing: controller and driver can publish ISO-8601 timestamps to configurable MQTT topics on every tick for external monitoring (e.g. ESP32 fallback)
+- Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale
 
 ### Entity names (current setup)
 

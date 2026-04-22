@@ -18,6 +18,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
@@ -266,6 +267,12 @@ class Config:
     """If True, publish internal PI sensors (p_term, i_term, integral, etc.)."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
 
+    # Heartbeat
+    heartbeat_mqtt_topic: str = ""
+    """MQTT topic for heartbeat publishing.  When set, the controller publishes
+    an ISO-8601 UTC timestamp on every tick for external monitoring
+    (e.g. by an ESP fallback controller).  Empty = disabled."""
+
     # File logging
     log_dir: str = ""
     """Directory for CSV log files. Empty = file logging disabled."""
@@ -326,6 +333,9 @@ class Config:
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
+            heartbeat_mqtt_topic=args.get(
+                "heartbeat_mqtt_topic", cls.heartbeat_mqtt_topic
+            ),
             log_dir=args.get("log_dir", cls.log_dir),
         )
 
@@ -1177,6 +1187,7 @@ class ZeroFeedInController(_HASS_BASE):
         surplus = ControlLogic.estimate_surplus(m)
         self._log_output(output, m, surplus)
         self._publish_ha_sensors(output, m, surplus)
+        self._publish_heartbeat()
         self._log_csv(output, m, surplus)
 
         self._tick_count += 1
@@ -1340,6 +1351,21 @@ class ZeroFeedInController(_HASS_BASE):
                 f"set_state failed for {entity_id}: {exc}",
                 level="WARNING",
             )
+
+    def _publish_heartbeat(self) -> None:
+        """Publish an MQTT heartbeat timestamp for external monitoring."""
+        topic = self.cfg.heartbeat_mqtt_topic
+        if not topic:
+            return
+        try:
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=datetime.now(timezone.utc).isoformat(),
+                retain=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Heartbeat publish failed: {exc}", level="WARNING")
 
     def _publish_ha_sensors(
         self,

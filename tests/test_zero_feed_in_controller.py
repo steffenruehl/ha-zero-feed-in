@@ -1251,3 +1251,32 @@ class TestStatePersistence:
 
         assert logic.state.integral == 50.0
         assert logic.state.mode == OperatingMode.DISCHARGING
+
+
+# ═══════════════════════════════════════════════════════════
+#  Config — heartbeat_mqtt_topic
+# ═══════════════════════════════════════════════════════════
+
+
+class TestControllerHeartbeatConfig:
+    """Tests for heartbeat_mqtt_topic in controller Config."""
+
+    MINIMAL_ARGS = {
+        "grid_power_sensor": "sensor.grid",
+        "soc_sensor": "sensor.soc",
+        "battery_power_sensor": "sensor.battery",
+    }
+
+    def test_default_empty(self):
+        """heartbeat_mqtt_topic defaults to empty string (disabled)."""
+        cfg = Config.from_args(self.MINIMAL_ARGS)
+        assert cfg.heartbeat_mqtt_topic == ""
+
+    def test_from_args(self):
+        """heartbeat_mqtt_topic is parsed from args."""
+        args = {
+            **self.MINIMAL_ARGS,
+            "heartbeat_mqtt_topic": "zfi/heartbeat/controller",
+        }
+        cfg = Config.from_args(args)
+        assert cfg.heartbeat_mqtt_topic == "zfi/heartbeat/controller"

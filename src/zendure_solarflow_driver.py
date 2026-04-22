@@ -18,6 +18,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
@@ -149,6 +150,14 @@ class Config:
     """HA switch entity for smartMode.  When set, the driver turns on
     smartMode at startup so that outputLimit/inputLimit/acMode writes
     go to device RAM instead of flash — eliminating flash wear."""
+    controller_stale_s: float = 30.0
+    """Max age (s) of the controller's desired-power sensor before the
+    driver treats it as stale and sends zero limits (safe state).
+    Set to 0 to disable the stale check."""
+    heartbeat_mqtt_topic: str = ""
+    """MQTT topic for heartbeat publishing.  When set, the driver publishes
+    an ISO-8601 UTC timestamp on every watchdog tick for external monitoring
+    (e.g. by an ESP fallback controller).  Empty = disabled."""
     watchdog_s: int = 15
     """Watchdog interval (s): re-run even when desired_power hasn't changed."""
     relay_lockout_ws: float = 1000.0
@@ -183,6 +192,12 @@ class Config:
             input_entity=args["input_limit_entity"],
             ac_mode_entity=args["ac_mode_entity"],
             smart_mode_entity=args.get("smart_mode_entity", cls.smart_mode_entity),
+            controller_stale_s=float(
+                args.get("controller_stale_s", cls.controller_stale_s)
+            ),
+            heartbeat_mqtt_topic=args.get(
+                "heartbeat_mqtt_topic", cls.heartbeat_mqtt_topic
+            ),
             watchdog_s=int(args.get("watchdog_s", cls.watchdog_s)),
             relay_lockout_ws=float(
                 args.get("relay_lockout_ws", cls.relay_lockout_ws)
@@ -538,6 +553,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         self.cfg = Config.from_args(self.args)
         self.driver_state = DriverState()
         self._last_sm_transition_t: float = -RELAY_SWITCH_DELAY_S
+        self._was_controller_stale: bool = False
 
         # CSV file logger (disabled when log_dir is empty)
         self._csv: CsvLogger | None = None
@@ -592,6 +608,8 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             f"idle_s={self.cfg.relay_lockout_idle_s}s "
             f"watchdog={self.cfg.watchdog_s}s "
             f"smart_mode={self.cfg.smart_mode_entity or 'disabled'} "
+            f"stale_check={self.cfg.controller_stale_s}s "
+            f"heartbeat={self.cfg.heartbeat_mqtt_topic or 'disabled'} "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -672,6 +690,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         """Called periodically to keep the SM ticking even when desired_power is stable."""
         self._ensure_smart_mode()
         self._run()
+        self._publish_heartbeat()
 
     def _run(self) -> None:
         """Read desired power, apply SM, send commands."""
@@ -681,6 +700,30 @@ class ZendureSolarFlowDriver(_HASS_BASE):
                 f"desired_power unavailable ({self.cfg.desired_power_sensor}), skipping",
                 level="WARNING",
             )
+            return
+
+        # ── Controller stale check ────────────────────────
+        stale = self._is_controller_stale()
+        self._set_sensor(
+            "controller_stale",
+            str(stale).lower(),
+            icon="mdi:alert" if stale else "mdi:check-circle",
+        )
+        if stale != self._was_controller_stale:
+            if stale:
+                self.log(
+                    "Controller stale — sending safe state (0W)",
+                    level="WARNING",
+                )
+            else:
+                self.log("Controller recovered — resuming normal operation")
+            self._was_controller_stale = stale
+        if stale:
+            if not self.cfg.dry_run:
+                self._send_safe_state()
+            self._set_sensor("device_output", 0, "W", "mdi:transmission-tower-export")
+            self._set_sensor("discharge_limit", 0, "W", "mdi:battery-arrow-down")
+            self._set_sensor("charge_limit", 0, "W", "mdi:battery-arrow-up")
             return
 
         now = time.monotonic()
@@ -797,6 +840,64 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             return
         self.call_service("switch/turn_on", entity_id=entity)
         self.log("smartMode turned on (RAM-only writes, no flash wear)")
+
+    # ─── Controller stale check ─────────────────────────────
+
+    def _is_controller_stale(self) -> bool:
+        """Return True if the controller's desired-power sensor is stale.
+
+        Compares the entity's ``last_updated`` timestamp against the
+        configured ``controller_stale_s`` threshold.  Returns False
+        (not stale) when the check is disabled (``controller_stale_s <= 0``)
+        or when the timestamp cannot be read.
+        """
+        if self.cfg.controller_stale_s <= 0:
+            return False
+        last_updated_raw = self.get_state(
+            self.cfg.desired_power_sensor, attribute="last_updated",
+        )
+        if not last_updated_raw:
+            return True
+        try:
+            last_updated = datetime.fromisoformat(str(last_updated_raw))
+            age_s = (datetime.now(timezone.utc) - last_updated).total_seconds()
+            return age_s > self.cfg.controller_stale_s
+        except (ValueError, TypeError):
+            return True
+
+    def _send_safe_state(self) -> None:
+        """Send zero limits to safely stop the device (controller stale failsafe)."""
+        if self.driver_state.last_sent_discharge_w != 0:
+            self.call_service(
+                "number/set_value",
+                entity_id=self.cfg.output_entity,
+                value=0,
+            )
+            self.driver_state.last_sent_discharge_w = 0
+        if self.driver_state.last_sent_charge_w != 0:
+            self.call_service(
+                "number/set_value",
+                entity_id=self.cfg.input_entity,
+                value=0,
+            )
+            self.driver_state.last_sent_charge_w = 0
+
+    # ─── Heartbeat ──────────────────────────────────────────
+
+    def _publish_heartbeat(self) -> None:
+        """Publish an MQTT heartbeat timestamp for external monitoring."""
+        topic = self.cfg.heartbeat_mqtt_topic
+        if not topic:
+            return
+        try:
+            self.call_service(
+                "mqtt/publish",
+                topic=topic,
+                payload=datetime.now(timezone.utc).isoformat(),
+                retain=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Heartbeat publish failed: {exc}", level="WARNING")
 
     # ─── Send ─────────────────────────────────────────────
 
