@@ -224,16 +224,22 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             self.log("All heartbeats recovered — safe state released")
 
     def _is_entity_stale(self, entity: str) -> bool:
-        """Return True if *entity*'s ``last_updated`` exceeds the threshold."""
+        """Return True if *entity*'s last report exceeds the threshold.
+
+        Prefers ``last_reported`` (HA 2024.4+, updates on every state
+        report even when value is unchanged) over ``last_updated``.
+        """
         state = self.get_state(entity)
         if state in (None, "unavailable", "unknown"):
             return True
-        last_updated_raw = self.get_state(entity, attribute="last_updated")
-        if not last_updated_raw:
+        ts_raw = self.get_state(entity, attribute="last_reported")
+        if not ts_raw:
+            ts_raw = self.get_state(entity, attribute="last_updated")
+        if not ts_raw:
             return True
         try:
-            last_updated = datetime.fromisoformat(str(last_updated_raw))
-            age_s = (datetime.now(timezone.utc) - last_updated).total_seconds()
+            ts = datetime.fromisoformat(str(ts_raw))
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
             return age_s > self._heartbeat_stale_s
         except (ValueError, TypeError):
             return True

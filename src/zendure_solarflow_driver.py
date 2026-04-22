@@ -721,7 +721,6 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         if stale:
             if not self.cfg.dry_run:
                 self._send_safe_state()
-            self._set_sensor("desired_power", 0, "W", "mdi:transmission-tower")
             self._set_sensor("device_output", 0, "W", "mdi:transmission-tower-export")
             self._set_sensor("discharge_limit", 0, "W", "mdi:battery-arrow-down")
             self._set_sensor("charge_limit", 0, "W", "mdi:battery-arrow-up")
@@ -847,21 +846,26 @@ class ZendureSolarFlowDriver(_HASS_BASE):
     def _is_controller_stale(self) -> bool:
         """Return True if the controller's desired-power sensor is stale.
 
-        Compares the entity's ``last_updated`` timestamp against the
-        configured ``controller_stale_s`` threshold.  Returns False
-        (not stale) when the check is disabled (``controller_stale_s <= 0``)
-        or when the timestamp cannot be read.
+        Tries ``last_reported`` first (HA 2024.4+ — updates on every
+        state report even when the value is unchanged), then falls back
+        to ``last_updated`` (only changes when value/attributes change).
+        Returns False (not stale) when the check is disabled
+        (``controller_stale_s <= 0``).
         """
         if self.cfg.controller_stale_s <= 0:
             return False
-        last_updated_raw = self.get_state(
-            self.cfg.desired_power_sensor, attribute="last_updated",
+        ts_raw = self.get_state(
+            self.cfg.desired_power_sensor, attribute="last_reported",
         )
-        if not last_updated_raw:
+        if not ts_raw:
+            ts_raw = self.get_state(
+                self.cfg.desired_power_sensor, attribute="last_updated",
+            )
+        if not ts_raw:
             return True
         try:
-            last_updated = datetime.fromisoformat(str(last_updated_raw))
-            age_s = (datetime.now(timezone.utc) - last_updated).total_seconds()
+            ts = datetime.fromisoformat(str(ts_raw))
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
             return age_s > self.cfg.controller_stale_s
         except (ValueError, TypeError):
             return True

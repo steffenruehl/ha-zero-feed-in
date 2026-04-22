@@ -307,7 +307,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
-- Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver publishes safe sensors (0 W to desired_power, device_output, limits) and sets `sensor.zfi_controller_stale = true`; watchdog handles device commands
+- Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver publishes safe sensors (0 W to device_output, limits) and sets `sensor.zfi_controller_stale = true`; uses `last_reported` (HA 2024.4+) with `last_updated` fallback; watchdog handles device commands
 - MQTT heartbeat publishing: controller and driver can publish ISO-8601 timestamps to configurable MQTT topics on every tick for external monitoring (e.g. ESP32 fallback)
 - Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale; when device entities are configured, also sends safe state (0W to outputLimit + inputLimit) catching both controller and driver failures
 

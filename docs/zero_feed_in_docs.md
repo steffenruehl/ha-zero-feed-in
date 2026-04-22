@@ -342,9 +342,10 @@ would perpetually act on a stale `sensor.zfi_desired_power`. The driver
 checks the entity's `last_updated` timestamp on every tick:
 
 - **Fresh** (age ≤ `controller_stale_s`, default 30 s): normal operation.
-- **Stale** (age > threshold): driver publishes all output sensors as
-  **0 W** (`desired_power`, `device_output`, `discharge_limit`,
-  `charge_limit`) and sets `sensor.zfi_controller_stale = true`.
+- **Stale** (age > threshold): driver publishes its own output sensors as
+  **0 W** (`device_output`, `discharge_limit`, `charge_limit`) and sets
+  `sensor.zfi_controller_stale = true`.  The driver does **not** overwrite
+  `sensor.zfi_desired_power` (that is the controller's entity).
   The watchdog handles sending 0 W to the physical device.
 - Logs a WARNING on the stale → fresh transition and vice versa.
 - Set `controller_stale_s: 0` to disable the check.
@@ -444,7 +445,7 @@ flowchart TD
     A([Tick: every 2s]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
     B -- Yes --> STALE{Controller stale?<br>last_updated > 30s}
-    STALE -- Yes --> SAFE["Safe sensors: 0W desired, out, in<br>Publish controller_stale=true"]
+    STALE -- Yes --> SAFE["Safe sensors: 0W out, limits<br>Publish controller_stale=true"]
     SAFE --> Z2([Done])
     STALE -- No --> SM{SM enabled?}
     SM -- Yes --> SMU["RelayStateMachine.update()<br>clamps power to current state"]

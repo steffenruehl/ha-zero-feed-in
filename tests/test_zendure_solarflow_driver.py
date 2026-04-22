@@ -1303,25 +1303,25 @@ class TestIsControllerStale:
         assert drv._is_controller_stale() is False
 
     def test_fresh_entity_not_stale(self):
-        """Entity updated 5s ago is not stale (threshold=30s)."""
+        """Entity reported 5s ago is not stale (threshold=30s)."""
         from datetime import datetime, timezone, timedelta
 
         drv = self._make_driver(30.0)
         ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        drv._attrs["sensor.zfi_desired_power"] = {"last_reported": ts}
         assert drv._is_controller_stale() is False
 
     def test_old_entity_is_stale(self):
-        """Entity updated 60s ago is stale (threshold=30s)."""
+        """Entity reported 60s ago is stale (threshold=30s)."""
         from datetime import datetime, timezone, timedelta
 
         drv = self._make_driver(30.0)
         ts = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
-        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        drv._attrs["sensor.zfi_desired_power"] = {"last_reported": ts}
         assert drv._is_controller_stale() is True
 
     def test_no_last_updated_is_stale(self):
-        """Missing last_updated attribute → stale."""
+        """Missing both last_reported and last_updated → stale."""
         drv = self._make_driver(30.0)
         drv._attrs["sensor.zfi_desired_power"] = {}
         assert drv._is_controller_stale() is True
@@ -1329,16 +1329,38 @@ class TestIsControllerStale:
     def test_invalid_timestamp_is_stale(self):
         """Unparseable timestamp → stale."""
         drv = self._make_driver(30.0)
-        drv._attrs["sensor.zfi_desired_power"] = {"last_updated": "not-a-date"}
+        drv._attrs["sensor.zfi_desired_power"] = {"last_reported": "not-a-date"}
         assert drv._is_controller_stale() is True
 
     def test_entity_at_exact_boundary_not_stale(self):
-        """Entity updated exactly at the threshold boundary is not stale."""
+        """Entity reported exactly at the threshold boundary is not stale."""
         from datetime import datetime, timezone, timedelta
 
         drv = self._make_driver(30.0)
         ts = (datetime.now(timezone.utc) - timedelta(seconds=29)).isoformat()
+        drv._attrs["sensor.zfi_desired_power"] = {"last_reported": ts}
+        assert drv._is_controller_stale() is False
+
+    def test_falls_back_to_last_updated(self):
+        """Uses last_updated when last_reported is unavailable."""
+        from datetime import datetime, timezone, timedelta
+
+        drv = self._make_driver(30.0)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
         drv._attrs["sensor.zfi_desired_power"] = {"last_updated": ts}
+        assert drv._is_controller_stale() is False
+
+    def test_prefers_last_reported_over_last_updated(self):
+        """last_reported is preferred even when last_updated is also present."""
+        from datetime import datetime, timezone, timedelta
+
+        drv = self._make_driver(30.0)
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        drv._attrs["sensor.zfi_desired_power"] = {
+            "last_reported": fresh,
+            "last_updated": stale,
+        }
         assert drv._is_controller_stale() is False
 
 

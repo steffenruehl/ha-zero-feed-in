@@ -54,7 +54,7 @@ Three AppDaemon apps:
 - Driver stale-check: sends safe state (0 W) when controller hasn't updated in 30 s
 - MQTT heartbeat publishing: controller + driver publish ISO-8601 timestamps for ESP monitoring
 - Watchdog heartbeat monitoring: checks entity last_updated, HA persistent notifications on stale
-- 272 unit tests (103 controller, 126 driver, 17 PV forecast, 8 CSV logger, 18 watchdog) — all passing
+- 274 unit tests (103 controller, 128 driver, 17 PV forecast, 8 CSV logger, 18 watchdog) — all passing
 - CSV file logging (controller + driver)
 - Lovelace dashboard
 
