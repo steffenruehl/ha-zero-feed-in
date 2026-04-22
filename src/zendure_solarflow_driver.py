@@ -966,7 +966,12 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         unit: str | None = None,
         icon: str | None = None,
     ) -> None:
-        """Create or update a ``sensor.zfi_<name>`` entity in HA."""
+        """Create or update a ``sensor.zfi_<name>`` entity in HA.
+
+        Includes a ``last_published`` ISO timestamp in the attributes so
+        that HA always sees a state change and advances ``last_updated``
+        (HA 2024.4+ skips the update when state+attrs are identical).
+        """
         entity_id = f"{self.cfg.sensor_prefix}_{name}"
         attrs = {"friendly_name": f"ZFI {name.replace('_', ' ').title()}"}
         if unit:
@@ -974,6 +979,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             attrs["state_class"] = "measurement"
         if icon:
             attrs["icon"] = icon
+        attrs["last_published"] = datetime.now(timezone.utc).isoformat()
         try:
             self.set_state(entity_id, state=str(value), attributes=attrs, replace=True)
         except Exception as exc:
