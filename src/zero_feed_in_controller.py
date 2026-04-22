@@ -259,7 +259,6 @@ class Config:
 
     # Protection
     max_feed_in_w: float = 800.0
-    emergency_kp_mult: float = 4.0
 
     # Debug
     dry_run: bool = True
@@ -323,9 +322,6 @@ class Config:
                 args.get("charge_confirm", cls.charge_confirm_s)
             ),
             max_feed_in_w=float(args.get("max_feed_in", cls.max_feed_in_w)),
-            emergency_kp_mult=float(
-                args.get("emergency_kp_multiplier", cls.emergency_kp_mult)
-            ),
             ff_enabled=bool(args.get("ff_enabled", cls.ff_enabled)),
             ff_deadband_w=float(args.get("ff_deadband", cls.ff_deadband_w)),
             ff_filter_tau_s=float(args.get("ff_filter_tau_s", cls.ff_filter_tau_s)),
@@ -435,7 +431,7 @@ class Measurement:
     relay_locked: bool = False
     """Whether the driver's relay SM is clamping output (lockout active)."""
     dynamic_min_soc_pct: float | None = None
-    """Dynamic minimum SOC (%) from ``input_number.zfi_min_soc``.
+    """Dynamic minimum SOC (%) from ``sensor.zfi_dynamic_min_soc``.
 
     When set, overrides ``Config.min_soc_pct`` for the SOC-too-low guard.
     Clamped to ``[Config.min_soc_pct, Config.max_soc_pct]`` so the

@@ -956,7 +956,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
 
     @staticmethod
     def _round_to_step(value: float) -> int:
-        """Round a power value to the nearest device step (10 W)."""
+        """Round a power value to the nearest device step (5 W)."""
         return int(round(value / ROUNDING_STEP_W) * ROUNDING_STEP_W)
 
     def _set_sensor(

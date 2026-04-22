@@ -36,7 +36,7 @@ Existing PV → Q.HOME+ inverter → House grid ← Utility grid
 - Controller handles PI control, mode switching, surplus estimation — reusable for any battery
 - Driver handles Zendure-specific protocol: AC mode relay, power rounding, lockout timing
 - Controller publishes `sensor.zfi_desired_power` (signed W, +discharge/-charge)
-- Driver polls this sensor every 2 s and translates to device commands
+- Driver reacts to desired-power state changes and runs a watchdog every `watchdog_s` (default 15 s, typically 5 s)
 - Separation allows swapping the driver for other batteries without touching control logic
 
 ### Why AppDaemon (not HA Blueprint)
@@ -336,7 +336,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 ### Missing features
 
 - **No unit tests**: PIController, compute pipeline, guards are testable pure functions  
-  → **Resolved**: 208 tests (101 controller, 99 driver, 8 CSV logger) covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, state persistence, CSV logging
+  → **Resolved**: 277 tests (123 driver, 103 controller, 26 watchdog, 17 PV forecast, 8 CSV logger) covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, state persistence, watchdog safe-state, CSV logging
 - **No time-of-use / dynamic tariff support**: could charge from grid during negative prices
 - **Emergency only curtails discharge**: doesn't start charging to absorb existing PV surplus
 - **Single-instance only**: no multi-device HEMS support
@@ -359,8 +359,8 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `ki_discharge_down` | 0.051 | Integral gain: decrease discharge. |
 | `ki_charge_up` | 0.011 | Integral gain: increase charge. |
 | `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
-| `deadband` | 35W | No action within this error range. |
-| `deadband_leak_ws` | 250 W·s | Deadband leak correction to prevent persistent bias. |
+| `deadband` | 25W (prod: 35W) | No action within this error range. |
+| `deadband_leak_ws` | 500 W·s (prod: 250) | Deadband leak correction to prevent persistent bias. |
 | `feed_forward_sources` | (list) | Feed-forward sources: entity, gain, sign. |
 | `ff_enabled` | true | Master switch to enable/disable feed-forward. |
 | `ff_deadband` | 30W | Ignore total FF correction below this threshold. |
@@ -370,13 +370,12 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `mode_hysteresis` | 50W | Surplus band for mode switching. Increase if mode flaps. |
 | `charge_confirm` | 20s | Seconds surplus must hold before entering CHARGING. |
 | `relay_locked_sensor` | (entity) | HA entity for relay lockout feedback from driver. |
-| `relay_lockout_ws` | 10000 W·s | Energy threshold for relay direction change. |
-| `relay_lockout_cutoff_w` | 25W | Floor power for lockout accumulator (prevents infinite wait). |
-| `relay_lockout_idle_s` | 90s | Time before switching to idle state. |
+| `relay_lockout_ws` | 1000 W·s (prod: 10000) | Energy threshold for relay direction change. |
+| `relay_lockout_cutoff_w` | 1.0W (prod: 25W) | Floor power for lockout accumulator (prevents infinite wait). |
+| `relay_lockout_idle_s` | 5.0s (prod: 90s) | Time before switching to idle state. |
 | `max_output` | 1200W | Max discharge (W). |
 | `max_charge` | 800W | AC charge limit. |
 | `max_feed_in` | 800W | Emergency threshold. |
-| `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
 | `state_file` | `run/*.json` | JSON file path for state persistence (controller/driver). Defaults to `run/` directory in the repo root. |
 
 ### Gain tuning

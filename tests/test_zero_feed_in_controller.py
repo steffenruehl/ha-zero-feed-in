@@ -578,7 +578,6 @@ class TestConfigFromArgs:
             "mode_hysteresis": 100,
             "charge_confirm": 20,
             "max_feed_in": 500,
-            "emergency_kp_multiplier": 6.0,
             "dry_run": False,
             "debug": True,
             "sensor_prefix": "sensor.test",
@@ -607,7 +606,6 @@ class TestConfigFromArgs:
         assert cfg.mode_hysteresis_w == 100.0
         assert cfg.charge_confirm_s == 20.0
         assert cfg.max_feed_in_w == 500.0
-        assert cfg.emergency_kp_mult == 6.0
         assert cfg.dry_run is False
         assert cfg.debug is True
         assert cfg.sensor_prefix == "sensor.test"

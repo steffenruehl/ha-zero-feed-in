@@ -85,6 +85,32 @@ class TestIsEntityStale:
         wd._attrs["sensor.test"] = {"state": "200", "last_updated": "garbage"}
         assert wd._is_entity_stale("sensor.test") is True
 
+    def test_prefers_last_reported_over_last_updated(self):
+        """last_reported takes priority when both are present."""
+        wd = self._make_watchdog(60)
+        fresh = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.test"] = {
+            "state": "200",
+            "last_reported": fresh,
+            "last_updated": stale,
+        }
+        assert wd._is_entity_stale("sensor.test") is False
+
+    def test_falls_back_to_last_updated(self):
+        """Uses last_updated when last_reported is absent."""
+        wd = self._make_watchdog(60)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        wd._attrs["sensor.test"] = {"state": "200", "last_updated": ts}
+        assert wd._is_entity_stale("sensor.test") is False
+
+    def test_fresh_via_last_reported(self):
+        """Entity is fresh when last_reported is recent (no last_updated)."""
+        wd = self._make_watchdog(60)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+        wd._attrs["sensor.test"] = {"state": "200", "last_reported": ts}
+        assert wd._is_entity_stale("sensor.test") is False
+
 
 # ═══════════════════════════════════════════════════════════
 #  _check_heartbeats

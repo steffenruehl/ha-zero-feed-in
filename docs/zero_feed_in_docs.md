@@ -58,7 +58,7 @@ Controller (every 5s):
   relay_locked_sensor────────┤               (integral frozen when locked)
   dynamic_min_soc_entity ────┘               (forecast-adjusted min SOC)
 
-Driver (every 2s):
+Driver (event-driven + watchdog every 5 s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
                                 sensor.zfi_device_output, relay, etc.
 ```
@@ -70,7 +70,7 @@ Driver (every 2s):
 | What it knows | Grid power, SOC, surplus | Device protocol, relay timing |
 | What it doesn't know | outputLimit, inputLimit, acMode | PI gains, targets, modes |
 | Reusable for | Any battery | Only Zendure SolarFlow |
-| Update rate | 5 s (PI cycle) | 2 s (react to new desired power) |
+| Update rate | 5 s (PI cycle) | Event-driven + watchdog (typically 5 s) |
 
 ---
 
@@ -273,26 +273,26 @@ Power limits (outputLimit, inputLimit) are sent whenever their values change. No
 
 ### 3. Relay Lockout (adaptive, energy-integrator)
 
-The `RelayStateMachine` gates relay transitions behind an energy integrator (`AdaptiveLockout`).  Each tick accumulates `|power| × dt`; the transition fires when the accumulated energy reaches `full_power_w × base_lockout_s`.
+The `RelayStateMachine` gates relay transitions behind an energy integrator (`AdaptiveLockout`).  Each tick accumulates `|power| × dt`; the transition fires when the accumulated energy reaches the configured `relay_lockout_ws` threshold (in W·s).
 
 ```
-threshold = full_power_w × base_lockout_s   (e.g. 200 W × 30 s = 6 000 W·s)
+threshold = relay_lockout_ws   (e.g. 10 000 W·s)
 ```
 
-For sustained constant power the effective lockout is:
+For sustained constant power the effective lockout is `threshold / |power|`:
 
-| |desired_power| | Lockout (base=30s, ref=200W) | Rationale |
+| |desired_power| | Lockout (relay_lockout_ws=10000) | Rationale |
 | --- | --- | --- |
-| 200 W+ | 30 s | High surplus — worth switching |
-| 100 W | 60 s | Moderate — wait longer |
-| 50 W | 120 s | Marginal — probably not worth the relay wear |
-| <20 W | ≥300 s (safety cap) | Negligible — idle instead |
+| 500 W+ | 20 s | High surplus — worth switching |
+| 200 W | 50 s | Moderate — wait longer |
+| 100 W | 100 s | Marginal — probably not worth the relay wear |
+| <cutoff_w | Capped at 600 s (safety timeout) | Negligible — idle instead |
 
 IDLE transitions use an accumulated-time lockout (`idle_lockout_s`): time is only counted during ticks where IDLE is the target, so oscillations between non-current states accumulate IDLE time across interruptions.
 
 **Independent accumulators:** Each non-current state tracks its own transition progress independently. Switching between two non-current targets (e.g. oscillating between IDLE and DISCHARGE while in CHARGING) does **not** reset the other's accumulator. This ensures that even with oscillating desired power, the state machine eventually transitions — whichever accumulator reaches its threshold first wins. All accumulators are reset only when the desired state matches the current state (stable) or when an actual transition fires.
 
-A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
+A 600 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
 During lockout, power is **clamped** to the current direction's minimum active power (`min_active_power_w`, default 25 W), keeping the device responsive while preventing relay chatter.
 
@@ -311,7 +311,7 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
-... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
+... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the configured `relay_lockout_ws` threshold (in W·s) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 600 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
 
 ### 3. SOC Protection
 
@@ -442,7 +442,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([Tick: every 2s]) --> B{desired_power<br>available?}
+    A([Tick: event-driven + watchdog]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
     B -- Yes --> STALE{Controller stale?<br>last_updated > 30s}
     STALE -- Yes --> SAFE["Safe sensors: 0W out, limits<br>Publish controller_stale=true"]

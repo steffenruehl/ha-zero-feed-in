@@ -55,7 +55,7 @@ When modifying existing code, add missing docstrings and type annotations to any
 - AC mode relay physically switches — minimize switching to avoid wear
 - `outputLimit` / `inputLimit` are write-only from driver perspective
 - MQTT integration overwrites HA entity state faster than relay switches — driver tracks its own intent
-- Power rounded to 10 W steps
+- Power rounded to 5 W steps
 
 ## Git
 

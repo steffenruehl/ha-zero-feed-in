@@ -7,7 +7,7 @@ https://github.com/steffenruehl/ha-zero-feed-in
 ## Architecture
 
 ```
-Forecast.Solar ──▸ HA Automation ──▸ input_number.zfi_min_soc
+PvForecastManager ──▸ sensor.zfi_dynamic_min_soc
                                               │
 Grid Sensor ───────▸                          │
 SOC Sensor ─────────▸ Controller (PI) ────────▸ sensor.zfi_desired_power
@@ -45,7 +45,7 @@ Three AppDaemon apps:
 - Signed + unsigned battery sensor support
 - 12+ debug sensors published to HA
 - Startup seeding from device state (controller + driver)
-- Forecast-based dynamic min_soc (reads `input_number.zfi_min_soc`)
+- Forecast-based dynamic min_soc (reads `sensor.zfi_dynamic_min_soc`)
 - Feed-forward: EMA-filtered multi-source (PV + arbitrary loads), configurable per source
 - MQTT reconnect watchdog (HA startup + entity-stale triggers)
 - State persistence: controller + driver save/restore state across restarts (JSON)

@@ -119,7 +119,6 @@ zero_feed_in_controller:
 
   # Protection
   max_feed_in: 800             # emergency brake: cap output if feed-in exceeds (W)
-  emergency_kp_multiplier: 4.0 # Kp boost when max_feed_in is breached
 
 
 # ══════════════════════════════════════════════════════════════════════════════
