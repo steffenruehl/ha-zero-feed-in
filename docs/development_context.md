@@ -135,9 +135,7 @@ can never violate the hard safety limits from apps.yaml. Falls back to static
 ## File Structure
 
 ```
-__init__.py                       # package marker (AppDaemon App Package)
 src/
-├── __init__.py                   # package marker
 ├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
 ├── pv_forecast_manager.py        # PV forecast → dynamic min SOC

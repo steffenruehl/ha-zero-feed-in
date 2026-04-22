@@ -12,8 +12,10 @@
 #    4. Counter     — tracks daily relay switch count
 #    5. Watchdog    — triggers MQTT reconnect via local HTTP API
 #
-#  Module paths assume this repo is cloned into:
+#  AppDaemon discovers modules by filename.  Clone this repo into:
 #    <appdaemon>/apps/zero_feed_in/
+#  Do NOT add __init__.py — AppDaemon's flat-name scanner requires plain
+#  directories (no Python packages).
 #
 #  Secrets: add entries from secrets.yaml.example to your AppDaemon
 #  secrets.yaml (usually at <appdaemon>/secrets.yaml).
@@ -24,7 +26,7 @@
 #  1. Controller (device-agnostic PI)
 # ══════════════════════════════════════════════════════════════════════════════
 zero_feed_in_controller:
-  module: zero_feed_in.src.zero_feed_in_controller
+  module: zero_feed_in_controller
   class: ZeroFeedInController
 
   # ── GLOBAL (shared via YAML anchors) ────────────────────────────────────
@@ -120,7 +122,7 @@ zero_feed_in_controller:
 #  2. Zendure SolarFlow Driver
 # ══════════════════════════════════════════════════════════════════════════════
 zendure_solarflow_driver:
-  module: zero_feed_in.src.zendure_solarflow_driver
+  module: zendure_solarflow_driver
   class: ZendureSolarFlowDriver
   dry_run:        *dry_run
   debug:          *debug
@@ -151,7 +153,7 @@ zendure_solarflow_driver:
 #  3. PV Forecast Manager
 # ══════════════════════════════════════════════════════════════════════════════
 pv_forecast_manager:
-  module: zero_feed_in.src.pv_forecast_manager
+  module: pv_forecast_manager
   class: PvForecastManager
   debug:          *debug
   sensor_prefix:  *sensor_prefix
@@ -186,7 +188,7 @@ pv_forecast_manager:
 #  4. Relay Switch Counter
 # ══════════════════════════════════════════════════════════════════════════════
 relay_switch_counter:
-  module: zero_feed_in.src.relay_switch_counter
+  module: relay_switch_counter
   class: RelaySwitchCounter
   sensor_prefix:  *sensor_prefix
 
@@ -198,7 +200,7 @@ relay_switch_counter:
 #  5. SolarFlow MQTT Watchdog
 # ══════════════════════════════════════════════════════════════════════════════
 solarflow_mqtt_watchdog:
-  module: zero_feed_in.src.solarflow_mqtt_watchdog
+  module: solarflow_mqtt_watchdog
   class: SolarFlowMqttWatchdog
   dry_run:        *dry_run
 
