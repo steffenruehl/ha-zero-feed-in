@@ -99,6 +99,8 @@ class TestCheckHeartbeats:
         entities: list[str],
         stale_s: int = 60,
         dry_run: bool = False,
+        output_limit_entity: str = "",
+        input_limit_entity: str = "",
     ) -> object:
         """Create a minimal watchdog with _check_heartbeats bound."""
 
@@ -108,6 +110,9 @@ class TestCheckHeartbeats:
                 self._heartbeat_stale_s = stale_s
                 self._dry_run = dry_run
                 self._stale_notified: set[str] = set()
+                self._output_limit_entity = output_limit_entity
+                self._input_limit_entity = input_limit_entity
+                self._safe_state_active: bool = False
                 self._attrs: dict[str, dict[str, str | None]] = {}
                 self.service_calls: list[tuple[str, dict]] = []
                 self.log_messages: list[str] = []
@@ -128,6 +133,7 @@ class TestCheckHeartbeats:
         wd = FakeWatchdog()
         wd._is_entity_stale = SolarFlowMqttWatchdog._is_entity_stale.__get__(wd)
         wd._check_heartbeats = SolarFlowMqttWatchdog._check_heartbeats.__get__(wd)
+        wd._send_safe_state = SolarFlowMqttWatchdog._send_safe_state.__get__(wd)
         return wd
 
     def test_fresh_entities_no_notification(self):
@@ -192,3 +198,129 @@ class TestCheckHeartbeats:
         wd._check_heartbeats({})
         notif_id = wd.service_calls[0][1]["notification_id"]
         assert notif_id == "zfi_heartbeat_sensor_zfi_desired_power"
+
+
+# ═══════════════════════════════════════════════════════════
+#  Safe state on heartbeat failure
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSafeState:
+    """Tests for safe-state enforcement when heartbeats go stale."""
+
+    @staticmethod
+    def _make_watchdog(
+        entities: list[str],
+        stale_s: int = 60,
+        dry_run: bool = False,
+    ) -> object:
+        """Create a watchdog with safe-state device entities configured."""
+        return TestCheckHeartbeats._make_watchdog(
+            entities=entities,
+            stale_s=stale_s,
+            dry_run=dry_run,
+            output_limit_entity="number.output",
+            input_limit_entity="number.input",
+        )
+
+    def test_stale_sends_safe_state(self):
+        """When any entity goes stale, 0W is sent to both device limits."""
+        wd = self._make_watchdog(["sensor.a"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 2
+        entities_zeroed = {c[1]["entity_id"] for c in number_calls}
+        assert entities_zeroed == {"number.output", "number.input"}
+        for c in number_calls:
+            assert c[1]["value"] == 0
+        assert wd._safe_state_active is True
+
+    def test_safe_state_sent_once_not_repeated(self):
+        """Safe state is sent once on first stale detection, not every check."""
+        wd = self._make_watchdog(["sensor.a"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": ts}
+        wd._check_heartbeats({})
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 2  # only from first check
+
+    def test_recovery_releases_safe_state(self):
+        """When all entities recover, safe_state_active is cleared."""
+        wd = self._make_watchdog(["sensor.a"])
+        # Stale
+        old_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": old_ts}
+        wd._check_heartbeats({})
+        assert wd._safe_state_active is True
+        # Recover
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        wd._attrs["sensor.a"]["last_updated"] = fresh_ts
+        wd._check_heartbeats({})
+        assert wd._safe_state_active is False
+        assert any("recovered" in m.lower() for m in wd.log_messages)
+
+    def test_one_stale_one_fresh_still_sends_safe_state(self):
+        """Even if only one of two entities is stale, safe state is sent."""
+        wd = self._make_watchdog(["sensor.a", "sensor.b"])
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": fresh_ts}
+        wd._attrs["sensor.b"] = {"state": "100", "last_updated": stale_ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 2
+        assert wd._safe_state_active is True
+
+    def test_safe_state_not_released_until_all_recover(self):
+        """Safe state stays active until ALL entities recover."""
+        wd = self._make_watchdog(["sensor.a", "sensor.b"])
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": stale_ts}
+        wd._attrs["sensor.b"] = {"state": "100", "last_updated": stale_ts}
+        wd._check_heartbeats({})
+        assert wd._safe_state_active is True
+        # Only sensor.a recovers
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        wd._attrs["sensor.a"]["last_updated"] = fresh_ts
+        wd._check_heartbeats({})
+        assert wd._safe_state_active is True  # sensor.b still stale
+
+    def test_no_device_entities_no_safe_state(self):
+        """Without device entities configured, no safe state is sent."""
+        wd = TestCheckHeartbeats._make_watchdog(["sensor.a"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 0
+
+    def test_dry_run_no_safe_state_sent(self):
+        """In dry_run mode, safe state is logged but not sent."""
+        wd = self._make_watchdog(["sensor.a"], dry_run=True)
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 0
+        assert wd._safe_state_active is True
+        assert any("dry run" in m.lower() for m in wd.log_messages)
+
+    def test_safe_state_exception_does_not_propagate(self):
+        """If service call fails, exception is caught and logged."""
+        wd = self._make_watchdog(["sensor.a"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.a"] = {"state": "200", "last_updated": ts}
+
+        original_call_service = wd.call_service
+
+        def failing_service(service, **kwargs):
+            if service == "number/set_value":
+                raise RuntimeError("HA down")
+            original_call_service(service, **kwargs)
+
+        wd.call_service = failing_service
+        wd._check_heartbeats({})  # should not raise
+        assert any("safe state send failed" in m.lower() for m in wd.log_messages)

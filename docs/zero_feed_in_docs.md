@@ -359,16 +359,27 @@ that watches the heartbeat topic and takes action when it goes stale.
 - Driver: `heartbeat_mqtt_topic: zfi/heartbeat/driver`
 - Omit or leave empty to disable.
 
-### 7. Watchdog Heartbeat Monitoring
+### 7. Watchdog Heartbeat Monitoring + Safe State
 
 The MQTT Watchdog app (`solarflow_mqtt_watchdog.py`) can optionally
 monitor a list of HA entities for staleness.  When any entity's
 `last_updated` exceeds `heartbeat_stale_s` (default 60 s):
 
 - A HA **persistent notification** is created (one per entity).
+- If `output_limit_entity` and `input_limit_entity` are configured,
+  both are set to **0 W** (device safe state).  This catches the case
+  where the driver itself has died — the driver's own stale-check
+  only covers a dead controller, not a dead driver.
+- Safe state is sent once per stale transition.  When **all** entities
+  recover, safe state is released and normal operation resumes.
 - When the entity recovers, the notification is dismissed.
 - Entities to monitor are configured via `heartbeat_entities` (e.g.
   `sensor.zfi_desired_power`, `sensor.zfi_device_output`).
+
+The future ESP32 watchdog runs independently of HA — it subscribes to
+the MQTT heartbeat topics and only needs to **notify** the user.
+Safe-state enforcement lives in the HA watchdog because it has direct
+access to device entities via HA services.
 
 ---
 

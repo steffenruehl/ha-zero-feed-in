@@ -141,7 +141,7 @@ src/
 ├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
 ├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
 ├── csv_logger.py                 # shared daily-rotating CSV file logger
-└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
+└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog + heartbeat safe-state
 run/                              # runtime state (git-ignored, auto-created)
 ├── zfi_controller_state.json
 ├── zfi_driver_state.json
@@ -309,7 +309,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
 - Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver sends 0 W to both limits and publishes `sensor.zfi_controller_stale = true`
 - MQTT heartbeat publishing: controller and driver can publish ISO-8601 timestamps to configurable MQTT topics on every tick for external monitoring (e.g. ESP32 fallback)
-- Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale
+- Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale; when device entities are configured, also sends safe state (0W to outputLimit + inputLimit) catching both controller and driver failures
 
 ### Entity names (current setup)
 

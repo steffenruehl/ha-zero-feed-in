@@ -54,7 +54,7 @@ Three AppDaemon apps:
 - Driver stale-check: sends safe state (0 W) when controller hasn't updated in 30 s
 - MQTT heartbeat publishing: controller + driver publish ISO-8601 timestamps for ESP monitoring
 - Watchdog heartbeat monitoring: checks entity last_updated, HA persistent notifications on stale
-- 263 unit tests (103 controller, 127 driver, 17 PV forecast, 8 CSV logger, 8 watchdog) — all passing
+- 271 unit tests (103 controller, 127 driver, 17 PV forecast, 8 CSV logger, 16 watchdog) — all passing
 - CSV file logging (controller + driver)
 - Lovelace dashboard
 
@@ -182,7 +182,7 @@ it runs inside AppDaemon and dies with it.
 - Layer 1: SolarFlow BMS (hardware, always active)
 - Layer 2: Driver stale-check (see #3 above)
 - Layer 3: MQTT heartbeat publishing (ready for ESP32 consumer)
-- Layer 4: Watchdog heartbeat monitoring (HA notifications)
+- Layer 4: Watchdog heartbeat monitoring + safe state (HA notifications + 0W)
 - Layer 5: ESP32 watchdog (not yet implemented)
 
 **MQTT heartbeats implemented**: Both controller and driver can publish
@@ -190,11 +190,14 @@ ISO-8601 UTC timestamps to configurable MQTT topics on every tick:
 - `heartbeat_mqtt_topic: zfi/heartbeat/controller`
 - `heartbeat_mqtt_topic: zfi/heartbeat/driver`
 
-**Watchdog heartbeat monitoring implemented**: The MQTT watchdog
-optionally checks `last_updated` of configured HA entities (e.g.
-`sensor.zfi_desired_power`, `sensor.zfi_device_output`) every
+**Watchdog heartbeat monitoring + safe state implemented**: The MQTT
+watchdog optionally checks `last_updated` of configured HA entities
+(e.g. `sensor.zfi_desired_power`, `sensor.zfi_device_output`) every
 `heartbeat_check_s` seconds.  Creates HA persistent notifications
-when stale, dismisses on recovery.
+when stale, dismisses on recovery.  When `output_limit_entity` and
+`input_limit_entity` are configured, sends safe state (0W to both
+limits) when any entity is stale — catching both controller and driver
+failures.  Safe state is released when all entities recover.
 
 **Remaining**: ESP32 (ESPHome) running independently of HA.  Subscribes
 to MQTT heartbeat topics.  If stale for >2 minutes, sends HTTP POST

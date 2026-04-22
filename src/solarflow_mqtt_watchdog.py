@@ -12,11 +12,15 @@ Two triggers:
   2. Entity stale – when ``watch_entity`` stays ``unavailable`` for longer than
                     ``unavailable_duration_s``, the config is resent.
 
-Optional heartbeat monitoring:
+Optional heartbeat monitoring with safe-state enforcement:
   When ``heartbeat_entities`` is configured, the watchdog periodically checks
   the ``last_updated`` timestamp of each entity.  If any entity is older than
-  ``heartbeat_stale_s`` seconds, a HA persistent notification is created.
-  When the entity recovers, the notification is dismissed.
+  ``heartbeat_stale_s`` seconds:
+    1. A HA persistent notification is created.
+    2. If ``output_limit_entity`` and ``input_limit_entity`` are configured,
+       both are set to 0 W (safe state) — stopping the device.
+  When all entities recover, the notification is dismissed and normal
+  operation resumes (the driver will re-send its desired limits).
 
 Config (apps.yaml):
 
@@ -39,6 +43,9 @@ Config (apps.yaml):
       - sensor.zfi_device_output         # driver heartbeat
     heartbeat_stale_s: 60                # max age before notification (s)
     heartbeat_check_s: 30                # check interval (s)
+    # Safe-state: device entities to zero when any heartbeat is stale
+    output_limit_entity: number.YOUR_SOLARFLOW_OUTPUTLIMIT
+    input_limit_entity: number.YOUR_SOLARFLOW_INPUTLIMIT
 """
 
 from __future__ import annotations
@@ -85,6 +92,15 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         )
         self._stale_notified: set[str] = set()
 
+        # Safe-state device entities (optional)
+        self._output_limit_entity: str = self.args.get(
+            "output_limit_entity", ""
+        )
+        self._input_limit_entity: str = self.args.get(
+            "input_limit_entity", ""
+        )
+        self._safe_state_active: bool = False
+
         # Trigger 1: HA startup
         self.listen_event(self._on_ha_start, "homeassistant_started")
 
@@ -111,6 +127,11 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
                 self._check_heartbeats, "now+60", self._heartbeat_check_s,
             )
 
+        safe_state_cfg = (
+            f"out={self._output_limit_entity} in={self._input_limit_entity}"
+            if self._output_limit_entity
+            else "disabled"
+        )
         self.log(
             f"Started | watch={self._watch_entity} "
             f"stale_after={self._unavailable_s}s "
@@ -118,6 +139,7 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             f"target=http://{self._solarflow_ip}/rpc "
             f"heartbeat_entities={len(self._heartbeat_entities)} "
             f"heartbeat_stale_s={self._heartbeat_stale_s} "
+            f"safe_state={safe_state_cfg} "
             f"dry_run={self._dry_run}"
         )
 
@@ -142,10 +164,15 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         """Periodically check ``last_updated`` of heartbeat entities.
 
         Creates a HA persistent notification when an entity is stale
-        and dismisses it when the entity recovers.
+        and dismisses it when the entity recovers.  When any entity is
+        stale and device entities are configured, sends safe state (0 W)
+        to both outputLimit and inputLimit.
         """
+        any_stale = False
         for entity in self._heartbeat_entities:
             stale = self._is_entity_stale(entity)
+            if stale:
+                any_stale = True
             notif_id = f"zfi_heartbeat_{entity.replace('.', '_')}"
 
             if stale and entity not in self._stale_notified:
@@ -174,6 +201,14 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
                         notification_id=notif_id,
                     )
 
+        # Safe-state enforcement: send 0 W when any entity is stale
+        if any_stale and not self._safe_state_active:
+            self._safe_state_active = True
+            self._send_safe_state()
+        elif not any_stale and self._safe_state_active:
+            self._safe_state_active = False
+            self.log("All heartbeats recovered — safe state released")
+
     def _is_entity_stale(self, entity: str) -> bool:
         """Return True if *entity*'s ``last_updated`` exceeds the threshold."""
         state = self.get_state(entity)
@@ -188,6 +223,39 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             return age_s > self._heartbeat_stale_s
         except (ValueError, TypeError):
             return True
+
+    def _send_safe_state(self) -> None:
+        """Send 0 W to both outputLimit and inputLimit (device safe state).
+
+        Called when any heartbeat entity goes stale.  Requires
+        ``output_limit_entity`` and ``input_limit_entity`` to be
+        configured.  Skipped in dry_run mode.
+        """
+        if not self._output_limit_entity or not self._input_limit_entity:
+            return
+        if self._dry_run:
+            self.log(
+                "DRY RUN — would send safe state "
+                f"(0W to {self._output_limit_entity}, {self._input_limit_entity})"
+            )
+            return
+        self.log(
+            "Sending safe state (0W) — heartbeat stale",
+            level="WARNING",
+        )
+        try:
+            self.call_service(
+                "number/set_value",
+                entity_id=self._output_limit_entity,
+                value=0,
+            )
+            self.call_service(
+                "number/set_value",
+                entity_id=self._input_limit_entity,
+                value=0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Safe state send failed: {exc}", level="ERROR")
 
     # ── Reconnect ─────────────────────────────────────────────────────
 

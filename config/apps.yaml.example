@@ -238,8 +238,15 @@ solarflow_mqtt_watchdog:
 
   # Heartbeat monitoring (optional).  Periodically checks last_updated of
   # each entity.  Sends a HA persistent notification when any goes stale.
+  # When device entities are configured, also sends safe state (0W) to stop
+  # the device — catching both controller and driver failures.
   # heartbeat_entities:
   #   - sensor.zfi_desired_power    # controller output
   #   - sensor.zfi_device_output    # driver output
   # heartbeat_stale_s: 60           # max age before notification (s)
   # heartbeat_check_s: 30           # check interval (s)
+  #
+  # Safe-state device entities (optional).  When set, the watchdog sends
+  # 0W to both limits when any heartbeat entity is stale.
+  # output_limit_entity: number.YOUR_SOLARFLOW_OUTPUTLIMIT
+  # input_limit_entity: number.YOUR_SOLARFLOW_INPUTLIMIT
