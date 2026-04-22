@@ -342,9 +342,10 @@ would perpetually act on a stale `sensor.zfi_desired_power`. The driver
 checks the entity's `last_updated` timestamp on every tick:
 
 - **Fresh** (age ≤ `controller_stale_s`, default 30 s): normal operation.
-- **Stale** (age > threshold): driver sends both `outputLimit` and
-  `inputLimit` to **0 W** (safe state) and publishes
-  `sensor.zfi_controller_stale = true`.
+- **Stale** (age > threshold): driver publishes all output sensors as
+  **0 W** (`desired_power`, `device_output`, `discharge_limit`,
+  `charge_limit`) and sets `sensor.zfi_controller_stale = true`.
+  The watchdog handles sending 0 W to the physical device.
 - Logs a WARNING on the stale → fresh transition and vice versa.
 - Set `controller_stale_s: 0` to disable the check.
 
@@ -438,7 +439,7 @@ flowchart TD
     A([Tick: every 2s]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
     B -- Yes --> STALE{Controller stale?<br>last_updated > 30s}
-    STALE -- Yes --> SAFE["Safe state: 0W out, 0W in<br>Publish controller_stale=true"]
+    STALE -- Yes --> SAFE["Safe sensors: 0W desired, out, in<br>Publish controller_stale=true"]
     SAFE --> Z2([Done])
     STALE -- No --> SM{SM enabled?}
     SM -- Yes --> SMU["RelayStateMachine.update()<br>clamps power to current state"]
@@ -536,7 +537,7 @@ Published only when `debug: true` in the controller config.
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
 | `zfi_relay_locked` | text | — | `true` when SM is clamping output or relay is physically switching (8 s holdoff) |
-| `zfi_controller_stale` | text | — | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver sends safe state (0 W) |
+| `zfi_controller_stale` | text | — | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver publishes safe sensors (0 W) |
 
 ### Driver sensors (debug only)
 

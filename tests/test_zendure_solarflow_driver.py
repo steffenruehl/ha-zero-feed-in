@@ -1348,7 +1348,7 @@ class TestIsControllerStale:
 
 
 class TestSendSafeState:
-    """Tests for _send_safe_state zero-limit failsafe."""
+    """Tests for _send_safe_state tracking reset (watchdog handles device)."""
 
     @staticmethod
     def _make_driver() -> object:
@@ -1368,44 +1368,28 @@ class TestSendSafeState:
                     ac_mode_entity="select.ac_mode",
                 )
                 self.driver_state = DriverState()
-                self.service_calls: list[tuple[str, dict]] = []
-
-            def call_service(self, service: str, **kwargs: object) -> None:
-                self.service_calls.append((service, kwargs))
 
         drv = FakeDriver()
         drv._send_safe_state = ZendureSolarFlowDriver._send_safe_state.__get__(drv)
         return drv
 
-    def test_sends_zero_when_nonzero(self):
-        """Both limits are sent to 0 when they were previously nonzero."""
+    def test_resets_tracking_when_nonzero(self):
+        """Both tracking fields are reset to 0."""
         drv = self._make_driver()
         drv.driver_state.last_sent_discharge_w = 200
         drv.driver_state.last_sent_charge_w = 100
         drv._send_safe_state()
-        assert len(drv.service_calls) == 2
         assert drv.driver_state.last_sent_discharge_w == 0
         assert drv.driver_state.last_sent_charge_w == 0
 
-    def test_skips_when_already_zero(self):
-        """No service calls when both limits are already 0."""
+    def test_noop_when_already_zero(self):
+        """No error when both limits are already 0."""
         drv = self._make_driver()
         drv.driver_state.last_sent_discharge_w = 0
         drv.driver_state.last_sent_charge_w = 0
         drv._send_safe_state()
-        assert drv.service_calls == []
-
-    def test_sends_only_nonzero_limit(self):
-        """Only the non-zero limit is sent."""
-        drv = self._make_driver()
-        drv.driver_state.last_sent_discharge_w = 200
-        drv.driver_state.last_sent_charge_w = 0
-        drv._send_safe_state()
-        assert len(drv.service_calls) == 1
-        assert drv.service_calls[0] == (
-            "number/set_value",
-            {"entity_id": "number.output", "value": 0},
-        )
+        assert drv.driver_state.last_sent_discharge_w == 0
+        assert drv.driver_state.last_sent_charge_w == 0
 
 
 # ═══════════════════════════════════════════════════════════

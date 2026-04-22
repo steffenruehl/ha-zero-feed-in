@@ -712,7 +712,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         if stale != self._was_controller_stale:
             if stale:
                 self.log(
-                    "Controller stale — sending safe state (0W)",
+                    "Controller stale — publishing safe sensors (0W)",
                     level="WARNING",
                 )
             else:
@@ -721,6 +721,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         if stale:
             if not self.cfg.dry_run:
                 self._send_safe_state()
+            self._set_sensor("desired_power", 0, "W", "mdi:transmission-tower")
             self._set_sensor("device_output", 0, "W", "mdi:transmission-tower-export")
             self._set_sensor("discharge_limit", 0, "W", "mdi:battery-arrow-down")
             self._set_sensor("charge_limit", 0, "W", "mdi:battery-arrow-up")
@@ -866,21 +867,9 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             return True
 
     def _send_safe_state(self) -> None:
-        """Send zero limits to safely stop the device (controller stale failsafe)."""
-        if self.driver_state.last_sent_discharge_w != 0:
-            self.call_service(
-                "number/set_value",
-                entity_id=self.cfg.output_entity,
-                value=0,
-            )
-            self.driver_state.last_sent_discharge_w = 0
-        if self.driver_state.last_sent_charge_w != 0:
-            self.call_service(
-                "number/set_value",
-                entity_id=self.cfg.input_entity,
-                value=0,
-            )
-            self.driver_state.last_sent_charge_w = 0
+        """Reset last-sent tracking to zero (watchdog handles device commands)."""
+        self.driver_state.last_sent_discharge_w = 0
+        self.driver_state.last_sent_charge_w = 0
 
     # ─── Heartbeat ──────────────────────────────────────────
 

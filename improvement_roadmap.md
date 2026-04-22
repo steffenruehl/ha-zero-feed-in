@@ -54,7 +54,7 @@ Three AppDaemon apps:
 - Driver stale-check: sends safe state (0 W) when controller hasn't updated in 30 s
 - MQTT heartbeat publishing: controller + driver publish ISO-8601 timestamps for ESP monitoring
 - Watchdog heartbeat monitoring: checks entity last_updated, HA persistent notifications on stale
-- 271 unit tests (103 controller, 127 driver, 17 PV forecast, 8 CSV logger, 16 watchdog) — all passing
+- 270 unit tests (103 controller, 126 driver, 17 PV forecast, 8 CSV logger, 16 watchdog) — all passing
 - CSV file logging (controller + driver)
 - Lovelace dashboard
 
@@ -180,7 +180,7 @@ it runs inside AppDaemon and dies with it.
 
 **Defense layers currently in place:**
 - Layer 1: SolarFlow BMS (hardware, always active)
-- Layer 2: Driver stale-check (see #3 above)
+- Layer 2: Driver stale-check (publishes safe sensors, see #3 above)
 - Layer 3: MQTT heartbeat publishing (ready for ESP32 consumer)
 - Layer 4: Watchdog heartbeat monitoring + safe state (HA notifications + 0W)
 - Layer 5: ESP32 watchdog (not yet implemented)
