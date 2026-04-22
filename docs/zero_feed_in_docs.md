@@ -797,13 +797,26 @@ Optional switches (create as HA helpers → Toggle):
 
 Add secrets to your AppDaemon `secrets.yaml` (see `config/secrets.yaml.example`).
 
-### 4. Start in Dry Run
+### 4. Runtime Files
+
+State files (PI integral, relay SM state, relay switch count) are stored in `zero_feed_in/run/`.  This directory is auto-created on first start and git-ignored, so `git pull` never overwrites runtime state.
+
+### 5. Start in Dry Run
 
 Set `dry_run: true` (the YAML anchor at the top of `apps.yaml` applies to all apps). Set `debug: true` to publish internal sensors for the debug dashboards. Monitor via AppDaemon log and `sensor.zfi_*` entities.
 
-### 5. Go Live
+### 6. Go Live
 
 Set `dry_run: false`. Start with `max_output: 200`. Once stable, set `debug: false` to reduce HA sensor churn.
+
+### 7. Updating
+
+```bash
+cd /root/addon_configs/a0d7b954_appdaemon/apps/zero_feed_in
+git pull origin main
+```
+
+AppDaemon detects file changes and reloads automatically.  State in `run/` is preserved across updates.
 
 ---
 

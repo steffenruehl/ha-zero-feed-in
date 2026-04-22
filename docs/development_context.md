@@ -296,7 +296,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Driver publishes `sensor.zfi_relay_locked` (always, not debug-only) so the controller can freeze the integral during relay lockout
 - `relay_locked` stays `true` for 8 seconds after each SM transition (`RELAY_SWITCH_DELAY_S`) to account for physical relay switching time
 - Redundant sends suppressed (only send when values change)
-- State persistence: controller saves integral/mode/last_computed_w to JSON every 60s and on shutdown; driver saves SM state on each transition and on shutdown. On restart, persisted state is restored before the battery_power seed, so the PI resumes where it left off instead of starting from zero.
+- State persistence: controller saves integral/mode/last_computed_w to JSON every 60s and on shutdown; driver saves SM state on each transition and on shutdown. All JSON state files default to the `run/` directory (auto-created, git-ignored). On restart, persisted state is restored before the battery_power seed, so the PI resumes where it left off instead of starting from zero.
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
@@ -362,7 +362,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `max_charge` | 800W | AC charge limit. |
 | `max_feed_in` | 800W | Emergency threshold. |
 | `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
-| `state_file` | (auto) | JSON file path for state persistence (controller/driver). |
+| `state_file` | `run/*.json` | JSON file path for state persistence (controller/driver). Defaults to `run/` directory in the repo root. |
 
 ### Gain tuning
 Gains are derived from step response measurements per quadrant using SIMC rules.
