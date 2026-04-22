@@ -37,7 +37,7 @@ cards:
 
   - type: history-graph
     title: Error vs Deadband (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_error
         name: Error (W)
@@ -65,7 +65,7 @@ cards:
 
   - type: history-graph
     title: PI Terms (P, I, FF) — 1 hour
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_p_term
         name: P term
@@ -76,7 +76,7 @@ cards:
 
   - type: history-graph
     title: Desired Power Buildup (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_desired_power
         name: Desired power
@@ -146,7 +146,7 @@ cards:
 
   - type: history-graph
     title: Surplus vs Mode (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_surplus
         name: Surplus (W)
@@ -158,7 +158,7 @@ cards:
   # ─────────────────────────────────────────────────────────
   - type: history-graph
     title: Complete PI Decomposition (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_desired_power
         name: Final desired power

@@ -30,7 +30,7 @@ cards:
 
   - type: history-graph
     title: PV Filter — Raw vs EMA
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_ff_pv_raw
         name: PV raw
@@ -39,7 +39,7 @@ cards:
 
   - type: history-graph
     title: FF Contribution Chain
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_ff_pv_contrib
         name: PV contrib (pre-deadband)
@@ -50,7 +50,7 @@ cards:
 
   - type: history-graph
     title: PI + FF Decomposition
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_desired_power
         name: Desired power

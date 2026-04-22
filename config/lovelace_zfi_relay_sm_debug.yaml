@@ -52,7 +52,7 @@ cards:
 
   - type: history-graph
     title: Lockout Progress (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_lockout_pct
         name: Lockout progress (%)
@@ -76,7 +76,7 @@ cards:
 
   - type: history-graph
     title: All Lockout Timers (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_charge_pct
         name: Charge lockout
@@ -112,7 +112,7 @@ cards:
 
   - type: history-graph
     title: Relay Lock Status (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_locked
         name: Relay locked
@@ -122,7 +122,7 @@ cards:
   # ─────────────────────────────────────────────────────────
   - type: history-graph
     title: Desired Power & Lockout Progress (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_desired_power
         name: Desired power (W)
@@ -134,7 +134,7 @@ cards:
   # ─────────────────────────────────────────────────────────
   - type: history-graph
     title: Accumulated Energy During Transitions (1h)
-    hours_to_show: 1
+    hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_relay_sm_accumulated_ws
         name: Accumulated energy (W·s)
