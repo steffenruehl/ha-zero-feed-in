@@ -785,6 +785,7 @@ Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections for 
 | `output_limit_entity` | Driver | `number.*_outputlimit` |
 | `input_limit_entity` | Driver | `number.*_inputlimit` |
 | `ac_mode_entity` | Driver | `select.*_acmode` |
+| `smart_mode_entity` | Driver | `switch.*_smartmode` (optional — enables RAM-only writes) |
 | `forecast_entities` | Forecast | `sensor.energy_production_tomorrow*` |
 | `watch_entity` | Watchdog | `sensor.*_electriclevel` |
 
@@ -916,6 +917,9 @@ PI wants to charge → guard: SOC ≥ max → idle
 ## Known Limitations
 
 - **Device response time**: 10–15 s (not 2–4 s as Zendure docs suggest)
-- **Flash writes**: `setOutputLimit`/`setInputLimit` may write to device flash
+- **Flash writes**: `setOutputLimit`/`setInputLimit` write to device flash by
+  default.  Mitigated by enabling `smartMode` via `smart_mode_entity` config —
+  routes all writes to RAM.  The driver re-enables smartMode automatically
+  after device reboot.
 - **Single phase**: SolarFlow feeds one phase; three-phase balancing at meter works
 - **Single instance only**: no multi-device HEMS support

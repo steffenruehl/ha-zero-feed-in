@@ -309,14 +309,19 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Output limit: `number.hec4nencn492140_outputlimit`
 - Input limit: `number.hec4nencn492140_inputlimit`
 - AC mode: `select.hec4nencn492140_acmode`
+- Smart mode: `switch.hec4nencn492140_smartmode`
 
 ## Known Issues / Not Yet Implemented
 
 ### Operational observations
 
 - Device response time is 10-15 s — much slower than docs suggest
-- Flash writes: whether `setOutputLimit`/`setInputLimit` write to flash is unknown
-- `setDeviceAutomationInOutLimit` as flash-safe alternative — not yet tested
+- Flash writes: `setOutputLimit`/`setInputLimit` write to device flash by default.
+  **Mitigated** by enabling `smartMode` (HA switch entity exposed by the Zendure
+  MQTT integration).  When ON, all property writes go to RAM instead of flash.
+  The driver enables smartMode automatically at startup and re-enables it on
+  each watchdog tick (device reboot resets it to OFF).  Configure via
+  `smart_mode_entity` in apps.yaml.
 
 ### Missing features
 

@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 try:
     from .csv_logger import CsvLogger
 except ImportError:
-    from src.csv_logger import CsvLogger  # type: ignore[no-redef]
+    from csv_logger import CsvLogger  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     import appdaemon.plugins.hass.hassapi as hass
@@ -145,6 +145,10 @@ class Config:
     """HA number entity for ``inputLimit`` (charge power, W)."""
     ac_mode_entity: str
     """HA select entity for AC mode ('Input mode' / 'Output mode')."""
+    smart_mode_entity: str = ""
+    """HA switch entity for smartMode.  When set, the driver turns on
+    smartMode at startup so that outputLimit/inputLimit/acMode writes
+    go to device RAM instead of flash — eliminating flash wear."""
     watchdog_s: int = 15
     """Watchdog interval (s): re-run even when desired_power hasn't changed."""
     relay_lockout_ws: float = 1000.0
@@ -178,6 +182,7 @@ class Config:
             output_entity=args["output_limit_entity"],
             input_entity=args["input_limit_entity"],
             ac_mode_entity=args["ac_mode_entity"],
+            smart_mode_entity=args.get("smart_mode_entity", cls.smart_mode_entity),
             watchdog_s=int(args.get("watchdog_s", cls.watchdog_s)),
             relay_lockout_ws=float(
                 args.get("relay_lockout_ws", cls.relay_lockout_ws)
@@ -560,6 +565,9 @@ class ZendureSolarFlowDriver(_HASS_BASE):
 
         self._seed_from_device()
 
+        # Enable smartMode (RAM-only writes, no flash wear)
+        self._ensure_smart_mode()
+
         # State persistence: override device seed with saved SM state
         _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
         os.makedirs(_run_dir, exist_ok=True)
@@ -583,6 +591,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             f"cutoff_w={self.cfg.relay_lockout_cutoff_w}W "
             f"idle_s={self.cfg.relay_lockout_idle_s}s "
             f"watchdog={self.cfg.watchdog_s}s "
+            f"smart_mode={self.cfg.smart_mode_entity or 'disabled'} "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -661,6 +670,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
 
     def _on_watchdog_tick(self, _kwargs: dict) -> None:
         """Called periodically to keep the SM ticking even when desired_power is stable."""
+        self._ensure_smart_mode()
         self._run()
 
     def _run(self) -> None:
@@ -767,6 +777,26 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         if ac_mode == AC_MODE_INPUT:
             return RelayDirection.CHARGE
         return RelayDirection.IDLE
+
+    # ─── Smart Mode ─────────────────────────────────────────
+
+    def _ensure_smart_mode(self) -> None:
+        """Turn on smartMode if configured and currently off.
+
+        smartMode tells the SolarFlow to keep property writes (outputLimit,
+        inputLimit, acMode) in RAM instead of flash.  The switch resets to
+        OFF on device reboot, so this is called on every watchdog tick.
+        """
+        entity = self.cfg.smart_mode_entity
+        if not entity:
+            return
+        state = self.get_state(entity)
+        if state in UNAVAILABLE_STATES:
+            return
+        if state == "on":
+            return
+        self.call_service("switch/turn_on", entity_id=entity)
+        self.log("smartMode turned on (RAM-only writes, no flash wear)")
 
     # ─── Send ─────────────────────────────────────────────
 

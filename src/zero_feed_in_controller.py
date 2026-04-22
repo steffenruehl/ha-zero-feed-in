@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 try:
     from .csv_logger import CsvLogger
 except ImportError:
-    from src.csv_logger import CsvLogger  # type: ignore[no-redef]
+    from csv_logger import CsvLogger  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     import appdaemon.plugins.hass.hassapi as hass

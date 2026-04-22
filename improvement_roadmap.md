@@ -50,7 +50,8 @@ Three AppDaemon apps:
 - MQTT reconnect watchdog (HA startup + entity-stale triggers)
 - State persistence: controller + driver save/restore state across restarts (JSON)
 - Relay switch counter (persists to JSON, publishes `sensor.zfi_relay_switches_today`)
-- 208 unit tests (101 controller, 99 driver, 8 CSV logger) — all passing
+- smartMode flash wear protection (RAM-only device writes, auto-reenabled after reboot)
+- 233 unit tests (101 controller, 107 driver, 17 PV forecast, 8 CSV logger) — all passing
 - CSV file logging (controller + driver)
 - Lovelace dashboard
 
@@ -214,16 +215,33 @@ source files. Atomic writes via tmp + `os.replace()`.
   spurious restart switches).
 - Optional `state_file` config key overrides the default path.
 
-### 6. Flash Wear Investigation — RESEARCH
+### 6. Flash Wear Investigation — DONE
 
 **Problem**: Unknown if frequent `outputLimit`/`inputLimit` MQTT writes
-cause flash wear on the SolarFlow. Driver sends a command every
-`watchdog_s` seconds; redundant-send suppression deduplicates identical
-values, so actual writes are fewer — but the exact write rate is unknown.
+cause flash wear on the SolarFlow.
 
-**Action**: Check Zendure community/forums for flash wear reports.
-Test if `setDeviceAutomationInOutLimit` exists as a single bidirectional
-entity that might reduce write frequency.
+**Investigation (April 2026):**
+- No community reports of actual device degradation from MQTT writes.
+- However, the ioBroker Zendure community confirmed with Zendure that
+  `setOutputLimit`/`setInputLimit` **do write to device flash** on each call.
+- Flash has ~100K write cycle endurance — a concern over years of use.
+- `setDeviceAutomationInOutLimit` exists in some firmware versions as a
+  combined bidirectional command, but is **not exposed as an HA entity**
+  by the Zendure MQTT integration and would require raw `mqtt/publish`.
+- The Zendure MQTT integration exposes a `smartMode` **switch entity**
+  (`switch.*_smartmode`).  When ON, all property writes go to **RAM
+  instead of flash**.  Values revert on device reboot.
+
+**Solution**: The driver now enables `smartMode` at startup via
+`call_service("switch/turn_on")`.  Since the switch resets to OFF on
+device reboot, the driver re-checks it on every watchdog tick and
+re-enables if needed.
+
+- Config: `smart_mode_entity: switch.hec4nencn492140_smartmode`
+- No changes to the existing command path (`outputLimit`, `inputLimit`,
+  `acMode` via `number/set_value` and `select/select_option`)
+- Existing deduplication still reduces unnecessary writes
+- Backward compatible: omit `smart_mode_entity` to disable
 
 ## Key Design Principles
 

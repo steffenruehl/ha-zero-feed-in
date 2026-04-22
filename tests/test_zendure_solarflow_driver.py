@@ -662,6 +662,7 @@ class TestDriverConfig:
         assert cfg.output_entity == "number.output_limit"
         assert cfg.input_entity == "number.input_limit"
         assert cfg.ac_mode_entity == "select.ac_mode"
+        assert cfg.smart_mode_entity == ""
         assert cfg.watchdog_s == 15
         assert cfg.relay_lockout_idle_s == 5.0
         assert cfg.relay_sm_enabled is True
@@ -691,6 +692,17 @@ class TestDriverConfig:
         assert cfg.dry_run is False
         assert cfg.debug is True
         assert cfg.sensor_prefix == "sensor.test"
+
+    def test_smart_mode_entity_from_args(self):
+        """smart_mode_entity is parsed from args when provided."""
+        from src.zendure_solarflow_driver import Config as DriverConfig
+
+        args = {
+            **self.MINIMAL_ARGS,
+            "smart_mode_entity": "switch.my_smartmode",
+        }
+        cfg = DriverConfig.from_args(args)
+        assert cfg.smart_mode_entity == "switch.my_smartmode"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1135,3 +1147,105 @@ class TestRelayStateMachinePersistence:
 
         sm.restore_from_snapshot({"state": "IDLE"})
         assert sm.state == RelayState.IDLE
+
+
+# ═══════════════════════════════════════════════════════════
+#  _ensure_smart_mode
+# ═══════════════════════════════════════════════════════════
+
+
+class TestEnsureSmartMode:
+    """Tests for the smartMode flash-wear protection logic.
+
+    Uses a minimal mock to exercise _ensure_smart_mode without AppDaemon.
+    """
+
+    @staticmethod
+    def _make_driver(smart_mode_entity: str = "") -> object:
+        """Create a minimal driver-like object with _ensure_smart_mode bound."""
+        from src.zendure_solarflow_driver import (
+            Config as DriverConfig,
+            UNAVAILABLE_STATES,
+        )
+
+        class FakeDriver:
+            """Minimal stand-in for ZendureSolarFlowDriver."""
+
+            def __init__(self, entity: str) -> None:
+                self.cfg = DriverConfig(
+                    desired_power_sensor="sensor.zfi_desired_power",
+                    output_entity="number.output",
+                    input_entity="number.input",
+                    ac_mode_entity="select.ac_mode",
+                    smart_mode_entity=entity,
+                )
+                self._state: dict[str, str | None] = {}
+                self.service_calls: list[tuple[str, dict]] = []
+                self.log_messages: list[str] = []
+
+            def get_state(self, entity_id: str) -> str | None:
+                return self._state.get(entity_id)
+
+            def call_service(self, service: str, **kwargs: object) -> None:
+                self.service_calls.append((service, kwargs))
+
+            def log(self, msg: str, **_kwargs: object) -> None:
+                self.log_messages.append(msg)
+
+        drv = FakeDriver(smart_mode_entity)
+        # Bind the real method
+        drv._ensure_smart_mode = ZendureSolarFlowDriver._ensure_smart_mode.__get__(drv)
+        return drv
+
+    def test_no_entity_configured_does_nothing(self):
+        """When smart_mode_entity is empty, no service call is made."""
+        drv = self._make_driver("")
+        drv._ensure_smart_mode()
+        assert drv.service_calls == []
+
+    def test_entity_unavailable_does_nothing(self):
+        """When the entity is unavailable, no service call is made."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = "unavailable"
+        drv._ensure_smart_mode()
+        assert drv.service_calls == []
+
+    def test_entity_none_does_nothing(self):
+        """When get_state returns None, no service call is made."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = None
+        drv._ensure_smart_mode()
+        assert drv.service_calls == []
+
+    def test_already_on_does_nothing(self):
+        """When smartMode is already on, no service call is made."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = "on"
+        drv._ensure_smart_mode()
+        assert drv.service_calls == []
+
+    def test_off_turns_on(self):
+        """When smartMode is off, turn_on is called."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = "off"
+        drv._ensure_smart_mode()
+        assert len(drv.service_calls) == 1
+        assert drv.service_calls[0] == (
+            "switch/turn_on",
+            {"entity_id": "switch.sm"},
+        )
+
+    def test_off_logs_message(self):
+        """Turning on smartMode logs an informational message."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = "off"
+        drv._ensure_smart_mode()
+        assert any("smartMode" in m for m in drv.log_messages)
+
+    def test_idempotent_when_on(self):
+        """Calling twice when already on produces zero service calls."""
+        drv = self._make_driver("switch.sm")
+        drv._state["switch.sm"] = "on"
+        drv._ensure_smart_mode()
+        drv._ensure_smart_mode()
+        assert drv.service_calls == []
