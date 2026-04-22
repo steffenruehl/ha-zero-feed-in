@@ -320,10 +320,10 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 | SOC ≤ effective min_soc | Discharge blocked |
 | SOC ≥ max_soc | Charge blocked |
 
-**Dynamic min SOC (forecast-based):** When `dynamic_min_soc_entity` is configured (default: `input_number.zfi_min_soc`), the controller reads it every cycle. The effective min SOC is clamped to `[Config.min_soc_pct, Config.max_soc_pct]` so it can never violate the hard limits from `apps.yaml`. When the entity is unavailable, the static `min_soc_pct` applies.
+**Dynamic min SOC (forecast-based):** When `dynamic_min_soc_entity` is configured (default: `sensor.zfi_dynamic_min_soc`, published by the PV Forecast Manager app), the controller reads it every cycle. The effective min SOC is clamped to `[Config.min_soc_pct, Config.max_soc_pct]` so it can never violate the hard limits from `apps.yaml`. When the entity is unavailable, the static `min_soc_pct` applies.
 
-A HA automation runs at 06:00, 15:00, and 20:00. If the PV forecast for tomorrow (summed across all Forecast.Solar planes) is below 1.5 kWh:
-- **06:00 (morning)**: sets `input_number.zfi_min_soc` to **50%** — prevents daytime discharge when PV won't recharge.
+The PV Forecast Manager (`pv_forecast_manager.py`) evaluates at 06:00, 15:00, and 20:00. If the PV forecast for tomorrow (summed across all configured Forecast.Solar entities) is below 1.5 kWh:
+- **06:00 (morning)**: sets `sensor.zfi_dynamic_min_soc` to **50%** — prevents daytime discharge when PV won't recharge.
 - **15:00 / 20:00 (evening)**: sets it to **30%** — preserves a night buffer.
 
 Otherwise resets to 10%. This prevents pointless deep discharge on days when PV won't deliver enough to recharge.
@@ -761,29 +761,32 @@ cards:
 
 Settings → Add-ons → Add-on Store → AppDaemon → Install → Start
 
-### 2. Deploy Files
+### 2. Clone the Repository
 
-```
-config/appdaemon/apps/
-├── zero_feed_in_controller.py
-├── zendure_solarflow_driver.py
-└── apps.yaml
+```bash
+cd /root/addon_configs/a0d7b954_appdaemon/apps
+git clone https://github.com/steffenruehl/ha-zero-feed-in.git zero_feed_in
 ```
 
-**Important**: Remove any old `zero_feed_in.py` entry from apps.yaml — running both the old monolithic app and the new controller+driver simultaneously will cause conflicts.
+### 3. Configure
 
-### 3. Configure Entity Names
+```bash
+cp zero_feed_in/config/apps.yaml.example zero_feed_in/config/apps.yaml
+```
 
-| apps.yaml key | Controller/Driver | Typical HA entity |
+Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections for each app:
+
+| apps.yaml key | App | Typical HA entity |
 | --- | --- | --- |
 | `grid_power_sensor` | Controller | `sensor.smart_meter_*` |
 | `soc_sensor` | Controller | `sensor.*_electriclevel` |
 | `battery_power_sensor` | Controller | `sensor.*_net_power` (template or helper) |
-| `pv_sensor` | Controller | Legacy PV entity (use `feed_forward_sources` instead) |
 | `desired_power_sensor` | Driver | `sensor.zfi_desired_power` (from controller) |
 | `output_limit_entity` | Driver | `number.*_outputlimit` |
 | `input_limit_entity` | Driver | `number.*_inputlimit` |
 | `ac_mode_entity` | Driver | `select.*_acmode` |
+| `forecast_entities` | Forecast | `sensor.energy_production_tomorrow*` |
+| `watch_entity` | Watchdog | `sensor.*_electriclevel` |
 
 Optional switches (create as HA helpers → Toggle):
 
@@ -792,13 +795,15 @@ Optional switches (create as HA helpers → Toggle):
 | `charge_switch` | `input_boolean.zfi_charge_enabled` |
 | `discharge_switch` | `input_boolean.zfi_discharge_enabled` |
 
+Add secrets to your AppDaemon `secrets.yaml` (see `config/secrets.yaml.example`).
+
 ### 4. Start in Dry Run
 
-Set `dry_run: true` in both apps. Set `debug: true` to publish internal sensors for the debug dashboards. Monitor via AppDaemon log and `sensor.zfi_*` entities.
+Set `dry_run: true` (the YAML anchor at the top of `apps.yaml` applies to all apps). Set `debug: true` to publish internal sensors for the debug dashboards. Monitor via AppDaemon log and `sensor.zfi_*` entities.
 
 ### 5. Go Live
 
-Set `dry_run: false` in both apps. Start with `max_output: 200`. Once stable, set `debug: false` to reduce HA sensor churn.
+Set `dry_run: false`. Start with `max_output: 200`. Once stable, set `debug: false` to reduce HA sensor churn.
 
 ---
 

@@ -1,0 +1,220 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Zero Feed-In — AppDaemon Configuration Template
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Copy this file to apps.yaml and edit the MANDATORY sections.
+#  Tuning parameters have safe defaults — adjust only if needed.
+#
+#  Five apps:
+#    1. Controller  — device-agnostic PI, publishes desired power
+#    2. Driver      — translates desired power into Zendure SolarFlow commands
+#    3. Forecast    — adjusts dynamic min SOC based on PV forecast
+#    4. Counter     — tracks daily relay switch count
+#    5. Watchdog    — triggers MQTT reconnect via local HTTP API
+#
+#  Module paths assume this repo is cloned into:
+#    <appdaemon>/apps/zero_feed_in/
+#
+#  Secrets: add entries from secrets.yaml.example to your AppDaemon
+#  secrets.yaml (usually at <appdaemon>/secrets.yaml).
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  1. Controller (device-agnostic PI)
+# ══════════════════════════════════════════════════════════════════════════════
+zero_feed_in_controller:
+  module: zero_feed_in.src.zero_feed_in_controller
+  class: ZeroFeedInController
+
+  # ── GLOBAL (shared via YAML anchors) ────────────────────────────────────
+  dry_run:        &dry_run        false    # true = compute but don't actuate
+  debug:          &debug          false    # true = publish internal sensors
+  sensor_prefix:  &sensor_prefix  sensor.zfi
+  log_dir:        &log_dir        ""       # CSV log directory (empty = disabled)
+
+  # ══════ MANDATORY — edit these for your installation ══════════════════════
+
+  # Grid power sensor (W).  Must report total household import/export.
+  grid_power_sensor: sensor.YOUR_GRID_POWER_SENSOR
+
+  # Battery SOC sensor (%).
+  soc_sensor: sensor.YOUR_SOC_SENSOR
+
+  # Battery power sensor (W).  Convention: +discharge / -charge.
+  battery_power_sensor: sensor.YOUR_BATTERY_POWER_SENSOR
+
+  # Battery sensor mode: "signed" (default) or "unsigned"
+  #   signed   — sensor already has correct sign (+discharge / -charge)
+  #   unsigned — sensor is always positive; sign derived from ac_mode_entity
+  battery_sensor_mode: signed
+  # ac_mode_entity: select.YOUR_AC_MODE_ENTITY   # required only for unsigned mode
+
+  # Direction switches (optional).  Create as input_boolean helpers in HA.
+  # Omit or comment out if you don't need manual charge/discharge control.
+  # charge_switch: input_boolean.zfi_charge_enabled
+  # discharge_switch: input_boolean.zfi_discharge_enabled
+
+  # Relay lockout feedback (from driver) — freeze integral during transitions
+  relay_locked_sensor: sensor.zfi_relay_locked
+
+  # Dynamic min SOC — published by the PV Forecast Manager app (below)
+  dynamic_min_soc_entity: sensor.zfi_dynamic_min_soc
+
+  # ══════ TUNING — safe defaults, adjust if needed ══════════════════════════
+
+  target_grid_power: 30        # discharge target (W), small positive = slight import
+  charge_target_power: 0       # charge target (W)
+  mode_hysteresis: 50          # Schmitt trigger band for mode switching (W)
+  charge_confirm: 20           # seconds surplus must hold before entering CHARGING
+  deadband: 35                 # ignore errors below this (W)
+  interval: 5                  # control loop period (s)
+  deadband_leak_ws: 250        # leak correction for persistent deadband bias (W·s)
+
+  # Four-quadrant PI gains.  Tuned for Zendure SolarFlow 2400 AC+ step response.
+  #
+  #   Quadrant          Physical action      T1     Kp    Ki
+  #   discharge_up      increase discharge   5.0s   0.25  0.025
+  #   discharge_down    decrease discharge   3.5s   0.35  0.025
+  #   charge_up         increase charge      3.5s   0.17  0.036
+  #   charge_down       decrease charge      3.2s   0.23  0.036
+  #
+  kp_discharge_up: 0.25
+  kp_discharge_down: 0.35
+  kp_charge_up: 0.17
+  kp_charge_down: 0.23
+  ki_discharge_up: 0.025
+  ki_discharge_down: 0.025
+  ki_charge_up: 0.036
+  ki_charge_down: 0.036
+
+  # Feed-forward (optional).  Set ff_enabled: false to disable entirely.
+  # Each source tracks a power sensor and applies sign × gain × delta.
+  #   sign: -1.0 for generation (PV), +1.0 for loads
+  #   gain: how aggressively to react (0.0–1.0)
+  #   name: label for the first source tagged "pv" (used for debug sensors)
+  ff_enabled: false
+  ff_deadband: 30              # ignore total FF below this (W)
+  ff_filter_tau_s: 30          # EMA time constant (s)
+  # feed_forward_sources:
+  #   - entity: sensor.YOUR_PV_POWER_SENSOR
+  #     gain: 0.8
+  #     sign: -1.0
+  #     name: pv
+  #   - entity: sensor.YOUR_LOAD_SENSOR
+  #     gain: 0.6
+  #     sign: 1.0
+
+  # Power limits
+  max_output: 1200             # max discharge power (W)
+  max_charge: 800              # max charge power (W)
+  min_soc: 10                  # hard floor SOC (%), dynamic_min_soc can only raise this
+  max_soc: 90                  # hard ceiling SOC (%)
+
+  # Protection
+  max_feed_in: 800             # emergency brake: cap output if feed-in exceeds (W)
+  emergency_kp_multiplier: 4.0 # Kp boost when max_feed_in is breached
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  2. Zendure SolarFlow Driver
+# ══════════════════════════════════════════════════════════════════════════════
+zendure_solarflow_driver:
+  module: zero_feed_in.src.zendure_solarflow_driver
+  class: ZendureSolarFlowDriver
+  dry_run:        *dry_run
+  debug:          *debug
+  sensor_prefix:  *sensor_prefix
+  log_dir:        *log_dir
+
+  # ══════ MANDATORY ═════════════════════════════════════════════════════════
+
+  # Input from controller
+  desired_power_sensor: sensor.zfi_desired_power
+
+  # Zendure HA entities (from the Zendure MQTT integration)
+  output_limit_entity: number.YOUR_SOLARFLOW_OUTPUTLIMIT
+  input_limit_entity: number.YOUR_SOLARFLOW_INPUTLIMIT
+  ac_mode_entity: select.YOUR_SOLARFLOW_ACMODE
+
+  # ══════ TUNING ════════════════════════════════════════════════════════════
+
+  watchdog_s: 5                # re-apply command interval (s)
+  relay_lockout_ws: 10000      # energy accumulator threshold for direction change (W·s)
+  relay_lockout_cutoff_w: 25   # floor on power used in accumulator (W)
+  relay_lockout_idle_s: 90     # holdoff time before switching to idle (s)
+  relay_sm_enabled: true       # false = bypass relay state machine
+  min_active_power_w: 25       # minimum power floor in active states (W)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  3. PV Forecast Manager
+# ══════════════════════════════════════════════════════════════════════════════
+pv_forecast_manager:
+  module: zero_feed_in.src.pv_forecast_manager
+  class: PvForecastManager
+  debug:          *debug
+  sensor_prefix:  *sensor_prefix
+
+  # ══════ MANDATORY ═════════════════════════════════════════════════════════
+
+  # Forecast.Solar entities to sum (one per PV plane).
+  # Install the Forecast.Solar integration first.
+  forecast_entities:
+    - sensor.energy_production_tomorrow
+    # - sensor.energy_production_tomorrow_2   # uncomment for second plane
+
+  # ══════ TUNING ════════════════════════════════════════════════════════════
+
+  forecast_threshold_kwh: 1.5     # below this → low-forecast rules apply
+  min_soc_high_forecast_pct: 10   # min SOC on good-forecast days (%)
+
+  # Time-of-day rules for low-forecast days.  First matching rule wins.
+  min_soc_rules:
+    - before: "12:00"
+      soc: 50                     # morning: preserve battery for daytime
+    - before: "23:59"
+      soc: 30                     # afternoon/evening: lighter reserve
+
+  evaluation_times:               # when to evaluate the forecast
+    - "06:00"
+    - "15:00"
+    - "20:00"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  4. Relay Switch Counter
+# ══════════════════════════════════════════════════════════════════════════════
+relay_switch_counter:
+  module: zero_feed_in.src.relay_switch_counter
+  class: RelaySwitchCounter
+  sensor_prefix:  *sensor_prefix
+
+  desired_power_sensor: sensor.zfi_desired_power
+  min_active_w: 25                # power threshold for counting a switch (W)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  5. SolarFlow MQTT Watchdog
+# ══════════════════════════════════════════════════════════════════════════════
+solarflow_mqtt_watchdog:
+  module: zero_feed_in.src.solarflow_mqtt_watchdog
+  class: SolarFlowMqttWatchdog
+  dry_run:        *dry_run
+
+  # ══════ MANDATORY ═════════════════════════════════════════════════════════
+
+  solarflow_ip:   !secret solarflow_ip
+  serial_number:  !secret solarflow_serial
+  mqtt_broker_ip: !secret mqtt_broker_ip
+  mqtt_username:  !secret mqtt_username
+  mqtt_password:  !secret mqtt_password
+
+  # SOC entity — used to detect when device goes unavailable
+  watch_entity: sensor.YOUR_SOC_SENSOR
+
+  # ══════ TUNING ════════════════════════════════════════════════════════════
+
+  mqtt_port: 1883
+  unavailable_duration_s: 120    # seconds before triggering reconnect
+  startup_delay_s: 30            # wait for Mosquitto after HA start (s)

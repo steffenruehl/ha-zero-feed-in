@@ -10,7 +10,7 @@ Keeps the grid meter at ~0 W by charging and discharging the battery based on so
 
 ## Architecture
 
-Two apps with clear separation of concerns:
+Five apps with clear separation of concerns:
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────┐
@@ -33,9 +33,11 @@ Two apps with clear separation of concerns:
 
 | App | File | Responsibility |
 | --- | --- | --- |
-| Controller | `zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
-| Driver | `zendure_solarflow_driver.py` | AC mode, relay lockout, 5 W rounding, redundant-send suppression |
-| Watchdog | `solarflow_mqtt_watchdog.py` | Reconnects SolarFlow to MQTT broker after broker restarts |
+| Controller | `src/zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
+| Driver | `src/zendure_solarflow_driver.py` | AC mode, relay lockout, 5 W rounding, redundant-send suppression |
+| Forecast | `src/pv_forecast_manager.py` | Adjusts dynamic min SOC based on PV forecast |
+| Counter | `src/relay_switch_counter.py` | Tracks daily relay switch count |
+| Watchdog | `src/solarflow_mqtt_watchdog.py` | Reconnects SolarFlow to MQTT broker after broker restarts |
 
 ### Key Features
 
@@ -54,61 +56,43 @@ Two apps with clear separation of concerns:
 
 Home Assistant → Settings → Add-ons → Add-on Store → **AppDaemon** → Install → Start
 
-### 2. Deploy Files
+### 2. Clone the Repository
 
-Copy to your AppDaemon apps directory:
+SSH into your Home Assistant and clone into the AppDaemon apps directory:
 
-```
-config/appdaemon/apps/
-├── zero_feed_in_controller.py
-├── zendure_solarflow_driver.py
-├── solarflow_mqtt_watchdog.py
-└── apps.yaml
+```bash
+cd /root/addon_configs/a0d7b954_appdaemon/apps
+git clone https://github.com/steffenruehl/ha-zero-feed-in.git zero_feed_in
 ```
 
-Create `config/appdaemon/secrets.yaml` with your device credentials (see `config/secrets.yaml.example`):
+### 3. Configure
 
+```bash
+cp zero_feed_in/config/apps.yaml.example zero_feed_in/config/apps.yaml
+```
+
+Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections:
+- Your grid power, SOC, and battery power sensor entity IDs
+- Your Zendure SolarFlow entity IDs (outputLimit, inputLimit, acMode)
+- Your Forecast.Solar entity IDs
+
+Add secrets to your AppDaemon `secrets.yaml` (see `config/secrets.yaml.example`):
 ```yaml
 solarflow_ip:     "192.168.x.x"
 solarflow_serial: "XXXXXXXXXXX"
 mqtt_broker_ip:   "192.168.x.x"
-mqtt_username:    "mqtt"
-mqtt_password:    "mqtt"
-```
-
-### 3. Configure Entity Names
-
-Find your SolarFlow's actual entity names (via MQTT Explorer or HA Developer Tools) and update `apps.yaml`:
-
-```yaml
-# Controller
-zero_feed_in_controller:
-  module: zero_feed_in_controller
-  class: ZeroFeedInController
-  grid_power_sensor: sensor.your_grid_meter
-  soc_sensor: sensor.your_solarflow_electriclevel
-  battery_power_sensor: sensor.your_battery_net_power  # +discharge/-charge
-
-# Driver
-zendure_solarflow_driver:
-  module: zendure_solarflow_driver
-  class: ZendureSolarFlowDriver
-  desired_power_sensor: sensor.zfi_desired_power
-  output_limit_entity: number.your_solarflow_outputlimit
-  input_limit_entity: number.your_solarflow_inputlimit
-  ac_mode_entity: select.your_solarflow_acmode
+mqtt_username:    "your_mqtt_user"
+mqtt_password:    "your_mqtt_password"
 ```
 
 ### 4. Start in Dry Run
 
-Both apps default to `dry_run: true` — they compute and publish HA sensors but send no commands.
+Set `dry_run: true` in `apps.yaml` (the anchor at the top applies to all apps).
+Restart AppDaemon. Check that `sensor.zfi_*` entities appear in HA.
 
 ### 5. Go Live
 
-```yaml
-  dry_run: false
-```
-
+Set `dry_run: false` and restart AppDaemon.
 Start with `max_output: 200` and increase over several days.
 
 ## Configuration
@@ -139,10 +123,11 @@ Start with `max_output: 200` and increase over several days.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `interval` | 2 s | Poll interval (faster than controller) |
-| `direction_lockout` | 30 s | Base lockout time between relay direction changes |
+| `watchdog_s` | 5 s | Re-apply command interval |
+| `relay_lockout_ws` | 10000 W·s | Energy accumulator threshold for direction change |
+| `relay_lockout_cutoff_w` | 25 W | Floor on power in accumulator (caps max wait) |
+| `relay_lockout_idle_s` | 90 s | Holdoff before switching to idle |
 | `relay_sm_enabled` | true | Enable/disable relay state machine |
-| `adaptive_lockout_ref_w` | 200 W | Reference power for full-speed lockout (low power → longer lockout) |
 | `min_active_power_w` | 25 W | Minimum power floor when relay is in an active state |
 
 ### Watchdog
@@ -153,7 +138,7 @@ Start with `max_output: 200` and increase over several days.
 | `unavailable_duration_s` | 120 s | Trigger reconnect after this many seconds unavailable |
 | `startup_delay_s` | 30 s | Wait after HA start before sending reconnect (lets Mosquitto start first) |
 
-See [apps.yaml](config/apps.yaml) for the full annotated configuration.
+See [config/apps.yaml.example](config/apps.yaml.example) for the full annotated configuration.
 
 ## Published HA Sensors
 
@@ -188,8 +173,8 @@ Published when `debug: true`:
 
 ## Documentation
 
-- [zero_feed_in_docs.md](zero_feed_in_docs.md) — Full technical documentation with flowcharts, dashboards, and tuning guide
-- [development_context.md](development_context.md) — Architecture decisions, known issues, and development history
+- [docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md) — Full technical documentation with flowcharts, dashboards, and tuning guide
+- [docs/development_context.md](docs/development_context.md) — Architecture decisions, known issues, and development history
 
 ## Hardware
 

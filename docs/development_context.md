@@ -120,11 +120,12 @@ if raw < 0:  # wants to charge
 ### Forecast-Based Dynamic min_soc
 
 Prevents pointless deep discharge on days when PV won't recharge the battery.
-A HA automation (06:00, 15:00, 20:00) reads the summed PV forecast for tomorrow
-(`sensor.pv_forecast_tomorrow_total`, template sensor summing Forecast.Solar planes).
-If forecast < 1.5 kWh: morning (06:00) sets `input_number.zfi_min_soc` to 50%
-(prevent daytime discharge), evening (15:00/20:00) sets it to 30% (night buffer).
-Otherwise resets to 10%.
+The `pv_forecast_manager.py` AppDaemon app evaluates at 06:00, 15:00, and 20:00
+by summing configured Forecast.Solar entities.
+
+If forecast < 1.5 kWh: morning (06:00) sets `sensor.zfi_dynamic_min_soc` to 50%
+(prevent daytime discharge), afternoon/evening (15:00/20:00) sets it to 30%
+(night buffer). Otherwise resets to 10%.
 
 The controller reads this entity every cycle via `dynamic_min_soc_entity` config key.
 The dynamic value is clamped to `[Config.min_soc_pct, Config.max_soc_pct]` so it
@@ -134,20 +135,25 @@ can never violate the hard safety limits from apps.yaml. Falls back to static
 ## File Structure
 
 ```
+__init__.py                       # package marker (AppDaemon App Package)
 src/
 ├── __init__.py                   # package marker
 ├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
+├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
 ├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
 ├── csv_logger.py                 # shared daily-rotating CSV file logger
 └── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
 config/
-└── apps.yaml                     # AppDaemon configuration for all apps
+├── apps.yaml.example             # documented configuration template
+├── secrets.yaml.example          # template for device credentials
+└── lovelace_ff_debug.yaml        # Lovelace dashboard for FF debugging
 tests/
 ├── __init__.py
-├── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController (101 tests)
-├── test_zendure_solarflow_driver.py # unit tests for AdaptiveLockout & RelayStateMachine (99 tests)
-└── test_csv_logger.py               # unit tests for CsvLogger (8 tests)
+├── test_zero_feed_in_controller.py
+├── test_zendure_solarflow_driver.py
+├── test_pv_forecast_manager.py
+└── test_csv_logger.py
 docs/
 ├── development_context.md        # this file
 └── zero_feed_in_docs.md          # full technical documentation
