@@ -127,12 +127,14 @@ class TestCheckHeartbeats:
         dry_run: bool = False,
         output_limit_entity: str = "",
         input_limit_entity: str = "",
+        notify_only_entities: list[str] | None = None,
     ) -> object:
         """Create a minimal watchdog with _check_heartbeats bound."""
 
         class FakeWatchdog:
             def __init__(self) -> None:
                 self._heartbeat_entities = entities
+                self._heartbeat_notify_only = notify_only_entities or []
                 self._heartbeat_stale_s = stale_s
                 self._dry_run = dry_run
                 self._stale_notified: set[str] = set()
@@ -374,3 +376,99 @@ class TestSafeState:
         wd.call_service = failing_service
         wd._check_heartbeats({})  # should not raise
         assert any("safe state send failed" in m.lower() for m in wd.log_messages)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Notify-only heartbeat entities
+# ═══════════════════════════════════════════════════════════
+
+
+class TestNotifyOnlyEntities:
+    """Tests for heartbeat_notify_only_entities (no safe-state)."""
+
+    @staticmethod
+    def _make_watchdog(
+        entities: list[str],
+        notify_only: list[str],
+        stale_s: int = 60,
+    ) -> object:
+        """Create a watchdog with both entity lists and safe-state configured."""
+        return TestCheckHeartbeats._make_watchdog(
+            entities=entities,
+            stale_s=stale_s,
+            output_limit_entity="number.output",
+            input_limit_entity="number.input",
+            notify_only_entities=notify_only,
+        )
+
+    def test_notify_only_stale_creates_notification_no_safe_state(self):
+        """A stale notify-only entity triggers notification but NOT safe-state."""
+        wd = self._make_watchdog([], ["sensor.esp_uptime"])
+        ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.esp_uptime"] = {"state": "200", "last_updated": ts}
+        wd._check_heartbeats({})
+        notif_calls = [c for c in wd.service_calls if "create" in c[0]]
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(notif_calls) == 1
+        assert len(number_calls) == 0
+        assert wd._safe_state_active is False
+
+    def test_notify_only_recovery_dismisses_notification(self):
+        """Recovering notify-only entity dismisses its notification."""
+        wd = self._make_watchdog([], ["sensor.esp_uptime"])
+        # Stale first
+        old_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.esp_uptime"] = {"state": "200", "last_updated": old_ts}
+        wd._check_heartbeats({})
+        assert "sensor.esp_uptime" in wd._stale_notified
+        # Recover
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        wd._attrs["sensor.esp_uptime"]["last_updated"] = fresh_ts
+        wd._check_heartbeats({})
+        assert "sensor.esp_uptime" not in wd._stale_notified
+        assert wd.service_calls[-1][0] == "persistent_notification/dismiss"
+
+    def test_mixed_entities_only_regular_triggers_safe_state(self):
+        """Only regular entities trigger safe-state, not notify-only."""
+        wd = self._make_watchdog(
+            ["sensor.controller"], ["sensor.esp_uptime"],
+        )
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        # ESP is stale, controller is fresh
+        wd._attrs["sensor.esp_uptime"] = {"state": "200", "last_updated": stale_ts}
+        wd._attrs["sensor.controller"] = {"state": "100", "last_updated": fresh_ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 0
+        assert wd._safe_state_active is False
+
+    def test_mixed_regular_stale_triggers_safe_state(self):
+        """Regular stale entity triggers safe-state even if notify-only is fresh."""
+        wd = self._make_watchdog(
+            ["sensor.controller"], ["sensor.esp_uptime"],
+        )
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        wd._attrs["sensor.controller"] = {"state": "100", "last_updated": stale_ts}
+        wd._attrs["sensor.esp_uptime"] = {"state": "200", "last_updated": fresh_ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 2
+        assert wd._safe_state_active is True
+
+    def test_both_stale_safe_state_from_regular_only(self):
+        """Both types stale: safe-state triggered by regular entity."""
+        wd = self._make_watchdog(
+            ["sensor.controller"], ["sensor.esp_uptime"],
+        )
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+        wd._attrs["sensor.controller"] = {"state": "100", "last_updated": stale_ts}
+        wd._attrs["sensor.esp_uptime"] = {"state": "200", "last_updated": stale_ts}
+        wd._check_heartbeats({})
+        number_calls = [c for c in wd.service_calls if c[0] == "number/set_value"]
+        assert len(number_calls) == 2
+        assert wd._safe_state_active is True
+        # Both should have notifications
+        notif_calls = [c for c in wd.service_calls if "create" in c[0]]
+        assert len(notif_calls) == 2

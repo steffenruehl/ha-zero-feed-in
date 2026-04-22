@@ -38,6 +38,11 @@ mqtt:
 http_request:
   useragent: esphome/zfi-watchdog
   timeout: 5s
+  verify_ssl: false
+
+time:
+  - platform: homeassistant
+    id: hass_time
 
 globals:
   - id: last_controller_hb
@@ -81,9 +86,24 @@ sensor:
       if (id(last_driver_hb) == 0) return NAN;
       return (millis() - id(last_driver_hb)) / 1000.0f;
 
+  - platform: uptime
+    name: "ZFI ESP Watchdog Uptime"
+    icon: "mdi:timer-outline"
+    update_interval: 30s
+
 interval:
   - interval: 30s
     then:
+      - mqtt.publish:
+          topic: zfi/heartbeat/esp_watchdog
+          retain: true
+          payload: !lambda |-
+            auto now = id(hass_time).now();
+            char buf[25];
+            snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+              now.year, now.month, now.day_of_month,
+              now.hour, now.minute, now.second);
+            return std::string(buf);
       - lambda: |-
           const uint32_t STALE_MS = 120000;   // 2 min
           const uint32_t GRACE_MS = 180000;   // 3 min after boot
@@ -116,7 +136,7 @@ script:
     then:
       - http_request.post:
           url: "http://${solarflow_ip}/properties/write"
-          headers:
+          request_headers:
             Content-Type: "application/json; charset=UTF-8"
           json: |-
             id(zfi_http_id)++;
@@ -125,10 +145,9 @@ script:
             root["properties"]["outputLimit"] = 0;
             root["properties"]["inputLimit"] = 0;
           on_response:
-            then:
-              - lambda: |-
-                  if (status_code == 200) {
-                    ESP_LOGI("zfi_wd", "Safe state sent OK");
-                  } else {
-                    ESP_LOGW("zfi_wd", "Safe state HTTP failed: %d", status_code);
-                  }
+            - lambda: |-
+                if (response->status_code == 200) {
+                  ESP_LOGI("zfi_wd", "Safe state sent OK");
+                } else {
+                  ESP_LOGW("zfi_wd", "Safe state HTTP failed: %d", response->status_code);
+                }

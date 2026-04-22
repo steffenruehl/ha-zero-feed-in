@@ -41,6 +41,8 @@ Config (apps.yaml):
     heartbeat_entities:                  # empty = heartbeat monitoring disabled
       - sensor.zfi_desired_power         # controller heartbeat
       - sensor.zfi_device_output         # driver heartbeat
+    heartbeat_notify_only_entities:      # notification only, no safe-state
+      - sensor.heizung_zfi_esp_watchdog_uptime  # ESP watchdog
     heartbeat_stale_s: 60                # max age before notification (s)
     heartbeat_check_s: 30                # check interval (s)
     heartbeat_grace_s: 120               # ignore stale checks for N s after start
@@ -84,6 +86,9 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         # Heartbeat monitoring
         self._heartbeat_entities: list[str] = list(
             self.args.get("heartbeat_entities", [])
+        )
+        self._heartbeat_notify_only: list[str] = list(
+            self.args.get("heartbeat_notify_only_entities", [])
         )
         self._heartbeat_stale_s: int = int(
             self.args.get("heartbeat_stale_s", 60)
@@ -129,7 +134,8 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             self.run_in(self._trigger_reconnect, self._startup_delay_s)
 
         # Heartbeat check timer
-        if self._heartbeat_entities:
+        all_hb = self._heartbeat_entities + self._heartbeat_notify_only
+        if all_hb:
             self.run_every(
                 self._check_heartbeats, "now+60", self._heartbeat_check_s,
             )
@@ -145,6 +151,7 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
             f"startup_delay={self._startup_delay_s}s "
             f"target=http://{self._solarflow_ip}/rpc "
             f"heartbeat_entities={len(self._heartbeat_entities)} "
+            f"heartbeat_notify_only={len(self._heartbeat_notify_only)} "
             f"heartbeat_stale_s={self._heartbeat_stale_s} "
             f"heartbeat_grace_s={self._heartbeat_grace_s} "
             f"safe_state={safe_state_cfg} "
@@ -172,9 +179,11 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         """Periodically check ``last_updated`` of heartbeat entities.
 
         Creates a HA persistent notification when an entity is stale
-        and dismisses it when the entity recovers.  When any entity is
-        stale and device entities are configured, sends safe state (0 W)
-        to both outputLimit and inputLimit.
+        and dismisses it when the entity recovers.  Entities in
+        ``heartbeat_entities`` trigger both notification **and** safe-state.
+        Entities in ``heartbeat_notify_only_entities`` trigger only a
+        notification (e.g. the ESP watchdog — its failure doesn't affect
+        the control loop).
 
         During the startup grace period (``heartbeat_grace_s``), all
         checks are skipped so the other apps have time to boot.
@@ -182,11 +191,15 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
         if datetime.now(timezone.utc) < self._grace_until:
             return
 
-        any_stale = False
-        for entity in self._heartbeat_entities:
+        any_safe_state_stale = False
+        all_entities = (
+            [(e, True) for e in self._heartbeat_entities]
+            + [(e, False) for e in self._heartbeat_notify_only]
+        )
+        for entity, triggers_safe_state in all_entities:
             stale = self._is_entity_stale(entity)
-            if stale:
-                any_stale = True
+            if stale and triggers_safe_state:
+                any_safe_state_stale = True
             notif_id = f"zfi_heartbeat_{entity.replace('.', '_')}"
 
             if stale and entity not in self._stale_notified:
@@ -215,11 +228,11 @@ class SolarFlowMqttWatchdog(_HASS_BASE):
                         notification_id=notif_id,
                     )
 
-        # Safe-state enforcement: send 0 W when any entity is stale
-        if any_stale and not self._safe_state_active:
+        # Safe-state enforcement: only for heartbeat_entities, not notify-only
+        if any_safe_state_stale and not self._safe_state_active:
             self._safe_state_active = True
             self._send_safe_state()
-        elif not any_stale and self._safe_state_active:
+        elif not any_safe_state_stale and self._safe_state_active:
             self._safe_state_active = False
             self.log("All heartbeats recovered — safe state released")
 
