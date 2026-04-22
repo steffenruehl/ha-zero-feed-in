@@ -1070,9 +1070,11 @@ class ZeroFeedInController(_HASS_BASE):
         self.logic.seed(bp)
 
         # State persistence: restore from file, then seed overrides if needed
+        _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
+        os.makedirs(_run_dir, exist_ok=True)
         self._state_file: str = self.args.get(
             "state_file",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "zfi_controller_state.json"),
+            os.path.join(_run_dir, "zfi_controller_state.json"),
         )
         self._state_save_interval: int = 12  # save every 12 ticks (~60s at 5s interval)
         self._tick_count: int = 0

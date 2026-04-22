@@ -142,6 +142,10 @@ src/
 ├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
 ├── csv_logger.py                 # shared daily-rotating CSV file logger
 └── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
+run/                              # runtime state (git-ignored, auto-created)
+├── zfi_controller_state.json
+├── zfi_driver_state.json
+└── relay_switch_count.json
 config/
 ├── apps.yaml.example             # documented configuration template
 ├── secrets.yaml.example          # template for device credentials

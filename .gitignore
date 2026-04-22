@@ -4,3 +4,4 @@ __pycache__/
 .coverage
 config/secrets.yaml
 config/apps.yaml
+run/

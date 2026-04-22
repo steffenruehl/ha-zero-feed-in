@@ -18,9 +18,11 @@ class RelaySwitchCounter(hass.Hass):
             "desired_power_sensor", "sensor.zfi_desired_power"
         )
         self._min_active_w: float = float(self.args.get("min_active_w", 25))
+        _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
+        os.makedirs(_run_dir, exist_ok=True)
         self._counter_file: str = self.args.get(
             "counter_file",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_switch_count.json"),
+            os.path.join(_run_dir, "relay_switch_count.json"),
         )
         self._sensor_prefix: str = self.args.get("sensor_prefix", "sensor.zfi")
 

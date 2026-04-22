@@ -561,9 +561,11 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         self._seed_from_device()
 
         # State persistence: override device seed with saved SM state
+        _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
+        os.makedirs(_run_dir, exist_ok=True)
         self._state_file: str = self.args.get(
             "state_file",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "zfi_driver_state.json"),
+            os.path.join(_run_dir, "zfi_driver_state.json"),
         )
         if self._restore_state():
             self.log(
