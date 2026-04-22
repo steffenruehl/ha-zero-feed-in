@@ -99,7 +99,7 @@ interval:
           retain: true
           payload: !lambda |-
             auto now = id(hass_time).now();
-            char buf[25];
+            char buf[30];
             snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
               now.year, now.month, now.day_of_month,
               now.hour, now.minute, now.second);
