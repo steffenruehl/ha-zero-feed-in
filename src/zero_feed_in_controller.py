@@ -1391,6 +1391,20 @@ class ZeroFeedInController(_HASS_BASE):
             icon="mdi:swap-vertical",
         )
 
+        # Measurement inputs (required for operations dashboard)
+        self._set_sensor(
+            "grid_power",
+            round(m.grid_power_w),
+            "W",
+            "mdi:transmission-tower",
+        )
+        self._set_sensor(
+            "soc",
+            round(m.soc_pct),
+            "%",
+            "mdi:battery",
+        )
+
         if not self.cfg.debug:
             return
 

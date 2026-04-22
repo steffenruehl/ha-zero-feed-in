@@ -606,253 +606,29 @@ Published only when `debug: true` in the driver config.
 
 ---
 
-## Debug Dashboards
+## Lovelace Dashboards
 
-### Full Debug Dashboard
+This repository includes pre-built Lovelace dashboard YAML files for different purposes.
 
-Shows all controller and driver states for troubleshooting. Copy to a manual HA dashboard card (YAML mode):
+**For detailed setup, signal descriptions, and troubleshooting, see [DASHBOARDS.md](DASHBOARDS.md).**
 
-```yaml
-type: vertical-stack
-cards:
-  # ── Power overview ──────────────────────────────
-  - type: history-graph
-    title: Power & Control
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.smart_meter_sum_active_instantaneous_power
-        name: Grid Power
-      - entity: sensor.zfi_desired_power
-        name: Desired Power
-      - entity: sensor.zfi_device_output
-        name: Device Output
-      - entity: sensor.zfi_surplus
-        name: Surplus
-      - entity: sensor.zfi_battery_power
-        name: Battery Power
+### Quick Reference
 
-  # ── Device commands ─────────────────────────────
-  - type: history-graph
-    title: Device Commands
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.zfi_discharge_limit
-        name: Discharge Limit
-      - entity: sensor.zfi_charge_limit
-        name: Charge Limit
+| Dashboard | File | Purpose | Requirements |
+|-----------|------|---------|--------------|
+| **Operations** | `config/lovelace_zfi_operations.yaml` | Main control loop view: grid power, surplus, battery, desired power, device commands | Always available |
+| **PI Debug** | `config/lovelace_zfi_pi_debug.yaml` | PI controller internals: P/I terms, integral, target, error, deadband, mode changes | `debug: true` |
+| **Relay State Machine** | `config/lovelace_zfi_relay_sm_debug.yaml` | Relay transitions: current state, pending target, lockout progress, energy accumulation | `debug: true` |
+| **Feed-Forward Debug** | `config/lovelace_ff_debug.yaml` | Feed-forward filtering: PV EMA, contribution sources, forecast min SOC | `debug: true` (if FF enabled) |
 
-  # ── PI internals ────────────────────────────────
-  - type: history-graph
-    title: PI Controller
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.zfi_error
-        name: Error
-      - entity: sensor.zfi_p_term
-        name: P Term
-      - entity: sensor.zfi_i_term
-        name: I Term
-      - entity: sensor.zfi_integral
-        name: Integral
-      - entity: sensor.zfi_target
-        name: Target
+### Setup Instructions
 
-  # ── Battery ─────────────────────────────────────
-  - type: history-graph
-    title: Battery
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.hec4nencn492140_electriclevel
-        name: SOC %
+1. **In Home Assistant**, navigate to **Dashboards** → Create a new dashboard (or edit an existing one)
+2. In **raw YAML edit mode**, paste the entire contents of one of the dashboard files above
+3. Replace sensor entity IDs (e.g., `sensor.zfi_*`) if you customized your sensor prefix
+4. Save and view
 
-  # ── Relay state machine ─────────────────────────
-  - type: history-graph
-    title: Relay State Machine
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.zfi_relay_sm_lockout_pct
-        name: Lockout Progress %
-      - entity: sensor.zfi_relay_sm_accumulated_ws
-        name: Accumulated (W·s)
-      - entity: sensor.zfi_relay_sm_threshold_ws
-        name: Threshold (W·s)
-
-  # ── Current state (entities card) ───────────────
-  - type: entities
-    title: ZFI Status
-    entities:
-      - entity: sensor.zfi_desired_power
-        name: Desired Power
-      - entity: sensor.zfi_device_output
-        name: Device Output
-      - entity: sensor.zfi_mode
-        name: Mode
-      - entity: sensor.zfi_relay
-        name: Relay
-      - entity: sensor.zfi_relay_locked
-        name: Relay Locked
-      - entity: sensor.zfi_surplus
-        name: Surplus
-      - entity: sensor.zfi_battery_power
-        name: Battery Power
-      - entity: sensor.zfi_target
-        name: Target
-      - entity: sensor.zfi_error
-        name: Error
-      - entity: sensor.zfi_p_term
-        name: P Term
-      - entity: sensor.zfi_i_term
-        name: I Term
-      - entity: sensor.zfi_integral
-        name: Integral
-      - entity: sensor.zfi_discharge_limit
-        name: Discharge Limit
-      - entity: sensor.zfi_charge_limit
-        name: Charge Limit
-      - entity: sensor.zfi_reason
-        name: Reason
-      - type: divider
-      - entity: sensor.zfi_relay_sm_state
-        name: SM State
-      - entity: sensor.zfi_relay_sm_pending
-        name: SM Pending
-      - entity: sensor.zfi_relay_sm_lockout_pct
-        name: SM Lockout %
-      - entity: sensor.zfi_relay_sm_accumulated_ws
-        name: SM Accumulated (W·s)
-      - entity: sensor.zfi_relay_sm_threshold_ws
-        name: SM Threshold (W·s)
-      - type: divider
-      - entity: select.hec4nencn492140_acmode
-        name: AC Mode (device)
-      - entity: number.hec4nencn492140_outputlimit
-        name: outputLimit (device)
-      - entity: number.hec4nencn492140_inputlimit
-        name: inputLimit (device)
-      - entity: sensor.hec4nencn492140_electriclevel
-        name: SOC (device)
-      - type: divider
-      - entity: input_boolean.zfi_charge_enabled
-        name: Charge Enabled
-      - entity: input_boolean.zfi_discharge_enabled
-        name: Discharge Enabled
-```
-
-### Compact Overview Dashboard
-
-For daily monitoring (not debugging):
-
-```yaml
-type: vertical-stack
-cards:
-  - type: history-graph
-    title: Zero Feed-In
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.smart_meter_sum_active_instantaneous_power
-        name: Grid
-      - entity: sensor.zfi_surplus
-        name: Surplus
-      - entity: sensor.zfi_desired_power
-        name: Desired
-      - entity: sensor.zfi_device_output
-        name: Output
-
-  - type: entities
-    title: Status
-    entities:
-      - entity: sensor.zfi_mode
-      - entity: sensor.zfi_reason
-      - entity: sensor.zfi_relay_locked
-        name: Relay Locked
-      - entity: sensor.hec4nencn492140_electriclevel
-        name: SOC
-      - entity: input_boolean.zfi_charge_enabled
-      - entity: input_boolean.zfi_discharge_enabled
-```
-
-### Relay State Machine Debug Dashboard
-
-For diagnosing relay transitions and adaptive lockout behaviour:
-
-```yaml
-type: vertical-stack
-cards:
-  # ── Lockout energy integrator over time ─────────
-  - type: history-graph
-    title: Adaptive Lockout Progress
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.zfi_relay_sm_lockout_pct
-        name: Lockout %
-      - entity: sensor.zfi_relay_sm_accumulated_ws
-        name: Accumulated (W·s)
-      - entity: sensor.zfi_relay_sm_threshold_ws
-        name: Threshold (W·s)
-
-  # ── Per-direction progress (independent accumulators) ─
-  - type: history-graph
-    title: Direction Progress (independent)
-    hours_to_show: 0.5
-    entities:
-      - entity: sensor.zfi_relay_sm_charge_pct
-        name: Charge %
-      - entity: sensor.zfi_relay_sm_discharge_pct
-        name: Discharge %
-      - entity: sensor.zfi_relay_sm_idle_pct
-        name: Idle %
-
-  # ── AC mode & power context ────────────────────
-  - type: history-graph
-    title: AC Mode & Power
-    hours_to_show: 0.5
-    entities:
-      - entity: select.hec4nencn492140_acmode
-        name: AC Mode (device)
-      - entity: sensor.zfi_relay
-        name: Relay (driver)
-      - entity: sensor.zfi_relay_locked
-        name: Relay Locked
-      - entity: sensor.zfi_desired_power
-        name: Desired Power
-      - entity: sensor.zfi_discharge_limit
-        name: Discharge Sent
-      - entity: sensor.zfi_charge_limit
-        name: Charge Sent
-
-  # ── Current SM state ───────────────────────────
-  - type: entities
-    title: Relay State Machine
-    entities:
-      - entity: sensor.zfi_relay_sm_state
-        name: Current State
-      - entity: sensor.zfi_relay_sm_pending
-        name: Last Target
-      - entity: sensor.zfi_relay_sm_lockout_pct
-        name: Last Target Lockout %
-      - entity: sensor.zfi_relay_sm_accumulated_ws
-        name: Accumulated Energy (W·s)
-      - entity: sensor.zfi_relay_sm_threshold_ws
-        name: Threshold (W·s)
-      - type: divider
-      - entity: sensor.zfi_relay_sm_charge_pct
-        name: Charge Progress %
-      - entity: sensor.zfi_relay_sm_discharge_pct
-        name: Discharge Progress %
-      - entity: sensor.zfi_relay_sm_idle_pct
-        name: Idle Progress %
-      - type: divider
-      - entity: select.hec4nencn492140_acmode
-        name: AC Mode (device)
-      - entity: sensor.zfi_relay
-        name: Relay (driver)
-      - entity: sensor.zfi_relay_locked
-        name: Relay Locked
-      - entity: sensor.zfi_desired_power
-        name: Desired Power
-      - entity: sensor.zfi_device_output
-        name: Device Output
-```
+For detailed signal descriptions, tuning guidance, and troubleshooting, see [DASHBOARDS.md](DASHBOARDS.md).
 
 ---
 

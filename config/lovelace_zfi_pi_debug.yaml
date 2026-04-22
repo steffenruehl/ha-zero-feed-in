@@ -1,0 +1,172 @@
+# Zero Feed-In — PI Controller Debug Dashboard
+#
+# Internal PI controller signals: P term, I term, integral state, target,
+# error, and deadband behavior. Useful for tuning gains and understanding
+# why the PI chose a particular desired power.
+#
+# Add as a new view in your Lovelace dashboard (raw YAML mode).
+# REQUIRES: debug: true in apps.yaml
+#
+# Signal decomposition:
+#   desired_power = P_term + I_term + FF_term + bias
+#
+# Deadband:
+#   When |error| < deadband, all PI terms freeze (leak correction may apply).
+#
+# Mode switching:
+#   Integral & last_computed_w reset when mode changes or guards activate.
+
+title: ZFI PI Debug
+icon: mdi:chart-line
+cards:
+  # ─────────────────────────────────────────────────────────
+  #  Row 1: Error & Target
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Control Loop Target & Error
+    entities:
+      - entity: sensor.zfi_target
+        name: PI Target (W)
+        icon: mdi:target
+      - entity: sensor.zfi_grid_power
+        name: Actual Grid Power (W)
+        icon: mdi:transmission-tower
+      - entity: sensor.zfi_error
+        name: Error (grid - target, W)
+        icon: mdi:delta
+
+  - type: history-graph
+    title: Error vs Deadband (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_error
+        name: Error (W)
+      - entity: sensor.zfi_deadband
+        name: ±Deadband (W)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 2: PI Terms Decomposition
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: PI & FF Components
+    entities:
+      - entity: sensor.zfi_p_term
+        name: P term (proportional)
+        icon: mdi:alpha-p-box
+      - entity: sensor.zfi_i_term
+        name: I term (integral)
+        icon: mdi:alpha-i-box
+      - entity: sensor.zfi_integral
+        name: Integral accumulator (W·s)
+        icon: mdi:sigma
+      - entity: sensor.zfi_ff
+        name: FF term (feedforward)
+        icon: mdi:flash
+
+  - type: history-graph
+    title: PI Terms (P, I, FF) — 1 hour
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_p_term
+        name: P term
+      - entity: sensor.zfi_i_term
+        name: I term
+      - entity: sensor.zfi_ff
+        name: FF term
+
+  - type: history-graph
+    title: Desired Power Buildup (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_desired_power
+        name: Desired power
+      - entity: sensor.zfi_p_term
+        name: P term
+      - entity: sensor.zfi_i_term
+        name: I term
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 3: Integral State
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Integral Accumulator State
+    entities:
+      - entity: sensor.zfi_integral
+        name: Current value (W·s)
+        icon: mdi:sigma
+      - entity: sensor.zfi_mode
+        name: Operating mode (frozen when locked)
+        icon: mdi:swap-vertical
+      - entity: sensor.zfi_relay_locked
+        name: Relay locked (integral frozen)
+        icon: mdi:lock
+
+  - type: history-graph
+    title: Integral Accumulation (24h)
+    hours_to_show: 24
+    entities:
+      - entity: sensor.zfi_integral
+        name: Integral state (W·s)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 4: Mode Changes & Guards
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Operating Mode & Reason
+    entities:
+      - entity: sensor.zfi_mode
+        name: Current mode (charging / discharging)
+        icon: mdi:swap-vertical
+      - entity: sensor.zfi_reason
+        name: Last decision reason
+        icon: mdi:information-outline
+
+  - type: history-graph
+    title: Mode Changes (24h)
+    hours_to_show: 24
+    entities:
+      - entity: sensor.zfi_mode
+        name: Operating mode
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 5: Surplus & Guards
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Surplus & SOC Guards
+    entities:
+      - entity: sensor.zfi_surplus
+        name: Estimated solar surplus (W)
+        icon: mdi:solar-power
+      - entity: sensor.zfi_soc
+        name: Battery SOC (%)
+        icon: mdi:battery
+      - entity: sensor.zfi_effective_min_soc
+        name: Min SOC limit (%)
+        icon: mdi:battery-low
+
+  - type: history-graph
+    title: Surplus vs Mode (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_surplus
+        name: Surplus (W)
+      - entity: sensor.zfi_mode
+        name: Mode (charging / discharging)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 6: All Terms in One View
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Complete PI Decomposition (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_desired_power
+        name: Final desired power
+      - entity: sensor.zfi_p_term
+        name: P term
+      - entity: sensor.zfi_i_term
+        name: I term
+      - entity: sensor.zfi_ff
+        name: FF term
+      - entity: sensor.zfi_grid_power
+        name: Grid power (target +30W)

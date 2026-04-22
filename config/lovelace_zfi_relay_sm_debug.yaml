@@ -1,0 +1,156 @@
+# Zero Feed-In — Relay State Machine Debug Dashboard
+#
+# Relay transition state machine: current state, pending target, lockout progress,
+# and accumulated energy. Useful for understanding relay chatter and why the relay
+# isn't switching when you expect it to.
+#
+# Add as a new view in your Lovelace dashboard (raw YAML mode).
+# REQUIRES: debug: true in apps.yaml
+#
+# State machine overview:
+#   States: IDLE, CHARGING, DISCHARGING
+#   Relay lockout prevents rapid state transitions using adaptive energy accumulation.
+#   Idle lockout prevents early exit from the IDLE state.
+#
+# Key metrics:
+#   relay_sm_state        — Current state (IDLE, CHARGING, DISCHARGING)
+#   relay_sm_pending      — Target state being worked toward
+#   relay_sm_lockout_pct  — Unified progress bar (0-100%)
+#   relay_sm_accumulated_ws — Energy accumulated since start of transition
+
+title: ZFI Relay State Machine
+icon: mdi:electric-switch-closed
+cards:
+  # ─────────────────────────────────────────────────────────
+  #  Row 1: Current State & Status
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Relay State Machine Status
+    entities:
+      - entity: sensor.zfi_relay_sm_state
+        name: Current State
+        icon: mdi:state-machine
+      - entity: sensor.zfi_relay_sm_pending
+        name: Pending Target
+        icon: mdi:timer-sand
+      - entity: sensor.zfi_relay
+        name: Physical Relay Position
+        icon: mdi:electric-switch
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 2: Overall Lockout Progress
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Overall Lockout Progress
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Unified Progress (%)
+        icon: mdi:timer-sand
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated Energy (W·s)
+        icon: mdi:sigma
+
+  - type: history-graph
+    title: Lockout Progress (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout progress (%)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 3: Direction-Specific Lockouts
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Direction-Specific Lockout Progress
+    state_color: true
+    entities:
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge lockout (%)
+        icon: mdi:battery-charging
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge lockout (%)
+        icon: mdi:battery-arrow-down
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle lockout (%)
+        icon: mdi:sleep
+
+  - type: history-graph
+    title: All Lockout Timers (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge lockout
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge lockout
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle lockout
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 4: State Machine Transitions (24h)
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: State Machine Transitions (24h)
+    hours_to_show: 24
+    entities:
+      - entity: sensor.zfi_relay_sm_state
+        name: Current state
+      - entity: sensor.zfi_relay_sm_pending
+        name: Pending target
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 5: Relay Activity & Lock Status
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Relay Activity
+    entities:
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked (frozen, transition in progress)
+        icon: mdi:lock
+      - entity: sensor.zfi_relay_switches
+        name: Relay Switches (today)
+        icon: mdi:counter
+
+  - type: history-graph
+    title: Relay Lock Status (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_locked
+        name: Relay locked
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 6: Desired Power vs Relay Progress
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Desired Power & Lockout Progress (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_desired_power
+        name: Desired power (W)
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout progress (%)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 7: Energy Accumulation Detail
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Accumulated Energy During Transitions (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated energy (W·s)
+      - entity: sensor.zfi_desired_power
+        name: Desired power (W)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 8: Complete State Picture (24h)
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Full State Machine Activity (24h)
+    hours_to_show: 24
+    entities:
+      - entity: sensor.zfi_relay_sm_state
+        name: Current state
+      - entity: sensor.zfi_relay_locked
+        name: Relay locked
+      - entity: sensor.zfi_desired_power
+        name: Desired power (W)

@@ -171,9 +171,25 @@ Published when `debug: true`:
 | `zfi_relay_sm_state` / `zfi_relay_sm_pending` | Driver | Relay state machine state and pending target |
 | `zfi_relay_sm_lockout_pct` | Driver | Transition progress (%) |
 
+## Lovelace Dashboards
+
+Pre-built debug dashboards included in `config/`:
+
+| Dashboard | Purpose |
+| --- | --- |
+| [`lovelace_zfi_operations.yaml`](config/lovelace_zfi_operations.yaml) | Main control loop: grid power, surplus, battery, desired power, device state |
+| [`lovelace_zfi_pi_debug.yaml`](config/lovelace_zfi_pi_debug.yaml) | PI internals: P/I terms, integral, error, deadband, mode transitions (requires `debug: true`) |
+| [`lovelace_zfi_relay_sm_debug.yaml`](config/lovelace_zfi_relay_sm_debug.yaml) | Relay state machine: transitions, lockout progress, energy accumulation (requires `debug: true`) |
+| [`lovelace_ff_debug.yaml`](config/lovelace_ff_debug.yaml) | Feed-forward: PV filtering, load sources, forecast integration (requires `debug: true`) |
+
+**Setup**: In Home Assistant, go to **Dashboards** → **Create new** → **Edit in YAML** → paste the entire contents of a dashboard file.
+
+See [docs/zero_feed_in_docs.md#lovelace-dashboards](docs/zero_feed_in_docs.md#lovelace-dashboards) for detailed descriptions and setup.
+
 ## Documentation
 
-- [docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md) — Full technical documentation with flowcharts, dashboards, and tuning guide
+- [docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md) — Full technical documentation with flowcharts and tuning guide
+- [docs/DASHBOARDS.md](docs/DASHBOARDS.md) — Lovelace dashboard setup, signal descriptions, and troubleshooting
 - [docs/development_context.md](docs/development_context.md) — Architecture decisions, known issues, and development history
 
 ## Hardware
