@@ -135,15 +135,19 @@ can never violate the hard safety limits from apps.yaml. Falls back to static
 
 ```
 src/
+├── __init__.py                   # package marker
 ├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
-└── csv_logger.py                 # shared daily-rotating CSV file logger
+├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
+├── csv_logger.py                 # shared daily-rotating CSV file logger
+└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
 config/
-└── apps.yaml                     # AppDaemon configuration for both apps
+└── apps.yaml                     # AppDaemon configuration for all apps
 tests/
-├── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController
-├── test_zendure_solarflow_driver.py  # unit tests for AdaptiveLockout & RelayStateMachine
-└── test_csv_logger.py               # unit tests for CsvLogger
+├── __init__.py
+├── test_zero_feed_in_controller.py  # unit tests for ControlLogic & PIController (101 tests)
+├── test_zendure_solarflow_driver.py # unit tests for AdaptiveLockout & RelayStateMachine (99 tests)
+└── test_csv_logger.py               # unit tests for CsvLogger (8 tests)
 docs/
 ├── development_context.md        # this file
 └── zero_feed_in_docs.md          # full technical documentation
@@ -178,6 +182,8 @@ ControlLogic:     — pure-computation control logic (no HA dependency)
   estimate_surplus()            — -battery_power_w - grid_power_w
   compute()                     — emergency → mode → PI+FF → guards → clamp → relay-lock freeze
   target_for_mode()             — active grid-power target
+  state_snapshot()              — return dict of integral/mode/last_computed_w/db_acc
+  restore_from_snapshot()       — restore state from dict (returns bool)
   _update_operating_mode()      — Schmitt trigger with charge confirmation
   _apply_guards()               — switches + SOC + grid-charge protection (resets integral)
   _clamp()                      — limit enforcement + surplus cap
@@ -185,11 +191,14 @@ ControlLogic:     — pure-computation control logic (no HA dependency)
   _run_pi()                     — PI computation (without committing state)
 
 ZeroFeedInController(hass.Hass): — thin HA adapter
-  initialize()                  — config, seed, CsvLogger, schedule
-  _on_tick()                    — read → compute → log → publish → csv
+  initialize()                  — config, seed, restore state, CsvLogger, schedule
+  terminate()                   — save state to JSON on shutdown
+  _on_tick()                    — read → compute → log → publish → csv → periodic save
   _read_measurement()           — assemble Measurement from HA sensors
   _publish_ha_sensors()         — publishes sensor.zfi_* entities
   _log_csv()                    — append row to CSV file (if log_dir set)
+  _save_state()                 — atomically write state snapshot to JSON
+  _restore_state()              — restore ControlLogic state from JSON file
 ```
 
 ### Driver Code Organization (src/zendure_solarflow_driver.py)
@@ -210,16 +219,21 @@ RelayStateMachine:  — guards relay transitions (pure computation)
   seed()            — set initial state from device
   update()          — process desired power, return allowed power
   publish()         — push state and transition progress to HA sensors
+  state_snapshot()  — return dict of SM state
+  restore_from_snapshot() — restore SM state from dict (returns bool)
   _classify()       — map desired_w to target RelayState
   _clamp_for_state()— constrain power to current state's direction
 
 ZendureSolarFlowDriver(_HASS_BASE):
-  initialize()              — config, seed, schedule (2 s interval)
+  initialize()              — config, seed, restore state, schedule (2 s interval)
+  terminate()               — save state to JSON on shutdown
   _seed_from_device()       — read current limits + AC mode
-  _on_tick()                — read desired → SM update → round → send
+  _on_tick()                — read desired → SM update → round → send → save on transition
   _send_limits()            — AC mode + power limits
   _set_ac_mode()            — send-once with 30 s retry timeout
   _set_sensor()             — publish sensor.zfi_* driver states
+  _save_state()             — atomically write SM state snapshot to JSON
+  _restore_state()          — restore RelayStateMachine state from JSON file
 ```
 
 ## Published HA Sensors (sensor.zfi_*)
@@ -274,6 +288,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Driver publishes `sensor.zfi_relay_locked` (always, not debug-only) so the controller can freeze the integral during relay lockout
 - `relay_locked` stays `true` for 8 seconds after each SM transition (`RELAY_SWITCH_DELAY_S`) to account for physical relay switching time
 - Redundant sends suppressed (only send when values change)
+- State persistence: controller saves integral/mode/last_computed_w to JSON every 60s and on shutdown; driver saves SM state on each transition and on shutdown. On restart, persisted state is restored before the battery_power seed, so the PI resumes where it left off instead of starting from zero.
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
@@ -297,9 +312,8 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 
 ### Missing features
 
-- **No persistence across restarts**: integral, mode reset. Startup seeding mitigates.
 - **No unit tests**: PIController, compute pipeline, guards are testable pure functions  
-  → **Resolved**: 88 tests (32 controller + 56 driver) covering ControlLogic, PIController, AdaptiveLockout, RelayStateMachine
+  → **Resolved**: 208 tests (101 controller, 99 driver, 8 CSV logger) covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, state persistence, CSV logging
 - **No time-of-use / dynamic tariff support**: could charge from grid during negative prices
 - **Emergency only curtails discharge**: doesn't start charging to absorb existing PV surplus
 - **Single-instance only**: no multi-device HEMS support
@@ -322,20 +336,25 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `ki_discharge_down` | 0.051 | Integral gain: decrease discharge. |
 | `ki_charge_up` | 0.011 | Integral gain: increase charge. |
 | `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
-| `deadband` | 25W | No action within this error range. |
+| `deadband` | 35W | No action within this error range. |
+| `deadband_leak_ws` | 250 W·s | Deadband leak correction to prevent persistent bias. |
 | `feed_forward_sources` | (list) | Feed-forward sources: entity, gain, sign. |
 | `ff_enabled` | true | Master switch to enable/disable feed-forward. |
-| `ff_deadband` | 20W | Ignore total FF correction below this threshold. |
+| `ff_deadband` | 30W | Ignore total FF correction below this threshold. |
+| `ff_filter_tau_s` | 30s | EMA time constant for filtered FF derivative. |
 | `target_grid_power` | 30W | Discharge target. Small grid draw as safety buffer. |
 | `charge_target_power` | 0W | Charge target. Absorb all surplus exactly. |
 | `mode_hysteresis` | 50W | Surplus band for mode switching. Increase if mode flaps. |
-| `charge_confirm` | 15s | Seconds surplus must hold before entering CHARGING. |
-| `relay_locked_sensor` | (none) | HA entity for relay lockout feedback from driver. |
-| `direction_lockout` | 5s | Min time between relay state changes. |
-| `max_output` | 800W | Legal BKW limit (2400W with electrician sign-off). |
-| `max_charge` | 2400W | AC charge limit. |
+| `charge_confirm` | 20s | Seconds surplus must hold before entering CHARGING. |
+| `relay_locked_sensor` | (entity) | HA entity for relay lockout feedback from driver. |
+| `relay_lockout_ws` | 10000 W·s | Energy threshold for relay direction change. |
+| `relay_lockout_cutoff_w` | 25W | Floor power for lockout accumulator (prevents infinite wait). |
+| `relay_lockout_idle_s` | 90s | Time before switching to idle state. |
+| `max_output` | 1200W | Max discharge (W). |
+| `max_charge` | 800W | AC charge limit. |
 | `max_feed_in` | 800W | Emergency threshold. |
 | `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
+| `state_file` | (auto) | JSON file path for state persistence (controller/driver). |
 
 ### Gain tuning
 Gains are derived from step response measurements per quadrant using SIMC rules.

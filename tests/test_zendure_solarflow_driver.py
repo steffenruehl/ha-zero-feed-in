@@ -33,24 +33,24 @@ T0 = 1.0
 """Base timestamp for tests — matches production where time.monotonic() > 0."""
 
 
-def make_lockout(full_power_w: float = 200.0) -> AdaptiveLockout:
-    """Create an AdaptiveLockout with default reference power."""
-    return AdaptiveLockout(full_power_w=full_power_w)
+def make_lockout(cutoff_w: float = 1.0) -> AdaptiveLockout:
+    """Create an AdaptiveLockout with default cutoff."""
+    return AdaptiveLockout(cutoff_w=cutoff_w)
 
 
 def make_sm(
-    base_lockout_s: float = 30.0,
+    threshold_ws: float = 6000.0,
     idle_lockout_s: float = 5.0,
-    ref_w: float = 200.0,
+    cutoff_w: float = 1.0,
     min_active_power_w: float = MIN_ACTIVE_POWER_W,
     log_fn=None,
 ) -> RelayStateMachine:
     """Create a RelayStateMachine with test defaults."""
     return RelayStateMachine(
         idle_lockout_s=idle_lockout_s,
-        charge_lockout=AdaptiveLockout(full_power_w=ref_w),
-        discharge_lockout=AdaptiveLockout(full_power_w=ref_w),
-        base_lockout_s=base_lockout_s,
+        charge_lockout=AdaptiveLockout(cutoff_w=cutoff_w),
+        discharge_lockout=AdaptiveLockout(cutoff_w=cutoff_w),
+        threshold_ws=threshold_ws,
         min_active_power_w=min_active_power_w,
         log_fn=log_fn,
     )
@@ -66,7 +66,7 @@ class TestAdaptiveLockout:
 
     def test_fresh_lockout_not_settled(self):
         al = make_lockout()
-        assert not al.is_settled(base_s=30.0)
+        assert not al.is_settled(6000.0)
 
     def test_reset_clears_accumulator(self):
         al = make_lockout()
@@ -74,7 +74,7 @@ class TestAdaptiveLockout:
         al.tick(200, now=T0 + 10)
         al.reset()
         assert al.progress == 0.0
-        assert not al.is_settled(base_s=30.0)
+        assert not al.is_settled(6000.0)
 
     def test_single_tick_no_accumulation(self):
         """First tick only sets the timestamp, no dt available yet."""
@@ -83,82 +83,88 @@ class TestAdaptiveLockout:
         assert al.progress == 0.0
 
     def test_threshold_calculation(self):
-        al = make_lockout(full_power_w=200.0)
-        assert al.threshold(base_s=30.0) == 6000.0
+        al = make_lockout()
+        assert al.threshold(6000.0) == 6000.0
 
     # -- Doc examples: full_power_w=200, base=30s, threshold=6000 W·s --
 
     def test_200w_sustained_settles_in_30s(self):
         """200 W sustained -> 30 s (from docs table)."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(200, now=T0)
         al.tick(200, now=T0 + 30)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_200w_just_under_30s_not_settled(self):
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(200, now=T0)
         al.tick(200, now=T0 + 29.9)
-        assert not al.is_settled(base_s=30.0)
+        assert not al.is_settled(6000.0)
 
     def test_100w_sustained_settles_in_60s(self):
         """100 W sustained -> 60 s (from docs table)."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(100, now=T0)
         al.tick(100, now=T0 + 60)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_100w_just_under_60s_not_settled(self):
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(100, now=T0)
         al.tick(100, now=T0 + 59)
-        assert not al.is_settled(base_s=30.0)
+        assert not al.is_settled(6000.0)
 
     def test_50w_sustained_settles_in_120s(self):
         """50 W sustained -> 120 s (from docs table)."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(50, now=T0)
         al.tick(50, now=T0 + 120)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_20w_sustained_settles_in_300s(self):
         """<20 W -> 300 s (from docs table)."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(20, now=T0)
         al.tick(20, now=T0 + 300)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_variable_power_proportional(self):
         """Variable power: each slice contributes proportionally."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         # 200 W for 15 s -> 3000 W-s
         al.tick(200, now=T0)
         al.tick(200, now=T0 + 15)
         assert al.progress == pytest.approx(3000.0)
-        assert not al.is_settled(base_s=30.0)
+        assert not al.is_settled(6000.0)
         # Then 100 W for 30 s -> 3000 W-s more -> total 6000 -> settled
         al.tick(100, now=T0 + 45)
         assert al.progress == pytest.approx(6000.0)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_negative_power_uses_abs(self):
         """Charging (negative) power contributes via absolute value."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(-200, now=T0)
         al.tick(-200, now=T0 + 30)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
-    def test_zero_power_no_progress(self):
-        """Zero power contributes nothing to the accumulator."""
-        al = make_lockout(full_power_w=200.0)
+    def test_zero_power_uses_cutoff(self):
+        """Zero power still accumulates at the cutoff rate."""
+        al = make_lockout(cutoff_w=1.0)
         al.tick(0, now=T0)
-        al.tick(0, now=T0 + 1000)
-        assert al.progress == 0.0
-        assert not al.is_settled(base_s=30.0)
+        al.tick(0, now=T0 + 100)
+        assert al.progress == pytest.approx(100.0)
+
+    def test_cutoff_prevents_infinite_lockout(self):
+        """Cutoff floor ensures progress even at very low power."""
+        al = make_lockout(cutoff_w=25.0)
+        al.tick(5, now=T0)        # 5 < 25 → effective = 25
+        al.tick(5, now=T0 + 240)  # 25 × 240 = 6000
+        assert al.is_settled(6000.0)
 
     def test_reset_then_reaccumulate(self):
         """After reset, accumulation restarts from zero."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(200, now=T0)
         al.tick(200, now=T0 + 15)
         assert al.progress == pytest.approx(3000.0)
@@ -166,7 +172,7 @@ class TestAdaptiveLockout:
         al.tick(200, now=T0 + 20)
         al.tick(200, now=T0 + 50)
         assert al.progress == pytest.approx(6000.0)
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -262,14 +268,14 @@ class TestTransitions:
 
     def test_idle_to_discharge_requires_lockout(self):
         """Transition from IDLE to DISCHARGING requires adaptive lockout to settle."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         result = sm.update(200.0, now=T0)
         assert sm.state == RelayState.IDLE
         assert result == 0.0
 
     def test_idle_to_discharge_after_lockout(self):
         """After sustained power meets threshold, transition fires."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 15)
         assert sm.state == RelayState.IDLE
@@ -278,7 +284,7 @@ class TestTransitions:
 
     def test_idle_to_charge_after_lockout(self):
         """Transition to CHARGING after adaptive lockout settles."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(-200.0, now=T0)
         sm.update(-200.0, now=T0 + 15)
         assert sm.state == RelayState.IDLE
@@ -287,7 +293,7 @@ class TestTransitions:
 
     def test_discharge_to_idle_requires_idle_lockout(self):
         """Transition from DISCHARGING to IDLE requires idle_lockout_s to elapse."""
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0)
+        sm = make_sm(idle_lockout_s=5.0)
         sm.seed(RelayDirection.DISCHARGE)
         sm.update(0.0, now=T0)
         assert sm.state == RelayState.DISCHARGING
@@ -297,7 +303,7 @@ class TestTransitions:
         assert sm.state == RelayState.IDLE
 
     def test_charge_to_idle_requires_lockout(self):
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0)
+        sm = make_sm(idle_lockout_s=5.0)
         sm.seed(RelayDirection.CHARGE)
         sm.update(0.0, now=T0)
         assert sm.state == RelayState.CHARGING
@@ -306,7 +312,7 @@ class TestTransitions:
 
     def test_discharge_to_charge_goes_through_lockout(self):
         """Switching from DISCHARGING to CHARGING must accumulate enough energy."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.DISCHARGE)
         sm.update(-200.0, now=T0)
         assert sm.state == RelayState.DISCHARGING
@@ -316,7 +322,7 @@ class TestTransitions:
         assert sm.state == RelayState.CHARGING
 
     def test_charge_to_discharge_goes_through_lockout(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.CHARGE)
         sm.update(200.0, now=T0)
         assert sm.state == RelayState.CHARGING
@@ -325,7 +331,7 @@ class TestTransitions:
 
     def test_same_state_no_lockout(self):
         """Staying in the same state requires no lockout."""
-        sm = make_sm(base_lockout_s=30.0)
+        sm = make_sm()
         sm.seed(RelayDirection.DISCHARGE)
         result = sm.update(200.0, now=T0)
         assert sm.state == RelayState.DISCHARGING
@@ -333,7 +339,7 @@ class TestTransitions:
 
     def test_clamped_during_lockout_discharge(self):
         """During lockout in DISCHARGING, charging request is clamped to +MIN_ACTIVE_POWER_W."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.DISCHARGE)
         result = sm.update(-100.0, now=T0)
         assert result == MIN_ACTIVE_POWER_W
@@ -341,7 +347,7 @@ class TestTransitions:
 
     def test_clamped_during_lockout_charge(self):
         """During lockout in CHARGING, discharge request is clamped to -MIN_ACTIVE_POWER_W."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.CHARGE)
         result = sm.update(100.0, now=T0)
         assert result == -MIN_ACTIVE_POWER_W
@@ -351,7 +357,7 @@ class TestTransitions:
         """Flipping from DISCHARGE to CHARGE target while in IDLE:
         the new charge accumulator starts from zero (no prior ticks),
         but the old discharge accumulator preserves its progress."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 15)
         # Halfway there -- now flip to charge
@@ -365,7 +371,7 @@ class TestTransitions:
     def test_direction_flip_preserves_other_accumulator(self):
         """Flipping target back after a brief interruption resumes
         from the preserved accumulator progress."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 15)  # discharge acc = 3000 W·s
         # Briefly flip to charge for one tick
@@ -378,7 +384,7 @@ class TestTransitions:
     def test_oscillation_idle_discharge_while_charging(self):
         """In CHARGING, oscillating between IDLE and DISCHARGE targets
         must still allow the IDLE timer to accumulate and eventually fire."""
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm = make_sm(idle_lockout_s=5.0)
         sm.seed(RelayDirection.CHARGE)
 
         # Alternating: 2 s IDLE, 1 s DISCHARGE — IDLE accumulates ~2 s per cycle
@@ -397,7 +403,7 @@ class TestTransitions:
     def test_oscillation_idle_charge_while_discharging(self):
         """In DISCHARGING, oscillating between IDLE and CHARGE targets
         must still allow the IDLE timer to accumulate and eventually fire."""
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm = make_sm(idle_lockout_s=5.0)
         sm.seed(RelayDirection.DISCHARGE)
 
         sm.update(0.0, now=T0)
@@ -414,7 +420,7 @@ class TestTransitions:
 
     def test_low_power_longer_lockout(self):
         """50 W takes 120 s to transition (from docs: threshold 6000 / 50 = 120s)."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(50.0, now=T0)
         sm.update(50.0, now=T0 + 60)
         assert sm.state == RelayState.IDLE  # Only halfway
@@ -432,7 +438,7 @@ class TestSafetyTimeout:
 
     def test_safety_timeout_forces_transition(self):
         """Even at low power, safety timeout fires after RELAY_SAFETY_TIMEOUT_S."""
-        sm = make_sm(base_lockout_s=60.0, ref_w=200.0)
+        sm = make_sm(threshold_ws=12000.0)
         # 11 W is above DIRECTION_THRESHOLD_W (10) but needs 12000/11 ≈ 1091s
         # to settle naturally — well above the safety cap.
         sm.update(11.0, now=T0)
@@ -442,7 +448,7 @@ class TestSafetyTimeout:
         assert sm.state == RelayState.DISCHARGING
 
     def test_safety_timeout_on_charge(self):
-        sm = make_sm(base_lockout_s=60.0, ref_w=200.0)
+        sm = make_sm(threshold_ws=12000.0)
         sm.update(-11.0, now=T0)
         sm.update(-11.0, now=T0 + RELAY_SAFETY_TIMEOUT_S)
         assert sm.state == RelayState.CHARGING
@@ -464,9 +470,9 @@ class TestPublish:
 
         sm = RelayStateMachine(
             idle_lockout_s=5.0,
-            charge_lockout=AdaptiveLockout(full_power_w=200.0),
-            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
-            base_lockout_s=30.0,
+            charge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            discharge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            threshold_ws=6000.0,
             publish_fn=capture,
         )
         sm.publish()
@@ -488,9 +494,9 @@ class TestPublish:
 
         sm = RelayStateMachine(
             idle_lockout_s=5.0,
-            charge_lockout=AdaptiveLockout(full_power_w=200.0),
-            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
-            base_lockout_s=30.0,
+            charge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            discharge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            threshold_ws=6000.0,
             publish_fn=capture,
         )
         sm.update(200.0, now=T0)
@@ -514,9 +520,9 @@ class TestPublish:
 
         sm = RelayStateMachine(
             idle_lockout_s=5.0,
-            charge_lockout=AdaptiveLockout(full_power_w=200.0),
-            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
-            base_lockout_s=30.0,
+            charge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            discharge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            threshold_ws=6000.0,
             publish_fn=capture,
         )
         sm.update(-200.0, now=T0)
@@ -546,26 +552,26 @@ class TestRounding:
         assert ZendureSolarFlowDriver._round_to_step(100.0) == 100
 
     def test_rounds_up(self):
-        assert ZendureSolarFlowDriver._round_to_step(106.0) == 110
+        assert ZendureSolarFlowDriver._round_to_step(103.0) == 105
 
     def test_rounds_down(self):
-        assert ZendureSolarFlowDriver._round_to_step(104.0) == 100
+        assert ZendureSolarFlowDriver._round_to_step(101.0) == 100
 
     def test_negative(self):
-        assert ZendureSolarFlowDriver._round_to_step(-106.0) == -110
+        assert ZendureSolarFlowDriver._round_to_step(-103.0) == -105
 
     def test_zero(self):
         assert ZendureSolarFlowDriver._round_to_step(0.0) == 0
 
     def test_small_value(self):
-        assert ZendureSolarFlowDriver._round_to_step(3.0) == 0
+        assert ZendureSolarFlowDriver._round_to_step(2.0) == 0
 
     def test_midpoint_bankers_rounding(self):
         """Python uses banker's rounding: 0.5 rounds to nearest even."""
-        assert ZendureSolarFlowDriver._round_to_step(5.0) == 0   # round(0.5) = 0
-        assert ZendureSolarFlowDriver._round_to_step(15.0) == 20  # round(1.5) = 2
-        assert ZendureSolarFlowDriver._round_to_step(25.0) == 20  # round(2.5) = 2
-        assert ZendureSolarFlowDriver._round_to_step(105.0) == 100  # round(10.5) = 10
+        assert ZendureSolarFlowDriver._round_to_step(2.5) == 0    # round(0.5) = 0
+        assert ZendureSolarFlowDriver._round_to_step(7.5) == 10   # round(1.5) = 2
+        assert ZendureSolarFlowDriver._round_to_step(12.5) == 10  # round(2.5) = 2
+        assert ZendureSolarFlowDriver._round_to_step(52.5) == 50  # round(10.5) = 10
 
 
 # ═══════════════════════════════════════════════════════════
@@ -578,7 +584,7 @@ class TestFullRelayCycle:
 
     def test_idle_discharge_idle_cycle(self):
         """IDLE -> DISCHARGING -> IDLE full cycle."""
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm = make_sm(idle_lockout_s=5.0)
         assert sm.state == RelayState.IDLE
 
         # Ramp up discharge for 30s
@@ -598,7 +604,7 @@ class TestFullRelayCycle:
 
     def test_idle_charge_discharge_cycle(self):
         """IDLE -> CHARGING -> DISCHARGING with full lockouts."""
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=5.0, ref_w=200.0)
+        sm = make_sm(idle_lockout_s=5.0)
 
         # Enter charging
         sm.update(-200.0, now=T0)
@@ -622,7 +628,7 @@ class TestFullRelayCycle:
 
     def test_oscillating_input_prevents_transition(self):
         """Rapid direction changes keep resetting the accumulator."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         t = T0
         for _ in range(10):
             sm.update(200.0, t)
@@ -657,9 +663,9 @@ class TestDriverConfig:
         assert cfg.input_entity == "number.input_limit"
         assert cfg.ac_mode_entity == "select.ac_mode"
         assert cfg.watchdog_s == 15
-        assert cfg.direction_lockout_s == 5.0
+        assert cfg.relay_lockout_idle_s == 5.0
         assert cfg.relay_sm_enabled is True
-        assert cfg.adaptive_lockout_ref_w == 200.0
+        assert cfg.relay_lockout_cutoff_w == 1.0
         assert cfg.dry_run is True
         assert cfg.debug is False
         assert cfg.sensor_prefix == "sensor.zfi"
@@ -670,18 +676,18 @@ class TestDriverConfig:
         args = {
             **self.MINIMAL_ARGS,
             "watchdog_s": 5,
-            "direction_lockout": 10.0,
+            "relay_lockout_idle_s": 10.0,
             "relay_sm_enabled": False,
-            "adaptive_lockout_ref_w": 400.0,
+            "relay_lockout_cutoff_w": 50.0,
             "dry_run": False,
             "debug": True,
             "sensor_prefix": "sensor.test",
         }
         cfg = DriverConfig.from_args(args)
         assert cfg.watchdog_s == 5
-        assert cfg.direction_lockout_s == 10.0
+        assert cfg.relay_lockout_idle_s == 10.0
         assert cfg.relay_sm_enabled is False
-        assert cfg.adaptive_lockout_ref_w == 400.0
+        assert cfg.relay_lockout_cutoff_w == 50.0
         assert cfg.dry_run is False
         assert cfg.debug is True
         assert cfg.sensor_prefix == "sensor.test"
@@ -715,7 +721,7 @@ class TestStateMachineLogging:
 
     def test_log_on_transition(self):
         logged = []
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0, log_fn=logged.append)
+        sm = make_sm(log_fn=logged.append)
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 30)
         assert sm.state == RelayState.DISCHARGING
@@ -723,7 +729,7 @@ class TestStateMachineLogging:
 
     def test_no_log_when_stable(self):
         logged = []
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0, log_fn=logged.append)
+        sm = make_sm(log_fn=logged.append)
         sm.seed(RelayDirection.DISCHARGE)
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 10)
@@ -731,7 +737,7 @@ class TestStateMachineLogging:
 
     def test_no_log_without_callback(self):
         """No crash when log_fn is None."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0, log_fn=None)
+        sm = make_sm(log_fn=None)
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 30)
         assert sm.state == RelayState.DISCHARGING
@@ -753,7 +759,7 @@ class TestLockoutProgress:
         assert thresh == 0.0
 
     def test_discharge_pending_progress(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 15)
         pct, acc, thresh = sm._lockout_progress()
@@ -762,7 +768,7 @@ class TestLockoutProgress:
         assert 49 <= pct <= 51
 
     def test_charge_pending_progress(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(-200.0, now=T0)
         sm.update(-200.0, now=T0 + 15)
         pct, acc, thresh = sm._lockout_progress()
@@ -771,7 +777,7 @@ class TestLockoutProgress:
         assert 49 <= pct <= 51
 
     def test_idle_pending_progress(self):
-        sm = make_sm(base_lockout_s=30.0, idle_lockout_s=10.0, ref_w=200.0)
+        sm = make_sm(idle_lockout_s=10.0)
         sm.seed(RelayDirection.DISCHARGE)
         sm.update(0.0, now=T0)
         sm.update(0.0, now=T0 + 5)
@@ -797,9 +803,9 @@ class TestPublishIdlePending:
 
         sm = RelayStateMachine(
             idle_lockout_s=10.0,
-            charge_lockout=AdaptiveLockout(full_power_w=200.0),
-            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
-            base_lockout_s=30.0,
+            charge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            discharge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            threshold_ws=6000.0,
             publish_fn=capture,
         )
         sm.seed(RelayDirection.DISCHARGE)
@@ -820,9 +826,9 @@ class TestPublishIdlePending:
 
         sm = RelayStateMachine(
             idle_lockout_s=5.0,
-            charge_lockout=AdaptiveLockout(full_power_w=200.0),
-            discharge_lockout=AdaptiveLockout(full_power_w=200.0),
-            base_lockout_s=30.0,
+            charge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            discharge_lockout=AdaptiveLockout(cutoff_w=1.0),
+            threshold_ws=6000.0,
             publish_fn=capture,
         )
         sm.update(200.0, now=T0)
@@ -842,33 +848,33 @@ class TestDepartureSince:
     """Tests for departure_since tracking."""
 
     def test_departure_since_set_on_first_departure(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         assert sm._departure_since == 0.0
         sm.update(200.0, now=T0)
         assert sm._departure_since == T0
 
     def test_departure_since_not_reset_by_subsequent_ticks(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 10)
         assert sm._departure_since == T0  # Still first departure time
 
     def test_departure_since_reset_on_stability(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         assert sm._departure_since == T0
         # Back to stable IDLE
         sm.update(0.0, now=T0 + 1)  # first idle tick
         sm.update(0.0, now=T0 + 2)  # idle but still pending
         # Force transition via safety timeout
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         sm.update(200.0, now=T0 + 30)
         assert sm.state == RelayState.DISCHARGING
         assert sm._departure_since == 0.0  # Reset after transition
 
     def test_departure_since_reset_on_target_matches_state(self):
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.DISCHARGE)
         sm.update(-200.0, now=T0)  # wants CHARGING
         assert sm._departure_since == T0
@@ -902,10 +908,10 @@ class TestAdaptiveLockoutEdgeCases:
 
     def test_very_small_power(self):
         """Very small power requires proportionally longer time."""
-        al = make_lockout(full_power_w=200.0)
+        al = make_lockout()
         al.tick(1, now=T0)
         al.tick(1, now=T0 + 6000)  # 1 W × 6000 s = 6000 W·s
-        assert al.is_settled(base_s=30.0)
+        assert al.is_settled(6000.0)
 
     def test_negative_dt_ignored(self):
         """If timestamps go backwards, dt is not accumulated (dt <= 0)."""
@@ -929,13 +935,13 @@ class TestUpdateReturnValues:
         assert result == 0.0
 
     def test_discharging_returns_desired(self):
-        sm = make_sm(base_lockout_s=0.01, ref_w=200.0)
+        sm = make_sm(threshold_ws=2.0)
         sm.seed(RelayDirection.DISCHARGE)
         result = sm.update(200.0, now=T0)
         assert result == 200.0
 
     def test_charging_returns_desired(self):
-        sm = make_sm(base_lockout_s=0.01, ref_w=200.0)
+        sm = make_sm(threshold_ws=2.0)
         sm.seed(RelayDirection.CHARGE)
         result = sm.update(-200.0, now=T0)
         assert result == -200.0
@@ -947,7 +953,7 @@ class TestUpdateReturnValues:
 
     def test_transition_returns_clamped_first_tick(self):
         """First tick after transition returns clamped value for new state."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.update(200.0, now=T0)
         result = sm.update(200.0, now=T0 + 30)
         assert sm.state == RelayState.DISCHARGING
@@ -984,7 +990,7 @@ class TestRelaySwitchDelay:
 
     def test_relay_locked_true_immediately_after_transition(self):
         """relay_locked stays true right after SM transitions."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         last_t = -RELAY_SWITCH_DELAY_S  # no holdoff at start
         # Request discharge until SM transitions
         sm.update(200.0, now=T0)
@@ -995,7 +1001,7 @@ class TestRelaySwitchDelay:
 
     def test_relay_locked_true_during_holdoff(self):
         """relay_locked stays true within RELAY_SWITCH_DELAY_S of transition."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         last_t = -RELAY_SWITCH_DELAY_S
         sm.update(200.0, now=T0)
         _, last_t = _sim_relay_locked(sm, 200.0, T0 + 30, last_t)
@@ -1005,7 +1011,7 @@ class TestRelaySwitchDelay:
 
     def test_relay_locked_false_after_holdoff(self):
         """relay_locked goes false once holdoff expires and SM is stable."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         last_t = -RELAY_SWITCH_DELAY_S
         sm.update(200.0, now=T0)
         _, last_t = _sim_relay_locked(sm, 200.0, T0 + 30, last_t)
@@ -1015,7 +1021,7 @@ class TestRelaySwitchDelay:
 
     def test_sm_clamping_overrides_holdoff(self):
         """relay_locked is true when SM clamps, regardless of holdoff timer."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         last_t = -RELAY_SWITCH_DELAY_S
         # SM is IDLE, request discharge — SM clamps to 0
         locked, last_t = _sim_relay_locked(sm, 200.0, T0, last_t)
@@ -1024,7 +1030,7 @@ class TestRelaySwitchDelay:
 
     def test_no_holdoff_at_startup(self):
         """No false holdoff when driver starts (initialized to -RELAY_SWITCH_DELAY_S)."""
-        sm = make_sm(base_lockout_s=30.0, ref_w=200.0)
+        sm = make_sm()
         sm.seed(RelayDirection.DISCHARGE)
         last_t = -RELAY_SWITCH_DELAY_S
         # Stable in DISCHARGING — no clamping, no holdoff
@@ -1033,7 +1039,7 @@ class TestRelaySwitchDelay:
 
     def test_holdoff_resets_on_each_transition(self):
         """Each SM transition resets the holdoff timer."""
-        sm = make_sm(base_lockout_s=0.01, ref_w=200.0, idle_lockout_s=0.01)
+        sm = make_sm(threshold_ws=2.0, idle_lockout_s=0.01)
         last_t = -RELAY_SWITCH_DELAY_S
         # Transition to DISCHARGING (near-zero lockout)
         sm.update(200.0, now=T0)
@@ -1051,3 +1057,81 @@ class TestRelaySwitchDelay:
         # Holdoff active again
         locked, last_t = _sim_relay_locked(sm, 0.0, last_t + 1, last_t)
         assert locked is True
+
+
+# ═══════════════════════════════════════════════════════════
+#  State Persistence
+# ═══════════════════════════════════════════════════════════
+
+
+class TestRelayStateMachinePersistence:
+    """Tests for RelayStateMachine.state_snapshot / restore_from_snapshot."""
+
+    def test_snapshot_round_trip_idle(self):
+        """Snapshot captures IDLE state and restores it."""
+        sm = make_sm()
+        assert sm.state == RelayState.IDLE
+        snap = sm.state_snapshot()
+        sm2 = make_sm()
+        sm2.state = RelayState.DISCHARGING  # force a different state
+        assert sm2.restore_from_snapshot(snap) is True
+        assert sm2.state == RelayState.IDLE
+
+    def test_snapshot_round_trip_discharging(self):
+        """Snapshot captures DISCHARGING state after transition."""
+        sm = make_sm()
+        sm.update(200.0, now=T0)
+        sm.update(200.0, now=T0 + 30)
+        assert sm.state == RelayState.DISCHARGING
+
+        snap = sm.state_snapshot()
+
+        sm2 = make_sm()
+        assert sm2.restore_from_snapshot(snap) is True
+        assert sm2.state == RelayState.DISCHARGING
+
+    def test_snapshot_round_trip_charging(self):
+        """Snapshot captures CHARGING state after transition."""
+        sm = make_sm()
+        sm.update(-200.0, now=T0)
+        sm.update(-200.0, now=T0 + 30)
+        assert sm.state == RelayState.CHARGING
+
+        snap = sm.state_snapshot()
+
+        sm2 = make_sm()
+        assert sm2.restore_from_snapshot(snap) is True
+        assert sm2.state == RelayState.CHARGING
+
+    def test_snapshot_is_json_serializable(self):
+        """Snapshot dict survives JSON round-trip."""
+        import json
+        sm = make_sm()
+        sm.update(200.0, now=T0)
+        sm.update(200.0, now=T0 + 30)
+
+        snap = sm.state_snapshot()
+        restored = json.loads(json.dumps(snap))
+
+        sm2 = make_sm()
+        assert sm2.restore_from_snapshot(restored) is True
+        assert sm2.state == RelayState.DISCHARGING
+
+    def test_restore_invalid_state_returns_false(self):
+        """Restore fails on invalid state name."""
+        sm = make_sm()
+        assert sm.restore_from_snapshot({"state": "INVALID"}) is False
+
+    def test_restore_missing_key_returns_false(self):
+        """Restore fails when state key is missing."""
+        sm = make_sm()
+        assert sm.restore_from_snapshot({}) is False
+
+    def test_restore_overrides_seed(self):
+        """Restore after seed takes precedence."""
+        sm = make_sm()
+        sm.seed(RelayDirection.DISCHARGE)
+        assert sm.state == RelayState.DISCHARGING
+
+        sm.restore_from_snapshot({"state": "IDLE"})
+        assert sm.state == RelayState.IDLE

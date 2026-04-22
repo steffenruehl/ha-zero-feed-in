@@ -959,16 +959,16 @@ class TestFeedForward:
 
     def test_first_cycle_returns_zero(self):
         """No previous reading → ff = 0, but previous is stored."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, filter_tau_s=0)
         readings = {"sensor.pv": 1000.0}
         assert ff.compute(readings) == 0.0
         ff.update_previous(readings)
-        # Now previous is set
-        assert ff._sources[0].previous_w == 1000.0
+        # Now EMA filter is seeded
+        assert ff._sources[0].filtered_w == 1000.0
 
     def test_pv_drop_positive_correction(self):
         """PV drops → positive ff (increase discharge)."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0})
         # delta = 800 - 1000 = -200, sign=-1.0, gain=0.6
         # ff = -1.0 * 0.6 * (-200) = 120
@@ -976,7 +976,7 @@ class TestFeedForward:
 
     def test_pv_rise_negative_correction(self):
         """PV rises → negative ff (can charge more)."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 500.0})
         # delta = 700 - 500 = 200, sign=-1.0, gain=0.6
         # ff = -1.0 * 0.6 * 200 = -120
@@ -984,21 +984,21 @@ class TestFeedForward:
 
     def test_deadband_filters_small_total(self):
         """Total FF within deadband → ff = 0."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=20)
+        ff = FeedForward((PV_SOURCE,), deadband_w=20, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0})
         # delta = 10, sign=-1.0, gain=0.6 → total = 6 < deadband 20
         assert ff.compute({"sensor.pv": 1010.0}) == 0.0
 
     def test_load_increase_positive_correction(self):
         """Wallbox starts → positive ff (increase discharge)."""
-        ff = FeedForward((LOAD_SOURCE,), deadband_w=0)
+        ff = FeedForward((LOAD_SOURCE,), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.wallbox": 0.0})
         # delta = 3000, sign=1.0, gain=0.8 → ff = 2400
         assert ff.compute({"sensor.wallbox": 3000.0}) == pytest.approx(2400.0)
 
     def test_multiple_sources_sum(self):
         """Multiple sources are summed."""
-        ff = FeedForward((PV_SOURCE, LOAD_SOURCE), deadband_w=0)
+        ff = FeedForward((PV_SOURCE, LOAD_SOURCE), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0, "sensor.wallbox": 0.0})
         # PV drops 200: -1.0 * 0.6 * (-200) = 120
         # Load rises 500: 1.0 * 0.8 * 500 = 400
@@ -1007,16 +1007,16 @@ class TestFeedForward:
 
     def test_unavailable_sensor_skipped(self):
         """None reading → source skipped, no crash."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0})
         assert ff.compute({"sensor.pv": None}) == 0.0
 
     def test_update_previous_ignores_none(self):
-        """None reading does not overwrite previous."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0)
+        """None reading does not overwrite EMA filter state."""
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0})
         ff.update_previous({"sensor.pv": None})
-        assert ff._sources[0].previous_w == 1000.0
+        assert ff._sources[0].filtered_w == 1000.0
 
     def test_gain_zero_always_zero(self):
         """gain=0 → ff is always 0 regardless of delta."""
@@ -1029,7 +1029,7 @@ class TestFeedForward:
 
     def test_disabled_returns_zero(self):
         """enabled=False → ff always 0 even with large deltas."""
-        ff = FeedForward((PV_SOURCE,), deadband_w=0, enabled=False)
+        ff = FeedForward((PV_SOURCE,), deadband_w=0, enabled=False, filter_tau_s=0)
         ff.update_previous({"sensor.pv": 1000.0})
         assert ff.compute({"sensor.pv": 500.0}) == 0.0
 
@@ -1037,7 +1037,7 @@ class TestFeedForward:
         """Two small deltas that individually are below deadband but sum above."""
         src_a = FeedForwardSource(entity="sensor.a", gain=1.0, sign=1.0)
         src_b = FeedForwardSource(entity="sensor.b", gain=1.0, sign=1.0)
-        ff = FeedForward((src_a, src_b), deadband_w=20)
+        ff = FeedForward((src_a, src_b), deadband_w=20, filter_tau_s=0)
         ff.update_previous({"sensor.a": 0.0, "sensor.b": 0.0})
         # Each delta is 15, sum = 30 > deadband 20
         assert ff.compute({"sensor.a": 15.0, "sensor.b": 15.0}) == pytest.approx(30.0)
@@ -1137,7 +1137,7 @@ class TestPreviousStateUpdates:
             ff_readings={"sensor.pv": 500.0},
         )
         logic.compute(m, now=0)
-        assert logic.ff._sources[0].previous_w == 500.0
+        assert logic.ff._sources[0].filtered_w == 500.0
 
     def test_previous_none_when_no_sources(self):
         """No sources configured → nothing to track."""
@@ -1156,7 +1156,7 @@ class TestPreviousStateUpdates:
             ff_readings={"sensor.pv": 2000.0},
         )
         logic.compute(m, now=0)
-        assert logic.ff._sources[0].previous_w == 2000.0
+        assert logic.ff._sources[0].filtered_w == 2000.0
 
     def test_previous_updated_on_guard(self):
         """Previous state is updated even when a guard blocks output."""
@@ -1167,4 +1167,87 @@ class TestPreviousStateUpdates:
             ff_readings={"sensor.pv": 500.0},
         )
         logic.compute(m, now=0)
-        assert logic.ff._sources[0].previous_w == 500.0
+        assert logic.ff._sources[0].filtered_w == 500.0
+
+
+# ═══════════════════════════════════════════════════════════
+#  State Persistence
+# ═══════════════════════════════════════════════════════════
+
+
+class TestStatePersistence:
+    """Tests for ControlLogic.state_snapshot / restore_from_snapshot."""
+
+    def test_snapshot_round_trip(self):
+        """Snapshot captures state and restore recovers it exactly."""
+        logic = make_logic()
+        logic.state.integral = 123.4
+        logic.state.last_computed_w = 200.0
+        logic.state.mode = OperatingMode.CHARGING
+        logic._db_acc = 42.5
+
+        snap = logic.state_snapshot()
+
+        logic2 = make_logic()
+        assert logic2.restore_from_snapshot(snap) is True
+        assert logic2.state.integral == 123.4
+        assert logic2.state.last_computed_w == 200.0
+        assert logic2.state.mode == OperatingMode.CHARGING
+        assert logic2._db_acc == 42.5
+
+    def test_snapshot_is_json_serializable(self):
+        """Snapshot dict can round-trip through JSON."""
+        import json
+        logic = make_logic()
+        logic.state.integral = -50.0
+        logic.state.mode = OperatingMode.DISCHARGING
+
+        snap = logic.state_snapshot()
+        restored = json.loads(json.dumps(snap))
+
+        logic2 = make_logic()
+        assert logic2.restore_from_snapshot(restored) is True
+        assert logic2.state.integral == -50.0
+        assert logic2.state.mode == OperatingMode.DISCHARGING
+
+    def test_restore_missing_key_returns_false(self):
+        """Restore fails gracefully when required keys are missing."""
+        logic = make_logic()
+        assert logic.restore_from_snapshot({}) is False
+        assert logic.restore_from_snapshot({"integral": 1.0}) is False
+
+    def test_restore_invalid_mode_returns_false(self):
+        """Restore fails gracefully on an invalid mode name."""
+        logic = make_logic()
+        snap = {"integral": 0.0, "last_computed_w": 0.0, "mode": "INVALID"}
+        assert logic.restore_from_snapshot(snap) is False
+
+    def test_restore_does_not_corrupt_state_on_failure(self):
+        """Failed restore leaves existing state unchanged."""
+        logic = make_logic()
+        logic.state.integral = 100.0
+        logic.state.mode = OperatingMode.CHARGING
+
+        logic.restore_from_snapshot({"bad": "data"})
+
+        assert logic.state.integral == 100.0
+        assert logic.state.mode == OperatingMode.CHARGING
+
+    def test_restore_missing_db_acc_defaults_to_zero(self):
+        """Old snapshots without db_acc still restore successfully."""
+        logic = make_logic()
+        snap = {"integral": 10.0, "last_computed_w": 20.0, "mode": "DISCHARGING"}
+        assert logic.restore_from_snapshot(snap) is True
+        assert logic._db_acc == 0.0
+
+    def test_restore_overrides_seed(self):
+        """Restore after seed takes precedence."""
+        logic = make_logic()
+        logic.seed(-300.0)  # seeds CHARGING, integral=-300
+        assert logic.state.mode == OperatingMode.CHARGING
+
+        snap = {"integral": 50.0, "last_computed_w": 100.0, "mode": "DISCHARGING", "db_acc": 1.0}
+        logic.restore_from_snapshot(snap)
+
+        assert logic.state.integral == 50.0
+        assert logic.state.mode == OperatingMode.DISCHARGING

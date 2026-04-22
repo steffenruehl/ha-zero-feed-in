@@ -13,6 +13,8 @@ Output convention (sensor.zfi_desired_power):
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -713,6 +715,34 @@ class ControlLogic:
             self.state.mode = OperatingMode.CHARGING
         self._log(f"Seeded from battery_power: {current_w:.0f}W")
 
+    def state_snapshot(self) -> dict[str, object]:
+        """Return a dict of state fields suitable for JSON persistence."""
+        return {
+            "integral": self.state.integral,
+            "last_computed_w": self.state.last_computed_w,
+            "mode": self.state.mode.name,
+            "db_acc": self._db_acc,
+        }
+
+    def restore_from_snapshot(self, data: dict[str, object]) -> bool:
+        """Restore internal state from a snapshot dict.
+
+        Returns True on success, False if the data is invalid or
+        incomplete.  On failure the state is left unchanged.
+        """
+        try:
+            integral = float(data["integral"])
+            last_computed_w = float(data["last_computed_w"])
+            mode = OperatingMode[data["mode"]]
+            db_acc = float(data.get("db_acc", 0.0))
+        except (KeyError, ValueError, TypeError):
+            return False
+        self.state.integral = integral
+        self.state.last_computed_w = last_computed_w
+        self.state.mode = mode
+        self._db_acc = db_acc
+        return True
+
     @staticmethod
     def estimate_surplus(m: Measurement) -> float:
         """Estimate PV minus house load.
@@ -1039,6 +1069,23 @@ class ZeroFeedInController(_HASS_BASE):
         bp = self._read_float(self.cfg.battery_power_sensor)
         self.logic.seed(bp)
 
+        # State persistence: restore from file, then seed overrides if needed
+        self._state_file: str = self.args.get(
+            "state_file",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "zfi_controller_state.json"),
+        )
+        self._state_save_interval: int = 12  # save every 12 ticks (~60s at 5s interval)
+        self._tick_count: int = 0
+        if self._restore_state():
+            self.log(
+                f"Restored state from {self._state_file}: "
+                f"mode={self.logic.state.mode.name} "
+                f"integral={self.logic.state.integral:.1f}W "
+                f"last_computed={self.logic.state.last_computed_w:.1f}W"
+            )
+        else:
+            self.log("No saved state found, using battery_power seed")
+
         self.run_every(self._on_tick, "now", self.cfg.interval_s)
 
         self.log(
@@ -1063,6 +1110,34 @@ class ZeroFeedInController(_HASS_BASE):
             )
 
         self._check_entities()
+
+    def terminate(self) -> None:
+        """Called by AppDaemon on shutdown — save state for next startup."""
+        self._save_state()
+
+    # ─── State persistence ────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Atomically write controller state to JSON file."""
+        try:
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.logic.state_snapshot(), f)
+            os.replace(tmp, self._state_file)
+        except OSError as exc:
+            self.log(f"Failed to save state: {exc}", level="WARNING")
+
+    def _restore_state(self) -> bool:
+        """Try to restore controller state from JSON file.
+
+        Returns True if state was successfully restored.
+        """
+        try:
+            with open(self._state_file) as f:
+                data = json.load(f)
+            return self.logic.restore_from_snapshot(data)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
 
     def _check_entities(self) -> None:
         """Log availability of every configured HA entity at startup."""
@@ -1101,6 +1176,10 @@ class ZeroFeedInController(_HASS_BASE):
         self._log_output(output, m, surplus)
         self._publish_ha_sensors(output, m, surplus)
         self._log_csv(output, m, surplus)
+
+        self._tick_count += 1
+        if self._tick_count % self._state_save_interval == 0:
+            self._save_state()
 
     # ─── Sensor reading ──────────────────────────────────
 

@@ -14,6 +14,8 @@ Handles:
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -279,6 +281,21 @@ class RelayStateMachine:
         else:
             self.state = RelayState.IDLE
 
+    def state_snapshot(self) -> dict[str, str]:
+        """Return a dict of state fields suitable for JSON persistence."""
+        return {"state": self.state.name}
+
+    def restore_from_snapshot(self, data: dict[str, str]) -> bool:
+        """Restore SM state from a snapshot dict.
+
+        Returns True on success, False if the data is invalid.
+        """
+        try:
+            self.state = RelayState[data["state"]]
+        except (KeyError, ValueError, TypeError):
+            return False
+        return True
+
     def update(self, desired_w: float, now: float) -> float:
         """Process a desired power value.  Returns the allowed power.
 
@@ -542,6 +559,18 @@ class ZendureSolarFlowDriver(_HASS_BASE):
         )
 
         self._seed_from_device()
+
+        # State persistence: override device seed with saved SM state
+        self._state_file: str = self.args.get(
+            "state_file",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "zfi_driver_state.json"),
+        )
+        if self._restore_state():
+            self.log(
+                f"Restored SM state from {self._state_file}: "
+                f"{self.relay_sm.state.name}"
+            )
+
         self.listen_state(self._on_desired_power_change, self.cfg.desired_power_sensor)
         self.run_every(self._on_watchdog_tick, "now", self.cfg.watchdog_s)
 
@@ -554,6 +583,34 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             f"watchdog={self.cfg.watchdog_s}s "
             f"dry_run={self.cfg.dry_run}"
         )
+
+    def terminate(self) -> None:
+        """Called by AppDaemon on shutdown — save state for next startup."""
+        self._save_state()
+
+    # ─── State persistence ────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Atomically write SM state to JSON file."""
+        try:
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.relay_sm.state_snapshot(), f)
+            os.replace(tmp, self._state_file)
+        except OSError as exc:
+            self.log(f"Failed to save state: {exc}", level="WARNING")
+
+    def _restore_state(self) -> bool:
+        """Try to restore SM state from JSON file.
+
+        Returns True if state was successfully restored.
+        """
+        try:
+            with open(self._state_file) as f:
+                data = json.load(f)
+            return self.relay_sm.restore_from_snapshot(data)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
 
     def _seed_from_device(self) -> None:
         """Read current device limits and AC mode to avoid redundant sends on startup."""
@@ -622,6 +679,7 @@ class ZendureSolarFlowDriver(_HASS_BASE):
             allowed = self.relay_sm.update(desired, now)
             if self.relay_sm.state != prev_state:
                 self._last_sm_transition_t = now
+                self._save_state()
         else:
             allowed = desired
 
