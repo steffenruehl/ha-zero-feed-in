@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 .coverage
 config/secrets.yaml
+config/apps.yaml
