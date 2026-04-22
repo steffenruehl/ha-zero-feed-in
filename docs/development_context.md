@@ -310,6 +310,7 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver publishes safe sensors (0 W to device_output, limits) and sets `sensor.zfi_controller_stale = true`; uses `last_reported` (HA 2024.4+) with `last_updated` fallback; watchdog handles device commands
 - MQTT heartbeat publishing: controller and driver can publish ISO-8601 timestamps to configurable MQTT topics on every tick for external monitoring (e.g. ESP32 fallback)
 - Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale; when device entities are configured, also sends safe state (0W to outputLimit + inputLimit) catching both controller and driver failures
+- ESP watchdog (`zfi_watchdog.yaml`): ESPHome package included via `packages:` on existing ESP8266. Subscribes to MQTT heartbeat topics, sends HTTP POST to SolarFlow local API (`/properties/write`) to set limits to 0 when stale >2 min. Fully independent of HA/AppDaemon — only needs MQTT broker + SolarFlow on LAN.
 
 ### Entity names (current setup)
 
@@ -401,3 +402,4 @@ Kp values above 1.0 risk oscillation with this latency.
 - **solarflow-control** (GitHub: reinhard-brandstaedter): Python tool for DC-coupled SolarFlow hubs + OpenDTU. More mature, but targets Hub 2000/AIO with Hoymiles WR, not AC-coupled storage.
 - **ioBroker zendure-solarflow adapter**: full-featured adapter with `setDeviceAutomationInOutLimit`, cloud relay, and PI controller script. The PI script for 2400 AC by forum user "schimi" was a reference for the PI approach.
 - **z-master42/solarflow**: HA MQTT YAML config for SolarFlow entities. Useful reference for MQTT topic structure.
+- **Zendure/Zendure-HA**: Official HA integration (HACS). Source for the local HTTP API discovery: SF2400 AC+ (ZenSDK devices) expose `GET /properties/report` and `POST /properties/write` endpoints that work independently of HA/MQTT. Used by the ESP watchdog for safe-state enforcement.

@@ -388,6 +388,50 @@ the MQTT heartbeat topics and only needs to **notify** the user.
 Safe-state enforcement lives in the HA watchdog because it has direct
 access to device entities via HA services.
 
+### 8. ESP Watchdog (`zfi_watchdog.yaml`)
+
+An ESPHome package (`src/zfi_watchdog.yaml`) that runs on an existing
+ESP8266 alongside other sensors (e.g. `heizung.yaml`).  Included via
+ESPHome `packages:` directive for clean separation.
+
+**How it works:**
+
+1. Connects to the MQTT broker and subscribes to
+   `zfi/heartbeat/controller` and `zfi/heartbeat/driver`.
+2. Tracks the last-received timestamp for each heartbeat.
+3. Every 30 s, checks if either heartbeat is older than 2 minutes.
+4. If stale: sends HTTP POST to the SolarFlow's **local HTTP API**
+   (`http://{ip}/properties/write`) with
+   `{"sn":"...","properties":{"outputLimit":0,"inputLimit":0}}`.
+5. When heartbeats resume: stops sending safe-state.
+
+**Independence:** The safe-state path is HA → MQTT broker → ESP → HTTP →
+SolarFlow.  If HA/AppDaemon die, only the broker and the SolarFlow
+need to be reachable on the LAN.  The HTTP API
+(`/properties/write`, `/properties/report`) is a direct device
+interface discovered in the Zendure HA integration source
+(`ZendureZenSdk.httpPost`).
+
+**Grace period:** 3 minutes after boot, all stale checks are
+suppressed to allow the controller and driver to start up.
+
+**HA entities published (via native API):**
+- `binary_sensor.heizung_zfi_watchdog_safe_state` — `problem` when
+  safe-state is active
+- `sensor.heizung_zfi_controller_heartbeat_age` — seconds since last
+  controller heartbeat
+- `sensor.heizung_zfi_driver_heartbeat_age` — seconds since last
+  driver heartbeat
+
+**Configuration:** Add to ESPHome secrets:
+```yaml
+mqtt_broker: "192.168.x.x"
+mqtt_user: "your_mqtt_user"
+mqtt_pass: "your_mqtt_password"
+solarflow_ip: "192.168.x.x"
+solarflow_serial: "HECxxxxxxxxxx"
+```
+
 ---
 
 ## Flowcharts

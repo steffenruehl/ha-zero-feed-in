@@ -1,0 +1,134 @@
+# Zero Feed-In ESP Watchdog
+#
+# Independent hardware watchdog for the SolarFlow 2400 AC+.
+# Monitors MQTT heartbeats from the controller and driver.
+# If either is stale for >2 minutes, sends HTTP POST directly
+# to the SolarFlow device to set outputLimit and inputLimit to 0.
+#
+# Include in your ESPHome device YAML via packages:
+#
+#   substitutions:
+#     solarflow_ip: !secret solarflow_ip
+#     solarflow_serial: !secret solarflow_serial
+#
+#   packages:
+#     zfi_watchdog: !include zfi_watchdog.yaml
+#
+# Required secrets (in your ESPHome secrets.yaml):
+#   mqtt_broker: "192.168.x.x"
+#   mqtt_user: "your_mqtt_user"
+#   mqtt_pass: "your_mqtt_password"
+#   solarflow_ip: "192.168.x.x"
+#   solarflow_serial: "HECxxxxxxxxxx"
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_user
+  password: !secret mqtt_pass
+  # Don't create duplicate HA entities — the native API handles that.
+  discovery: false
+  on_message:
+    - topic: zfi/heartbeat/controller
+      then:
+        - lambda: 'id(last_controller_hb) = millis();'
+    - topic: zfi/heartbeat/driver
+      then:
+        - lambda: 'id(last_driver_hb) = millis();'
+
+http_request:
+  useragent: esphome/zfi-watchdog
+  timeout: 5s
+
+globals:
+  - id: last_controller_hb
+    type: uint32_t
+    initial_value: '0'
+  - id: last_driver_hb
+    type: uint32_t
+    initial_value: '0'
+  - id: zfi_safe_active
+    type: bool
+    initial_value: 'false'
+  - id: zfi_http_id
+    type: int
+    initial_value: '0'
+
+binary_sensor:
+  - platform: template
+    name: "ZFI Watchdog Safe State"
+    id: zfi_safe_state_sensor
+    device_class: problem
+    lambda: 'return id(zfi_safe_active);'
+
+sensor:
+  - platform: template
+    name: "ZFI Controller Heartbeat Age"
+    unit_of_measurement: "s"
+    icon: "mdi:heart-pulse"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(last_controller_hb) == 0) return NAN;
+      return (millis() - id(last_controller_hb)) / 1000.0f;
+
+  - platform: template
+    name: "ZFI Driver Heartbeat Age"
+    unit_of_measurement: "s"
+    icon: "mdi:heart-pulse"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(last_driver_hb) == 0) return NAN;
+      return (millis() - id(last_driver_hb)) / 1000.0f;
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          const uint32_t STALE_MS = 120000;   // 2 min
+          const uint32_t GRACE_MS = 180000;   // 3 min after boot
+          uint32_t now_ms = millis();
+
+          // Don't act during startup grace period.
+          if (now_ms < GRACE_MS) return;
+
+          bool c_stale = (id(last_controller_hb) == 0)
+            || (now_ms - id(last_controller_hb) > STALE_MS);
+          bool d_stale = (id(last_driver_hb) == 0)
+            || (now_ms - id(last_driver_hb) > STALE_MS);
+
+          if (c_stale || d_stale) {
+            if (!id(zfi_safe_active)) {
+              ESP_LOGW("zfi_wd", "STALE controller=%s driver=%s -> safe state",
+                c_stale ? "yes" : "no", d_stale ? "yes" : "no");
+            }
+            id(zfi_safe_active) = true;
+            id(zfi_send_safe).execute();
+          } else {
+            if (id(zfi_safe_active)) {
+              ESP_LOGI("zfi_wd", "Heartbeats recovered — releasing safe state");
+            }
+            id(zfi_safe_active) = false;
+          }
+
+script:
+  - id: zfi_send_safe
+    then:
+      - http_request.post:
+          url: "http://${solarflow_ip}/properties/write"
+          headers:
+            Content-Type: "application/json; charset=UTF-8"
+          json: |-
+            id(zfi_http_id)++;
+            root["sn"] = "${solarflow_serial}";
+            root["id"] = id(zfi_http_id);
+            root["properties"]["outputLimit"] = 0;
+            root["properties"]["inputLimit"] = 0;
+          on_response:
+            then:
+              - lambda: |-
+                  if (status_code == 200) {
+                    ESP_LOGI("zfi_wd", "Safe state sent OK");
+                  } else {
+                    ESP_LOGW("zfi_wd", "Safe state HTTP failed: %d", status_code);
+                  }

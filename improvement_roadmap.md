@@ -171,7 +171,7 @@ clock comparison.  If age > `controller_stale_s` (default 30 s):
 
 Config: `controller_stale_s: 30` (set to `0` to disable).
 
-### 4. Watchdog (ESP32) — OPEN (MQTT heartbeats ready)
+### 4. Watchdog (ESP) — DONE
 
 **Problem**: If HA/AppDaemon dies entirely, SolarFlow continues
 executing the last command indefinitely. The MQTT watchdog
@@ -181,11 +181,11 @@ it runs inside AppDaemon and dies with it.
 **Defense layers currently in place:**
 - Layer 1: SolarFlow BMS (hardware, always active)
 - Layer 2: Driver stale-check (publishes safe sensors, see #3 above)
-- Layer 3: MQTT heartbeat publishing (ready for ESP32 consumer)
+- Layer 3: MQTT heartbeat publishing (consumed by ESP watchdog)
 - Layer 4: Watchdog heartbeat monitoring + safe state (HA notifications + 0W)
-- Layer 5: ESP32 watchdog (not yet implemented)
+- Layer 5: ESP watchdog (ESPHome, independent of HA)
 
-**MQTT heartbeats implemented**: Both controller and driver can publish
+**MQTT heartbeats implemented**: Both controller and driver publish
 ISO-8601 UTC timestamps to configurable MQTT topics on every tick:
 - `heartbeat_mqtt_topic: zfi/heartbeat/controller`
 - `heartbeat_mqtt_topic: zfi/heartbeat/driver`
@@ -199,9 +199,16 @@ when stale, dismisses on recovery.  When `output_limit_entity` and
 limits) when any entity is stale — catching both controller and driver
 failures.  Safe state is released when all entities recover.
 
-**Remaining**: ESP32 (ESPHome) running independently of HA.  Subscribes
-to MQTT heartbeat topics.  If stale for >2 minutes, sends HTTP POST
-to SolarFlow local API to set output/input to 0W.
+**ESP watchdog implemented** (`zfi_watchdog.yaml`): ESPHome config
+included via `packages:` in the existing Heizung ESP8266.  Subscribes
+to MQTT heartbeat topics via the broker.  If either heartbeat is stale
+for >2 minutes, sends HTTP POST directly to the SolarFlow's local API
+(`http://{ip}/properties/write`) to set `outputLimit` and `inputLimit`
+to 0.  This path is completely independent of HA, AppDaemon, and the
+Zendure integration — only requires the MQTT broker and the SolarFlow
+to be on the LAN.  3-minute grace period after boot suppresses false
+triggers.  Publishes `ZFI Watchdog Safe State` (binary_sensor) and
+heartbeat age sensors to HA via the native API.
 
 ### 5. Persistence — DONE
 
