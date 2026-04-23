@@ -715,6 +715,7 @@ class ControlLogic:
         self._last_ki: float = 0.0
         self._db_acc: float = 0.0
         self._prev_now: float | None = None
+        self._surplus_ema: float | None = None
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -733,6 +734,7 @@ class ControlLogic:
             "last_computed_w": self.state.last_computed_w,
             "mode": self.state.mode.name,
             "db_acc": self._db_acc,
+            "surplus_ema": self._surplus_ema,
         }
 
     def restore_from_snapshot(self, data: dict[str, object]) -> bool:
@@ -746,12 +748,16 @@ class ControlLogic:
             last_computed_w = float(data["last_computed_w"])
             mode = OperatingMode[data["mode"]]
             db_acc = float(data.get("db_acc", 0.0))
+            surplus_ema = data.get("surplus_ema")
+            if surplus_ema is not None:
+                surplus_ema = float(surplus_ema)
         except (KeyError, ValueError, TypeError):
             return False
         self.state.integral = integral
         self.state.last_computed_w = last_computed_w
         self.state.mode = mode
         self._db_acc = db_acc
+        self._surplus_ema = surplus_ema
         return True
 
     @staticmethod
@@ -795,6 +801,7 @@ class ControlLogic:
         self._last_ki = 0.0
 
         surplus = self.estimate_surplus(m)
+        self._update_surplus_ema(surplus, dt)
 
         emergency = self._check_emergency(m)
         if emergency is not None:
@@ -1011,13 +1018,28 @@ class ControlLogic:
 
         return None
 
+    def _update_surplus_ema(self, surplus: float, dt: float) -> None:
+        """Advance the surplus EMA filter.
+
+        Uses the device response time (~10 s) as the filter time constant
+        so the surplus clamp tracks the true available surplus rather than
+        chasing measurement noise from lagging battery power.
+        """
+        tau = 10.0  # seconds — matches device response latency
+        if self._surplus_ema is None:
+            self._surplus_ema = surplus
+        else:
+            alpha = dt / (tau + dt)
+            self._surplus_ema = alpha * surplus + (1.0 - alpha) * self._surplus_ema
+
     def _clamp(self, raw: float, surplus: float) -> float:
         """Enforce hard power limits and surplus cap.
 
         * Discharge is capped at ``max_discharge_w``.
-        * Charge is capped at both ``max_charge_w`` and the available
-          solar surplus (whichever is smaller), preventing the battery
-          from pulling power from the grid.
+        * Charge is capped at both ``max_charge_w`` and the filtered
+          surplus EMA (whichever is smaller), preventing the battery
+          from pulling power from the grid.  The EMA prevents the
+          clamp from oscillating when battery power lags the command.
 
         Returns:
             Clamped power value (W).
@@ -1025,7 +1047,8 @@ class ControlLogic:
         if raw > 0:
             return min(raw, self.cfg.max_discharge_w)
         elif raw < 0:
-            max_safe_charge = max(0.0, surplus)
+            filtered = self._surplus_ema if self._surplus_ema is not None else surplus
+            max_safe_charge = max(0.0, filtered)
             return max(raw, -self.cfg.max_charge_w, -max_safe_charge)
         return 0.0
 

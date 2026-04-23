@@ -438,6 +438,7 @@ def simulate_fast(
     db_acc = 0.0
     now = 0.0
     ff_ema: float | None = None  # feed-forward EMA state
+    surplus_ema: float | None = None  # surplus clamp EMA (τ=10s)
 
     # Transport delay buffer (FIFO: oldest at index 0).
     delay_d = sys_cfg.delay_steps
@@ -461,6 +462,14 @@ def simulate_fast(
         now_next = now + dt
 
         surplus = -battery_w - grid_w
+
+        # ── Surplus EMA (filter for clamp, τ=10s) ──
+        _surplus_tau = 10.0
+        _surplus_alpha = dt / (_surplus_tau + dt)
+        if surplus_ema is None:
+            surplus_ema = surplus
+        else:
+            surplus_ema = _surplus_alpha * surplus + (1.0 - _surplus_alpha) * surplus_ema
 
         # ── Emergency protection ──
         feed_in = -grid_w if grid_w < 0 else 0.0
@@ -595,7 +604,7 @@ def simulate_fast(
                 if desired_w > max_discharge_w:
                     clamped = max_discharge_w
             elif desired_w < 0:
-                max_safe_charge = surplus if surplus > 0 else 0.0
+                max_safe_charge = surplus_ema if surplus_ema > 0 else 0.0
                 limit = -max_charge_w if max_charge_w < max_safe_charge else -max_safe_charge
                 if desired_w < limit:
                     clamped = limit
