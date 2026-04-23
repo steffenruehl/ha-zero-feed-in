@@ -537,74 +537,67 @@ def simulate_fast(
             sm_discharge_last_t = 0.0
             sm_idle_last_t = 0.0
             sm_departure_since = 0.0
-            return _sm_clamp(sm_state, desired_w)
+        else:
+            # Track departure time for safety timeout.
+            if sm_departure_since == 0.0:
+                sm_departure_since = now
 
-        # Track departure time for safety timeout.
-        if sm_departure_since == 0.0:
-            sm_departure_since = now
+            # Tick only the target's accumulator.
+            can_switch = False
+            if sm_target == _SM_IDLE:
+                if sm_idle_last_t > 0.0:
+                    idt = now - sm_idle_last_t
+                    if idt > 0:
+                        sm_idle_acc_s += idt
+                sm_idle_last_t = now
+                sm_charge_last_t = 0.0
+                sm_discharge_last_t = 0.0
+                can_switch = sm_idle_acc_s >= relay_lockout_idle_s
+            elif sm_target == _SM_CHARGING:
+                if sm_charge_last_t > 0.0:
+                    cdt = now - sm_charge_last_t
+                    if cdt > 0:
+                        eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
+                        sm_charge_acc_ws += eff_w * cdt
+                sm_charge_last_t = now
+                sm_discharge_last_t = 0.0
+                sm_idle_last_t = 0.0
+                can_switch = sm_charge_acc_ws >= relay_lockout_ws
+            elif sm_target == _SM_DISCHARGING:
+                if sm_discharge_last_t > 0.0:
+                    ddt = now - sm_discharge_last_t
+                    if ddt > 0:
+                        eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
+                        sm_discharge_acc_ws += eff_w * ddt
+                sm_discharge_last_t = now
+                sm_charge_last_t = 0.0
+                sm_idle_last_t = 0.0
+                can_switch = sm_discharge_acc_ws >= relay_lockout_ws
 
-        # Tick only the target's accumulator.
-        can_switch = False
-        if sm_target == _SM_IDLE:
-            if sm_idle_last_t > 0.0:
-                idt = now - sm_idle_last_t
-                if idt > 0:
-                    sm_idle_acc_s += idt
-            sm_idle_last_t = now
-            sm_charge_last_t = 0.0
-            sm_discharge_last_t = 0.0
-            can_switch = sm_idle_acc_s >= relay_lockout_idle_s
-        elif sm_target == _SM_CHARGING:
-            if sm_charge_last_t > 0.0:
-                cdt = now - sm_charge_last_t
-                if cdt > 0:
-                    eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
-                    sm_charge_acc_ws += eff_w * cdt
-            sm_charge_last_t = now
-            sm_discharge_last_t = 0.0
-            sm_idle_last_t = 0.0
-            can_switch = sm_charge_acc_ws >= relay_lockout_ws
-        elif sm_target == _SM_DISCHARGING:
-            if sm_discharge_last_t > 0.0:
-                ddt = now - sm_discharge_last_t
-                if ddt > 0:
-                    eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
-                    sm_discharge_acc_ws += eff_w * ddt
-            sm_discharge_last_t = now
-            sm_charge_last_t = 0.0
-            sm_idle_last_t = 0.0
-            can_switch = sm_discharge_acc_ws >= relay_lockout_ws
+            # Safety cap.
+            if not can_switch and (now - sm_departure_since) >= 600.0:
+                can_switch = True
 
-        # Safety cap.
-        if not can_switch and (now - sm_departure_since) >= 600.0:
-            can_switch = True
+            if can_switch:
+                sm_state = sm_target
+                # Reset all accumulators.
+                sm_charge_acc_ws = 0.0
+                sm_discharge_acc_ws = 0.0
+                sm_idle_acc_s = 0.0
+                sm_charge_last_t = 0.0
+                sm_discharge_last_t = 0.0
+                sm_idle_last_t = 0.0
+                sm_departure_since = 0.0
+                relay_switches += 1
+                relay_locked_until = now + _RELAY_SWITCH_DELAY_S
 
-        if can_switch:
-            sm_state = sm_target
-            # Reset all accumulators.
-            sm_charge_acc_ws = 0.0
-            sm_discharge_acc_ws = 0.0
-            sm_idle_acc_s = 0.0
-            sm_charge_last_t = 0.0
-            sm_discharge_last_t = 0.0
-            sm_idle_last_t = 0.0
-            sm_departure_since = 0.0
-            relay_switches += 1
-            relay_locked_until = now + _RELAY_SWITCH_DELAY_S
-            return _sm_clamp(sm_state, desired_w)
-
-        # Not ready — stay in current state.
-        return _sm_clamp(sm_state, desired_w)
-
-    def _sm_clamp(state: int, desired_w: float) -> float:
-        """Clamp desired_w to the current relay state constraints."""
-        if state == _SM_IDLE:
+        # Clamp to current relay state (inlined _sm_clamp).
+        if sm_state == _SM_IDLE:
             return 0.0
-        if state == _SM_CHARGING:
+        if sm_state == _SM_CHARGING:
             return min(-min_active_power_w, desired_w)
-        if state == _SM_DISCHARGING:
-            return max(min_active_power_w, desired_w)
-        return 0.0
+        # DISCHARGING
+        return max(min_active_power_w, desired_w)
 
     for k in range(n):
         # ── Grid measurement ──
