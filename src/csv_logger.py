@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import csv
 import io
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 

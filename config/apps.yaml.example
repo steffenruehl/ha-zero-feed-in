@@ -50,12 +50,6 @@ zero_feed_in_controller:
   # Battery power sensor (W).  Convention: +discharge / -charge.
   battery_power_sensor: sensor.YOUR_BATTERY_POWER_SENSOR
 
-  # Battery sensor mode: "signed" (default) or "unsigned"
-  #   signed   — sensor already has correct sign (+discharge / -charge)
-  #   unsigned — sensor is always positive; sign derived from ac_mode_entity
-  battery_sensor_mode: signed
-  # ac_mode_entity: select.YOUR_AC_MODE_ENTITY   # required only for unsigned mode
-
   # Direction switches (optional).  Create as input_boolean helpers in HA.
   # Omit or comment out if you don't need manual charge/discharge control.
   # charge_switch: input_boolean.zfi_charge_enabled
@@ -80,19 +74,19 @@ zero_feed_in_controller:
   # Four-quadrant PI gains.  Tuned for Zendure SolarFlow 2400 AC+ step response.
   #
   #   Quadrant          Physical action      T1     Kp    Ki
-  #   discharge_up      increase discharge   5.0s   0.25  0.025
-  #   discharge_down    decrease discharge   3.5s   0.35  0.025
-  #   charge_up         increase charge      3.5s   0.17  0.036
-  #   charge_down       decrease charge      3.2s   0.23  0.036
+  #   discharge_up      increase discharge   5.0s   0.50  0.025
+  #   discharge_down    decrease discharge   3.5s   0.71  0.051
+  #   charge_up         increase charge      7.5s   0.33  0.011
+  #   charge_down       decrease charge      5.5s   0.45  0.021
   #
-  kp_discharge_up: 0.25
-  kp_discharge_down: 0.35
-  kp_charge_up: 0.17
-  kp_charge_down: 0.23
+  kp_discharge_up: 0.50
+  kp_discharge_down: 0.71
+  kp_charge_up: 0.33
+  kp_charge_down: 0.45
   ki_discharge_up: 0.025
-  ki_discharge_down: 0.025
-  ki_charge_up: 0.036
-  ki_charge_down: 0.036
+  ki_discharge_down: 0.051
+  ki_charge_up: 0.011
+  ki_charge_down: 0.021
 
   # Feed-forward (optional).  Set ff_enabled: false to disable entirely.
   # Each source tracks a power sensor and applies sign × gain × delta.
@@ -112,10 +106,10 @@ zero_feed_in_controller:
   #     sign: 1.0
 
   # Power limits
-  max_output: 1200             # max discharge power (W)
-  max_charge: 800              # max charge power (W)
+  max_output: 800              # max discharge power (W)
+  max_charge: 2400             # max charge power (W)
   min_soc: 10                  # hard floor SOC (%), dynamic_min_soc can only raise this
-  max_soc: 90                  # hard ceiling SOC (%)
+  max_soc: 100                 # hard ceiling SOC (%)
 
   # Protection
   max_feed_in: 800             # emergency brake: cap output if feed-in exceeds (W)
@@ -150,7 +144,7 @@ zendure_solarflow_driver:
 
   # ══════ TUNING ════════════════════════════════════════════════════════════
 
-  watchdog_s: 5                # re-apply command interval (s)
+  watchdog_s: 15               # re-apply command interval (s)
   controller_stale_s: 30       # max age of desired_power before safe-state (s), 0=disabled
   relay_lockout_ws: 10000      # energy accumulator threshold for direction change (W·s)
   relay_lockout_cutoff_w: 25   # floor on power used in accumulator (W)

@@ -337,6 +337,191 @@ Three layers:
 
 ---
 
+## Architecture & Design Decisions
+
+### Why two apps (controller + driver)?
+
+- **Controller** handles PI control, mode switching, surplus estimation — reusable for any battery
+- **Driver** handles Zendure-specific protocol: AC mode relay, power rounding, lockout timing
+- Controller publishes `sensor.zfi_desired_power` (signed W, +discharge/-charge)
+- Driver polls this sensor every 2 s and translates to device commands
+- Separation allows swapping the driver for other batteries without touching control logic
+
+### Why AppDaemon (not HA Blueprint)?
+
+- PI controller with state, mode machine, guards, and lockouts doesn't fit YAML templates
+- AppDaemon gives real Python: dataclasses, enums, testable methods, proper logging
+
+### Why two actuators (not one)?
+
+- `setOutputLimit`: discharge power (W), feeds into house
+- `setInputLimit`: AC charge power (W), charges battery
+- `acMode`: select entity, must be "Input mode" before charging, "Output mode" before discharging
+- All MQTT entities, actuators are write-only from the driver's perspective
+- `setDeviceAutomationInOutLimit` exists (single bidirectional entity) but availability depends on firmware
+
+### Why sensors are read-only, actuators write-only
+
+- Number entities show *commanded* value, not actual output
+- PI uses its own state (`last_computed_w`), surplus uses `battery_power_sensor`
+- Only external sensors needed by controller: `grid_power`, `soc`, `battery_power`
+
+### AC Mode Management in Driver
+
+- Zendure MQTT integration overwrites the AC mode entity with device reports faster than the physical relay switches (10-15 s)
+- Cannot use entity state to suppress redundant sends — it always shows old mode
+- Driver tracks its own intent (`last_set_relay`) and only re-sends after 30 s timeout
+- Relay lockout uses driver's intent tracking, not entity state
+- Power limits (outputLimit, inputLimit) are always sent when values change — no gating on device mode confirmation
+
+### Key Design Principles
+
+1. **Controller knows nothing about hardware.** All device specifics live in the driver. Controller outputs a signed watt value.
+2. **ControlLogic has no HA imports.** Testable with plain dataclasses. The HA adapter is a thin wrapper.
+3. **Surplus estimation uses measured battery power**, not reconstructed from last command. Eliminates dry-run drift and device lag issues.
+4. **"Never charge from grid" is a guard, not a mode.** Surplus ≤ 0 → charge blocked.
+5. **Relay protection lives in the driver.** The controller can freely request any power level. The driver's state machine decides when and how to execute it.
+6. **Forecast is conservative, not optimizing.** One threshold (1.5 kWh) switches between two min_soc values (10% / 30%). No complex optimization.
+7. **D-term and high-frequency FF don't work with current sensors.** Grid and PV noise levels are too high for derivative-based control.
+
+---
+
+## File Structure
+
+```
+src/
+├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
+├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
+├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
+├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
+├── csv_logger.py                 # shared daily-rotating CSV file logger
+└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
+run/                              # runtime state (git-ignored, auto-created)
+├── zfi_controller_state.json
+├── zfi_driver_state.json
+└── relay_switch_count.json
+config/
+├── apps.yaml.example             # documented configuration template
+├── apps.yaml                      # your configuration (git-ignored)
+├── secrets.yaml.example          # template for device credentials
+└── lovelace_*.yaml               # Lovelace dashboard YAML files
+tests/
+└── test_*.py                     # 274 unit tests covering all modules
+docs/
+├── zero_feed_in_docs.md          # this file (comprehensive technical doc)
+└── DASHBOARDS.md                 # Lovelace dashboard setup guide
+```
+
+---
+
+## Code Organization
+
+### Controller (`src/zero_feed_in_controller.py`)
+
+```
+Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX, EMERGENCY_SAFETY_MARGIN_W,
+            CONTROLLER_CSV_COLUMNS
+
+Enums:      OperatingMode (CHARGING, DISCHARGING)
+
+Dataclasses:
+  Config          — typed config from apps.yaml
+  FeedForwardSource — entity, gain, sign, previous_w
+  Measurement     — grid_power_w, soc_pct, battery_power_w, ff_readings, switch states, relay_locked, dynamic_min_soc_pct
+  ControlOutput   — desired_power_w, p/i/ff terms, reason
+  ControllerState — integral, last_computed_w, mode, charge_pending_since
+
+PIController:     — anti-windup back-calculation, gains supplied per call (PIGains)
+  PIGains:          — Kp/Ki pair for one quadrant
+  PIGainSet:        — four quadrant gain sets with select(mode, error)
+
+FeedForward:      — multi-source feed-forward compensation (deadband on sum)
+
+ControlLogic:     — pure-computation control logic (no HA dependency)
+  seed()                        — initialise from battery_power_sensor
+  compute()                     — emergency → mode → PI+FF → guards → clamp → relay-lock freeze
+  state_snapshot()              — return dict of integral/mode/last_computed_w/db_acc
+  restore_from_snapshot()       — restore state from dict (returns bool)
+
+ZeroFeedInController(hass.Hass): — thin HA adapter
+  initialize()                  — config, seed, restore state, CsvLogger, schedule
+  terminate()                   — save state to JSON on shutdown
+  _on_tick()                    — read → compute → log → publish → csv → periodic save
+```
+
+### Driver (`src/zendure_solarflow_driver.py`)
+
+```
+Constants:  DIRECTION_THRESHOLD_W, ROUNDING_STEP_W, AC_MODE_*,
+            AC_MODE_RETRY_S, RELAY_SAFETY_TIMEOUT_S, MIN_ACTIVE_POWER_W
+
+Enums:      RelayDirection (CHARGE, IDLE, DISCHARGE)
+            RelayState     (IDLE, CHARGING, DISCHARGING)
+
+Dataclasses:
+  AdaptiveLockout — energy integrator for relay lockout (pure computation)
+  Config          — desired_power_sensor, device entities, lockout settings
+  DriverState     — last_sent limits, relay tracking
+
+RelayStateMachine:  — guards relay transitions (pure computation)
+  seed()            — set initial state from device
+  update()          — process desired power, return allowed power
+  state_snapshot()  — return dict of SM state
+  restore_from_snapshot() — restore SM state from dict (returns bool)
+
+ZendureSolarFlowDriver(_HASS_BASE):
+  initialize()              — config, seed, restore state, schedule (2 s interval)
+  terminate()               — save state to JSON on shutdown
+  _on_tick()                — read desired → SM update → round → send → save on transition
+  _send_limits()            — AC mode + power limits
+```
+
+---
+
+## Testing
+
+### Test Coverage
+
+274 unit tests covering:
+- **Controller** (103 tests): ControlLogic, PIController, FeedForward, state persistence
+- **Driver** (128 tests): RelayStateMachine, AdaptiveLockout, command sequencing
+- **PV Forecast** (17 tests): sensor reading, dynamic min SOC logic
+- **CSV Logger** (8 tests): file rotation, CSV formatting
+- **MQTT Watchdog** (18 tests): heartbeat monitoring, safe state logic
+
+All tests pass. Run with:
+```bash
+pytest tests/
+```
+
+### Testing Approach
+
+1. **Dry run** (`dry_run: true`): controller computes, publishes sensors, logs — sends nothing. SOC can be faked via `input_number`. Grid sensor should be real.
+2. **Manual output**: set SolarFlow output manually while dry run is active. Controller sees real physics and shows what it would do.
+3. **Ramp up**: `dry_run: false`, start with `max_output: 200`, increase over days.
+4. **Monitor**: `sensor.zfi_*` entities in HA history graphs.
+
+---
+
+## Measured Device Timing
+
+Relay closed, step response settle times:
+
+| Quadrant | Physical action | T1 (s) |
+|---|---|---|
+| discharge_up | increase discharge | 5.0 |
+| discharge_down | decrease discharge | 3.5 |
+| charge_up | increase charge | 7.5 |
+| charge_down | decrease charge | 5.5 |
+
+Relay switching:
+- Charge relay on: 8s, off: 1s
+- Discharge relay on: 3-6s, off: 4s
+
+**Key finding**: no slew rate behavior. Settle time does not scale with step size. The device has a processing delay, not a ramp limit.
+
+---
+
 ## Flowcharts
 
 ### Main Control Loop (Controller)
@@ -903,6 +1088,15 @@ PI wants to charge → guard: SOC ≥ max → idle
 ## Known Limitations
 
 - **Device response time**: 10–15 s (not 2–4 s as Zendure docs suggest)
-- **Flash writes**: `setOutputLimit`/`setInputLimit` may write to device flash
+- **Flash writes**: `setOutputLimit`/`setInputLimit` may write to device flash (mitigated by `smartMode` RAM lock)
 - **Single phase**: SolarFlow feeds one phase; three-phase balancing at meter works
 - **Single instance only**: no multi-device HEMS support
+
+---
+
+## Related Projects & References
+
+- **alkly.de Blueprint**: commercial HA blueprint for SolarFlow 2400 Pro zero feed-in. Inspiration for this project. Uses Jinja2 templates, not PI control.
+- **solarflow-control** (GitHub: reinhard-brandstaedter): Python tool for DC-coupled SolarFlow hubs + OpenDTU. More mature, but targets Hub 2000/AIO with Hoymiles WR, not AC-coupled storage.
+- **ioBroker zendure-solarflow adapter**: full-featured adapter with `setDeviceAutomationInOutLimit`, cloud relay, and PI controller script. The PI script for 2400 AC by forum user "schimi" was a reference for the PI approach.
+- **z-master42/solarflow**: HA MQTT YAML config for SolarFlow entities. Useful reference for MQTT topic structure.

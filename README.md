@@ -52,124 +52,42 @@ Five apps with clear separation of concerns:
 
 ## Installation
 
-### 1. Install AppDaemon
+### Quick Start (3 steps)
+
+**1. Install AppDaemon**
 
 Home Assistant → Settings → Add-ons → Add-on Store → **AppDaemon** → Install → Start
 
-### 2. Clone the Repository
-
-SSH into your Home Assistant and clone into the AppDaemon apps directory:
+**2. Clone and Configure**
 
 ```bash
 cd /root/addon_configs/a0d7b954_appdaemon/apps
 git clone https://github.com/steffenruehl/ha-zero-feed-in.git zero_feed_in
+cd zero_feed_in
+cp config/apps.yaml.example config/apps.yaml
 ```
 
-### 3. Configure
+Edit `config/apps.yaml`:
+- Fill in **grid_power_sensor**, **soc_sensor**, **battery_power_sensor** (controller)
+- Fill in **output_limit_entity**, **input_limit_entity**, **ac_mode_entity** (driver)
+- Fill in **forecast_entities** if using PV forecast
+- Add device secrets to AppDaemon's `secrets.yaml`
+
+**3. Test and Deploy**
 
 ```bash
-cp zero_feed_in/config/apps.yaml.example zero_feed_in/config/apps.yaml
+# Dry run: no device commands, just monitoring
+Set dry_run: true in config/apps.yaml
+Restart AppDaemon, check sensor.zfi_* entities in Home Assistant
+
+# Go live
+Set dry_run: false
+Start with max_output: 200 and increase over days
 ```
 
-Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections:
-- Your grid power, SOC, and battery power sensor entity IDs
-- Your Zendure SolarFlow entity IDs (outputLimit, inputLimit, acMode)
-- Your Forecast.Solar entity IDs
-
-Add secrets to your AppDaemon `secrets.yaml` (see `config/secrets.yaml.example`):
-```yaml
-solarflow_ip:     "192.168.x.x"
-solarflow_serial: "XXXXXXXXXXX"
-mqtt_broker_ip:   "192.168.x.x"
-mqtt_username:    "your_mqtt_user"
-mqtt_password:    "your_mqtt_password"
-```
-
-### 4. Start in Dry Run
-
-Set `dry_run: true` in `apps.yaml` (the anchor at the top applies to all apps).
-Restart AppDaemon. Check that `sensor.zfi_*` entities appear in HA.
-
-### 5. Go Live
-
-Set `dry_run: false` and restart AppDaemon.
-Start with `max_output: 200` and increase over several days.
+For detailed configuration, tuning, and troubleshooting, see the docs.
 
 ## Configuration
-
-### Controller
-
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `target_grid_power` | 30 W | Discharge target (small grid draw as buffer) |
-| `charge_target_power` | 0 W | Charge target (absorb all surplus) |
-| `kp_discharge_up` / `kp_discharge_down` | 0.25 / 0.35 | Proportional gain: increase / decrease discharge |
-| `kp_charge_up` / `kp_charge_down` | 0.17 / 0.23 | Proportional gain: increase / decrease charge |
-| `ki_discharge_up` / `ki_discharge_down` | 0.025 / 0.025 | Integral gain: increase / decrease discharge |
-| `ki_charge_up` / `ki_charge_down` | 0.036 / 0.036 | Integral gain: increase / decrease charge |
-| `deadband` | 25 W | Error range where PI freezes |
-| `interval` | 5 s | Control cycle interval |
-| `max_output` | 800 W | Maximum discharge power |
-| `max_charge` | 2400 W | Maximum charge power |
-| `min_soc` / `max_soc` | 10% / 100% | SOC limits |
-| `mode_hysteresis` | 50 W | Surplus band for mode switching |
-| `charge_confirm` | 15 s | Seconds surplus must hold before charging |
-| `max_feed_in` | 800 W | Emergency curtailment threshold |
-| `ff_enabled` | false | Enable multi-source feed-forward |
-| `ff_deadband` | 30 W | Ignore total FF term below this magnitude |
-| `ff_filter_tau_s` | 30 s | EMA time constant for FF derivative filter |
-
-### Driver
-
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `watchdog_s` | 5 s | Re-apply command interval |
-| `relay_lockout_ws` | 10000 W·s | Energy accumulator threshold for direction change |
-| `relay_lockout_cutoff_w` | 25 W | Floor on power in accumulator (caps max wait) |
-| `relay_lockout_idle_s` | 90 s | Holdoff before switching to idle |
-| `relay_sm_enabled` | true | Enable/disable relay state machine |
-| `min_active_power_w` | 25 W | Minimum power floor when relay is in an active state |
-
-### Watchdog
-
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `watch_entity` | — | HA entity to monitor (goes unavailable when MQTT drops) |
-| `unavailable_duration_s` | 120 s | Trigger reconnect after this many seconds unavailable |
-| `startup_delay_s` | 30 s | Wait after HA start before sending reconnect (lets Mosquitto start first) |
-
-See [config/apps.yaml.example](config/apps.yaml.example) for the full annotated configuration.
-
-## Published HA Sensors
-
-Both apps publish `sensor.zfi_*` entities every cycle:
-
-Always published:
-
-| Sensor | Source | Description |
-| --- | --- | --- |
-| `zfi_desired_power` | Controller | Signed desired power (W): +discharge, -charge |
-| `zfi_mode` | Controller | Operating regime (charging/discharging) |
-| `zfi_device_output` | Driver | Signed power sent to device (W) |
-| `zfi_discharge_limit` | Driver | outputLimit sent (W) |
-| `zfi_charge_limit` | Driver | inputLimit sent (W) |
-| `zfi_relay` | Driver | Physical relay state |
-| `zfi_relay_locked` | Driver | `true` while SM is clamping or relay is physically switching |
-
-Published when `debug: true`:
-
-| Sensor | Source | Description |
-| --- | --- | --- |
-| `zfi_surplus` | Controller | Estimated solar surplus (W) |
-| `zfi_battery_power` | Controller | Actual battery power (W) |
-| `zfi_error` | Controller | Regulation error (W) |
-| `zfi_p_term` / `zfi_i_term` / `zfi_ff` | Controller | PI and feed-forward components (W) |
-| `zfi_ff_pv_raw` / `zfi_ff_pv_ema` / `zfi_ff_pv_contrib` | Controller | PV FF: live reading, EMA state, contribution pre-deadband (W) |
-| `zfi_ff_others_contrib` | Controller | Non-PV load sources FF contribution pre-deadband (W) |
-| `zfi_integral` | Controller | PI integral accumulator (W) |
-| `zfi_reason` | Controller | Human-readable decision reason |
-| `zfi_relay_sm_state` / `zfi_relay_sm_pending` | Driver | Relay state machine state and pending target |
-| `zfi_relay_sm_lockout_pct` | Driver | Transition progress (%) |
 
 ## Lovelace Dashboards
 
@@ -188,9 +106,17 @@ See [docs/zero_feed_in_docs.md#lovelace-dashboards](docs/zero_feed_in_docs.md#lo
 
 ## Documentation
 
-- [docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md) — Full technical documentation with flowcharts and tuning guide
-- [docs/DASHBOARDS.md](docs/DASHBOARDS.md) — Lovelace dashboard setup, signal descriptions, and troubleshooting
-- [docs/development_context.md](docs/development_context.md) — Architecture decisions, known issues, and development history
+- **[docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md)** — Complete technical documentation:
+  - System architecture and design decisions
+  - Controller and driver concepts
+  - PI controller tuning and feed-forward control
+  - Protection mechanisms (SOC, grid-charge, relay switching)
+  - Configuration reference and published sensors
+  - Flowcharts, example scenarios, and troubleshooting guide
+
+- **[docs/DASHBOARDS.md](docs/DASHBOARDS.md)** — Lovelace dashboard setup:
+  - Pre-built dashboards for monitoring and debugging
+  - Dashboard installation and entity ID customization
 
 ## Hardware
 
