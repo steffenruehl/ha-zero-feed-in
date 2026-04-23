@@ -16,7 +16,9 @@ from pathlib import Path
 
 from tools.optimize_gains import (
     BOUNDS,
+    IDENT_DT_S,
     PARAM_NAMES,
+    PlantModel,
     SimResult,
     SystemConfig,
     TraceArrays,
@@ -702,3 +704,300 @@ class TestBounds:
             assert lo <= DEFAULT_PARAMS[i] <= hi, (
                 f"{PARAM_NAMES[i]}: {DEFAULT_PARAMS[i]} not in [{lo}, {hi}]"
             )
+
+
+# ═══════════════════════════════════════════════════════════
+#  PlantModel dt-aware discretisation
+# ═══════════════════════════════════════════════════════════
+
+
+class TestPlantModel:
+    """Verify the dt-aware PlantModel."""
+
+    def test_nominal_dt_matches_original(self) -> None:
+        """At dt=IDENT_DT_S (5s), step() reproduces a*x + b*u + c exactly."""
+        a, b, c = PLANT_ABC
+        pm = PlantModel(a, b, c)
+        pm.reset(100.0)
+        out = pm.step(200.0, dt=IDENT_DT_S)
+        expected = a * 100.0 + b * 200.0 + c
+        assert out == pytest.approx(expected, rel=1e-10)
+
+    def test_default_dt_is_nominal(self) -> None:
+        """step() without explicit dt uses IDENT_DT_S."""
+        pm1 = PlantModel(*PLANT_ABC)
+        pm2 = PlantModel(*PLANT_ABC)
+        pm1.reset(50.0)
+        pm2.reset(50.0)
+        out1 = pm1.step(300.0)  # default dt
+        out2 = pm2.step(300.0, dt=IDENT_DT_S)
+        assert out1 == pytest.approx(out2, rel=1e-12)
+
+    def test_double_dt_differs(self) -> None:
+        """dt=10s should give a different result than dt=5s."""
+        pm5 = PlantModel(*PLANT_ABC)
+        pm10 = PlantModel(*PLANT_ABC)
+        pm5.reset(100.0)
+        pm10.reset(100.0)
+        out5 = pm5.step(200.0, dt=5.0)
+        out10 = pm10.step(200.0, dt=10.0)
+        assert out5 != pytest.approx(out10, abs=0.1)
+
+    def test_two_5s_steps_match_one_10s_step(self) -> None:
+        """Two consecutive 5s steps with constant input ≈ one 10s step."""
+        pm_2x5 = PlantModel(*PLANT_ABC)
+        pm_1x10 = PlantModel(*PLANT_ABC)
+        pm_2x5.reset(100.0)
+        pm_1x10.reset(100.0)
+        pm_2x5.step(200.0, dt=5.0)
+        out_2x5 = pm_2x5.step(200.0, dt=5.0)
+        out_1x10 = pm_1x10.step(200.0, dt=10.0)
+        assert out_2x5 == pytest.approx(out_1x10, rel=1e-6)
+
+    def test_continuous_params_derived_correctly(self) -> None:
+        """tau, dc_gain, c_cont match analytical formulas."""
+        a, b, c = PLANT_ABC
+        pm = PlantModel(a, b, c)
+        assert pm.tau == pytest.approx(-IDENT_DT_S / np.log(a), rel=1e-10)
+        assert pm.dc_gain == pytest.approx(b / (1 - a), rel=1e-10)
+        assert pm.c_cont == pytest.approx(c / (1 - a), rel=1e-10)
+
+    def test_longer_dt_approaches_steady_state_faster(self) -> None:
+        """With larger dt, the plant should reach steady state in fewer steps."""
+        desired = 200.0
+        pm_fast = PlantModel(*PLANT_ABC)
+        pm_slow = PlantModel(*PLANT_ABC)
+        # 10 steps at 10s vs 10 steps at 5s, same input
+        for _ in range(10):
+            pm_fast.step(desired, dt=10.0)
+            pm_slow.step(desired, dt=5.0)
+        # Steady state = K * desired + c_cont
+        ss = pm_fast.dc_gain * desired + pm_fast.c_cont
+        # pm_fast should be closer to steady state
+        err_fast = abs(pm_fast.battery_w - ss)
+        err_slow = abs(pm_slow.battery_w - ss)
+        assert err_fast < err_slow
+
+    def test_zero_dt_holds_state(self) -> None:
+        """dt=0 means no evolution — state stays the same."""
+        pm = PlantModel(*PLANT_ABC)
+        pm.reset(150.0)
+        out = pm.step(999.0, dt=0.0)
+        assert out == pytest.approx(150.0, abs=1e-10)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Jitter parity: variable dt in fast vs full sim
+# ═══════════════════════════════════════════════════════════
+
+
+class TestJitterParity:
+    """Verify fast and full sims stay in parity with timing jitter."""
+
+    def test_realistic_jitter(self) -> None:
+        """Gaussian jitter (mean=5s, std=0.5s) preserves parity."""
+        rng = np.random.RandomState(42)
+        n = 200
+        dt = np.clip(rng.normal(5.0, 0.5, n), 3.0, 8.0).tolist()
+        traces = make_traces(
+            disturbance=[200.0] * n,
+            soc=[50.0] * n,
+            dt=dt,
+        )
+        ta = make_trace_arrays(traces)
+        full = _simulate_full(DEFAULT_PARAMS, PLANT_ABC, traces, DEFAULT_SYS_CFG)
+        fast = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta, DEFAULT_SYS_CFG)
+        assert_results_match(full, fast, label="realistic_jitter")
+
+    def test_large_gap_parity(self) -> None:
+        """A 15s gap (e.g. missed ticks) preserves parity."""
+        n = 100
+        dt = [5.0] * 40 + [15.0] * 5 + [5.0] * 55
+        traces = make_traces(
+            disturbance=[150.0] * n,
+            soc=[50.0] * n,
+            dt=dt,
+        )
+        ta = make_trace_arrays(traces)
+        full = _simulate_full(DEFAULT_PARAMS, PLANT_ABC, traces, DEFAULT_SYS_CFG)
+        fast = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta, DEFAULT_SYS_CFG)
+        assert_results_match(full, fast, label="large_gap")
+
+    def test_jitter_changes_result_vs_constant_dt(self) -> None:
+        """Variable dt should produce different metrics than constant dt."""
+        n = 200
+        disturbance = [200.0] * n
+        soc = [50.0] * n
+
+        traces_const = make_traces(disturbance, soc, dt=[5.0] * n)
+        ta_const = make_trace_arrays(traces_const)
+        r_const = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta_const, DEFAULT_SYS_CFG)
+
+        rng = np.random.RandomState(99)
+        dt_jitter = np.clip(rng.normal(5.0, 1.5, n), 2.0, 12.0).tolist()
+        traces_jitter = make_traces(disturbance, soc, dt=dt_jitter)
+        ta_jitter = make_trace_arrays(traces_jitter)
+        r_jitter = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta_jitter, DEFAULT_SYS_CFG)
+
+        # Results should differ because the plant model responds to dt
+        assert r_const.feed_in_energy_wh != pytest.approx(
+            r_jitter.feed_in_energy_wh, abs=0.01,
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+#  Transport delay
+# ═══════════════════════════════════════════════════════════
+
+
+DELAY_SYS_CFG = SystemConfig(
+    max_discharge_w=1200, max_charge_w=800, max_feed_in_w=800,
+    min_soc_pct=15, max_soc_pct=85,
+    discharge_target_w=30, charge_target_w=0,
+    mode_hysteresis_w=50, charge_confirm_s=20,
+    deadband_leak_ws=250, interval_s=5,
+    delay_steps=2,
+)
+
+
+class TestPlantModelDelay:
+    """Verify PlantModel transport delay buffer."""
+
+    def test_delay_0_is_immediate(self) -> None:
+        """delay_steps=0: plant sees desired immediately."""
+        pm = PlantModel(*PLANT_ABC, delay_steps=0)
+        pm.reset(0.0)
+        out = pm.step(200.0)
+        # Should change from 0 immediately
+        assert out != pytest.approx(0.0, abs=0.1)
+
+    def test_delay_2_holds_for_2_steps(self) -> None:
+        """delay_steps=2: first two steps ignore the new desired."""
+        pm = PlantModel(*PLANT_ABC, delay_steps=2)
+        pm.reset(0.0)
+        # Step 1: buffer has [0, 0]; desired=200 queued; plant uses 0
+        out1 = pm.step(200.0)
+        # Step 2: buffer has [0, 200]; plant uses 0
+        out2 = pm.step(200.0)
+        # Step 3: buffer has [200, 200]; plant uses 200
+        out3 = pm.step(200.0)
+
+        # First two steps: plant only sees effective=0 (bias c only)
+        assert abs(out1) < 5.0  # close to c_cont*(1-alpha) term only
+        assert abs(out2) < 5.0
+        # Third step: plant finally sees 200
+        assert out3 > 10.0
+
+    def test_delay_buffer_resets(self) -> None:
+        """reset() clears the delay buffer."""
+        pm = PlantModel(*PLANT_ABC, delay_steps=2)
+        pm.step(500.0)
+        pm.step(500.0)
+        pm.reset(0.0)
+        # After reset, buffer should be [0, 0] again
+        out = pm.step(200.0)
+        assert abs(out) < 5.0  # still buffered
+
+
+class TestTransportDelayParity:
+    """Verify fast and full sims match with transport delay."""
+
+    @pytest.mark.parametrize("delay", [1, 2, 3])
+    def test_delay_parity(self, delay: int) -> None:
+        """Fast and full paths produce identical results with delay."""
+        n = 200
+        cfg = SystemConfig(
+            max_discharge_w=1200, max_charge_w=800, max_feed_in_w=800,
+            min_soc_pct=15, max_soc_pct=85,
+            discharge_target_w=30, charge_target_w=0,
+            mode_hysteresis_w=50, charge_confirm_s=20,
+            deadband_leak_ws=250, interval_s=5,
+            delay_steps=delay,
+        )
+        traces = make_traces(
+            disturbance=[200.0] * n,
+            soc=[50.0] * n,
+        )
+        ta = make_trace_arrays(traces)
+        full = _simulate_full(DEFAULT_PARAMS, PLANT_ABC, traces, cfg)
+        fast = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta, cfg)
+        assert_results_match(full, fast, label=f"delay_{delay}")
+
+    def test_delay_increases_feed_in(self) -> None:
+        """Transport delay should increase feed-in compared to no delay.
+
+        With delay, the battery responds later to controller commands,
+        causing more overshoot and thus more feed-in.
+        """
+        n = 200
+        traces = make_traces(
+            disturbance=[200.0] * 50 + [-200.0] * 50 + [200.0] * 100,
+            soc=[50.0] * n,
+        )
+        ta = make_trace_arrays(traces)
+
+        cfg_no_delay = SystemConfig(
+            max_discharge_w=1200, max_charge_w=800, max_feed_in_w=800,
+            min_soc_pct=15, max_soc_pct=85,
+            discharge_target_w=30, charge_target_w=0,
+            mode_hysteresis_w=50, charge_confirm_s=20,
+            deadband_leak_ws=250, interval_s=5,
+            delay_steps=0,
+        )
+        r_no_delay = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta, cfg_no_delay)
+
+        cfg_delay = SystemConfig(
+            max_discharge_w=1200, max_charge_w=800, max_feed_in_w=800,
+            min_soc_pct=15, max_soc_pct=85,
+            discharge_target_w=30, charge_target_w=0,
+            mode_hysteresis_w=50, charge_confirm_s=20,
+            deadband_leak_ws=250, interval_s=5,
+            delay_steps=2,
+        )
+        r_delay = simulate_fast(DEFAULT_PARAMS, PLANT_ABC, ta, cfg_delay)
+
+        # Delay should cause worse control performance
+        assert r_delay.iae > r_no_delay.iae
+
+    def test_delay_changes_optimal_kp(self) -> None:
+        """Optimal Kp should differ when transport delay is modeled.
+
+        Without delay the optimizer may pick gains that don't account
+        for the command-to-effect latency.  Adding delay changes
+        the cost landscape, yielding different gains.
+        """
+        n = 300
+        traces = make_traces(
+            disturbance=[500.0] * 50 + [100.0] * 100 + [500.0] * 150,
+            soc=[50.0] * n,
+        )
+        ta = make_trace_arrays(traces)
+
+        kp_values = [0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 1.00]
+
+        def best_kp(delay_steps: int) -> float:
+            """Return the Kp that minimizes IAE for the given delay."""
+            cfg = SystemConfig(
+                max_discharge_w=1200, max_charge_w=800, max_feed_in_w=800,
+                min_soc_pct=15, max_soc_pct=85,
+                discharge_target_w=30, charge_target_w=0,
+                mode_hysteresis_w=50, charge_confirm_s=20,
+                deadband_leak_ws=250, interval_s=5,
+                delay_steps=delay_steps,
+            )
+            best, best_iae = kp_values[0], float("inf")
+            for kp in kp_values:
+                params = DEFAULT_PARAMS.copy()
+                params[0] = kp
+                params[1] = kp
+                r = simulate_fast(params, PLANT_ABC, ta, cfg)
+                if r.iae < best_iae:
+                    best_iae = r.iae
+                    best = kp
+            return best
+
+        kp_no_delay = best_kp(0)
+        kp_delay = best_kp(3)
+
+        # Delay should change the optimal gains
+        assert kp_delay != kp_no_delay

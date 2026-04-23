@@ -44,10 +44,15 @@ def load_logs(paths: list[Path]) -> pd.DataFrame:
 
 
 def identify_plant(df: pd.DataFrame) -> dict:
-    """Fit batt[k] = a * batt[k-1] + b * desired[k] + c via least squares.
+    """Fit batt[k] = a * batt[k-1] + b * desired[k-d] + c via least squares.
 
-    Only uses rows where the controller is active (desired != 0) and the
-    tick interval is close to nominal (4-6 s) to avoid transient artefacts.
+    Tries delay d = 0, 1, 2, 3 steps and picks the delay with the
+    highest R².  Only uses rows where the controller is active
+    (desired != 0) and the tick interval is close to nominal (4-6 s)
+    to avoid transient artefacts.
+
+    The fitted delay accounts for the device's command-to-effect
+    transport delay (~10-15 s for the Zendure SolarFlow).
     """
     df = df.copy()
     df["dt"] = df["timestamp"].diff().dt.total_seconds()
@@ -58,36 +63,80 @@ def identify_plant(df: pd.DataFrame) -> dict:
         & df["desired_power_w"].abs().gt(10)
         & df["batt_prev"].notna()
     )
-    active = df.loc[mask]
-    if len(active) < 100:
-        print(f"WARNING: only {len(active)} active rows — model may be unreliable", file=sys.stderr)
 
-    X = np.column_stack([
-        active["batt_prev"].values,
-        active["desired_power_w"].values,
-        np.ones(len(active)),
-    ])
-    y = active["battery_power_w"].values
-    coeffs, residuals, _, _ = np.linalg.lstsq(X, y, rcond=None)
-    a, b, c = coeffs
+    best: dict | None = None
+    best_r2 = -1.0
 
-    # Goodness of fit
-    y_pred = X @ coeffs
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r_squared = 1 - ss_res / ss_tot
+    for delay in range(4):  # d = 0, 1, 2, 3
+        df[f"desired_d{delay}"] = df["desired_power_w"].shift(delay)
+        delay_mask = mask & df[f"desired_d{delay}"].notna()
+        active = df.loc[delay_mask]
+        if len(active) < 100:
+            continue
 
+        X = np.column_stack([
+            active["batt_prev"].values,
+            active[f"desired_d{delay}"].values,
+            np.ones(len(active)),
+        ])
+        y = active["battery_power_w"].values
+        coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        a, b, c = coeffs
+
+        y_pred = X @ coeffs
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        if r_squared > best_r2:
+            best_r2 = r_squared
+            best = {"a": a, "b": b, "c": c, "delay": delay,
+                    "r_squared": r_squared, "n_samples": len(active)}
+
+    if best is None:
+        print("WARNING: insufficient active rows for any delay — model unreliable",
+              file=sys.stderr)
+        best = {"a": 0.0, "b": 0.0, "c": 0.0, "delay": 0,
+                "r_squared": 0.0, "n_samples": 0}
+
+    a, b, c = best["a"], best["b"], best["c"]
     tau_s = -5.0 / np.log(a) if 0 < a < 1 else float("inf")
     dc_gain = b / (1 - a) if abs(1 - a) > 1e-9 else float("inf")
+
+    # Print all delay candidates for comparison.
+    print("  Delay scan (d=steps, each 5s):")
+    for delay in range(4):
+        col = f"desired_d{delay}"
+        if col not in df.columns:
+            continue
+        delay_mask = mask & df[col].notna()
+        active = df.loc[delay_mask]
+        if len(active) < 100:
+            print(f"    d={delay}: insufficient data")
+            continue
+        X = np.column_stack([
+            active["batt_prev"].values,
+            active[col].values,
+            np.ones(len(active)),
+        ])
+        y = active["battery_power_w"].values
+        coeffs_d, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        y_pred = X @ coeffs_d
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        marker = " ◄" if delay == best["delay"] else ""
+        print(f"    d={delay}: R²={r2:.4f}  a={coeffs_d[0]:.4f}  b={coeffs_d[1]:.4f}  c={coeffs_d[2]:.2f}{marker}")
 
     return {
         "a": round(float(a), 6),
         "b": round(float(b), 6),
         "c": round(float(c), 4),
+        "delay_steps": best["delay"],
         "tau_s": round(tau_s, 1),
         "dc_gain": round(dc_gain, 4),
-        "r_squared": round(float(r_squared), 4),
-        "n_samples": len(active),
+        "r_squared": round(float(best_r2), 4),
+        "n_samples": best["n_samples"],
     }
 
 
@@ -136,8 +185,9 @@ def main():
 
     print("\nIdentifying plant model...")
     plant = identify_plant(df)
-    print(f"  batt[k] = {plant['a']:.4f} · batt[k-1] + {plant['b']:.4f} · desired[k] + {plant['c']:.2f}")
+    print(f"  batt[k] = {plant['a']:.4f} · batt[k-1] + {plant['b']:.4f} · desired[k-{plant['delay_steps']}] + {plant['c']:.2f}")
     print(f"  τ = {plant['tau_s']:.1f}s, DC gain = {plant['dc_gain']:.3f}, R² = {plant['r_squared']:.4f}")
+    print(f"  Transport delay: {plant['delay_steps']} steps ({plant['delay_steps'] * 5.0:.0f}s at 5s sampling)")
     print(f"  Fitted on {plant['n_samples']} active ticks")
 
     print("\nExtracting disturbance traces...")

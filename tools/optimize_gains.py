@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -39,22 +40,66 @@ from src.zero_feed_in_controller import (
 
 # ── Plant model ──────────────────────────────────────────────
 
+IDENT_DT_S = 5.0
+"""Sampling interval used during plant identification (seconds).
+
+The discrete coefficients (a, b, c) were fitted from data filtered to
+4–6 s ticks.  Continuous-time parameters are derived assuming this
+nominal interval.
+"""
+
 
 class PlantModel:
-    """First-order discrete model: batt[k] = a·batt[k-1] + b·desired[k] + c."""
+    """First-order plant model with dt-aware discretisation.
 
-    def __init__(self, a: float, b: float, c: float):
-        self.a = a
-        self.b = b
-        self.c = c
-        self.battery_w = 0.0
+    Stores continuous-time parameters (tau, dc_gain, c_cont) derived from
+    the discrete coefficients (a, b, c) identified at ``IDENT_DT_S``.
+    Each ``step()`` recomputes the discrete coefficients for the actual
+    elapsed time, making the simulation robust to timing jitter.
 
-    def step(self, desired_w: float) -> float:
-        self.battery_w = self.a * self.battery_w + self.b * desired_w + self.c
+    Continuous model:  τ · ḃ = K · desired + c_cont − batt
+    Discrete at dt:    batt[k] = e^(−dt/τ) · batt[k−1]
+                                + K(1−e^(−dt/τ)) · desired[k]
+                                + c_cont(1−e^(−dt/τ))
+    """
+
+    def __init__(self, a: float, b: float, c: float, delay_steps: int = 0):
+        self.a_nominal = a
+        self.b_nominal = b
+        self.c_nominal = c
+        # Derive continuous-time parameters from identification at IDENT_DT_S.
+        self.tau: float = -IDENT_DT_S / np.log(a) if 0 < a < 1 else float("inf")
+        self.dc_gain: float = b / (1 - a) if abs(1 - a) > 1e-9 else float("inf")
+        self.c_cont: float = c / (1 - a) if abs(1 - a) > 1e-9 else 0.0
+        self.delay_steps: int = delay_steps
+        self._delay_buf: list[float] = [0.0] * delay_steps
+        self.battery_w: float = 0.0
+
+    def step(self, desired_w: float, dt: float = IDENT_DT_S) -> float:
+        """Advance plant state by *dt* seconds.
+
+        When ``delay_steps > 0``, the plant uses the desired value from
+        *d* calls ago (pure transport delay), modelling the device's
+        command-to-effect latency.
+        """
+        if self.delay_steps > 0:
+            effective = self._delay_buf[0]
+            self._delay_buf.pop(0)
+            self._delay_buf.append(desired_w)
+        else:
+            effective = desired_w
+        alpha = math.exp(-dt / self.tau)
+        self.battery_w = (
+            alpha * self.battery_w
+            + self.dc_gain * (1 - alpha) * effective
+            + self.c_cont * (1 - alpha)
+        )
         return self.battery_w
 
-    def reset(self, battery_w: float = 0.0):
+    def reset(self, battery_w: float = 0.0) -> None:
+        """Reset battery state and delay buffer."""
         self.battery_w = battery_w
+        self._delay_buf = [0.0] * self.delay_steps
 
 
 # ── Pre-converted trace arrays (set once in main) ────────────
@@ -126,6 +171,13 @@ class SystemConfig:
     charge_confirm_s: float = 20.0
     deadband_leak_ws: float = 250.0
     interval_s: int = 5
+    delay_steps: int = 0
+    """Command-to-effect transport delay in sampling steps.
+
+    The device does not respond instantly to setpoint changes.
+    A delay of d steps means the plant sees desired[k-d], not desired[k].
+    Identified by `identify_plant.py` alongside (a, b, c).
+    """
     ff_pv_entity: str = "sensor.pv"
     ff_load_entities: tuple[str, ...] = ("sensor.load",)
 
@@ -217,7 +269,7 @@ def _simulate_full(
     cfg = params_to_config(params, sys_cfg)
     logic = ControlLogic(cfg, log=None)
     logic.seed(None)
-    plant = PlantModel(*plant_abc)
+    plant = PlantModel(*plant_abc, delay_steps=sys_cfg.delay_steps)
 
     disturbance = np.array(traces["disturbance_w"])
     soc = np.array(traces["soc_pct"])
@@ -242,8 +294,9 @@ def _simulate_full(
         output = logic.compute(m, now=now)
         desired_w = output.desired_power_w
         desired_out[k] = desired_w
-        battery_out[k] = plant.step(desired_w)
-        now += float(dt_arr[k]) if k + 1 < n else 5.0
+        step_dt = float(dt_arr[k]) if k + 1 < n else IDENT_DT_S
+        battery_out[k] = plant.step(desired_w, step_dt)
+        now += step_dt
 
     # Metrics
     target = np.where(
@@ -316,14 +369,29 @@ def simulate_fast(
     interval_s = sys_cfg.interval_s
     emergency_margin = 50.0  # EMERGENCY_SAFETY_MARGIN_W
 
-    # Plant coefficients.
+    # Derive continuous-time plant parameters from discrete (a, b, c)
+    # identified at IDENT_DT_S, then precompute per-step coefficients.
     pa, pb, pc = plant_abc
+    tau = -IDENT_DT_S / np.log(pa) if 0 < pa < 1 else float("inf")
+    dc_gain = pb / (1 - pa) if abs(1 - pa) > 1e-9 else float("inf")
+    c_cont = pc / (1 - pa) if abs(1 - pa) > 1e-9 else 0.0
 
-    # Trace arrays (pre-converted).
-    disturbance = ta.disturbance
-    soc = ta.soc
-    dt_arr = ta.dt
+    # Trace arrays — convert to Python lists for fast per-element access
+    # (avoids numpy scalar overhead and keeps all loop arithmetic in
+    # native Python floats, which is ~3× faster than numpy scalars).
     n = ta.n
+    disturbance = ta.disturbance.tolist()
+    soc = ta.soc.tolist()
+    dt_l: list[float] = ta.dt.tolist()
+    dt_arr = ta.dt  # keep numpy array for vectorised metrics at end
+
+    # Per-step plant coefficients accounting for timing jitter.
+    plant_dt = dt_arr.copy()
+    plant_dt[-1] = IDENT_DT_S          # last step: no next measurement
+    alpha = np.exp(-plant_dt / tau)
+    pa_l: list[float] = alpha.tolist()
+    pb_l: list[float] = (dc_gain * (1.0 - alpha)).tolist()
+    pc_l: list[float] = (c_cont * (1.0 - alpha)).tolist()
 
     # Output arrays.
     grid_out = np.empty(n)
@@ -339,6 +407,10 @@ def simulate_fast(
     db_acc = 0.0
     now = 0.0
 
+    # Transport delay buffer (FIFO: oldest at index 0).
+    delay_d = sys_cfg.delay_steps
+    delay_buf = [0.0] * delay_d
+
     for k in range(n):
         # ── Grid measurement ──
         grid_w = disturbance[k] - battery_w
@@ -347,7 +419,7 @@ def simulate_fast(
 
         # ── Elapsed time ──
         if k > 0:
-            dt = dt_arr[k - 1]
+            dt = dt_l[k - 1]
             if dt > interval_s * 3:
                 dt = interval_s * 3
             elif dt < 0:
@@ -368,7 +440,13 @@ def simulate_fast(
             integral = forced
             last_computed = forced
             desired_out[k] = forced
-            battery_w = pa * battery_w + pb * forced + pc
+            if delay_d > 0:
+                effective = delay_buf[0]
+                del delay_buf[0]
+                delay_buf.append(forced)
+            else:
+                effective = forced
+            battery_w = pa_l[k] * battery_w + pb_l[k] * effective + pc_l[k]
             battery_out[k] = battery_w
             now = now_next
             continue
@@ -483,7 +561,13 @@ def simulate_fast(
 
         last_computed = desired_w
         desired_out[k] = desired_w
-        battery_w = pa * battery_w + pb * desired_w + pc
+        if delay_d > 0:
+            effective = delay_buf[0]
+            del delay_buf[0]
+            delay_buf.append(desired_w)
+        else:
+            effective = desired_w
+        battery_w = pa_l[k] * battery_w + pb_l[k] * effective + pc_l[k]
         battery_out[k] = battery_w
         now = now_next
 
@@ -745,7 +829,17 @@ def save_result(
             "cost": (optimized_cost - baseline_cost) / baseline_cost * 100
             if baseline_cost else 0.0,
         },
-        "plant": {"a": plant_abc[0], "b": plant_abc[1], "c": plant_abc[2]},
+        "plant": {
+            "a": plant_abc[0], "b": plant_abc[1], "c": plant_abc[2],
+            "ident_dt_s": IDENT_DT_S,
+            "tau_s": -IDENT_DT_S / np.log(plant_abc[0])
+            if 0 < plant_abc[0] < 1 else None,
+            "dc_gain": plant_abc[1] / (1 - plant_abc[0])
+            if abs(1 - plant_abc[0]) > 1e-9 else None,
+            "c_cont": plant_abc[2] / (1 - plant_abc[0])
+            if abs(1 - plant_abc[0]) > 1e-9 else None,
+            "delay_steps": sys_cfg.delay_steps,
+        },
         "system_config": {
             "max_discharge_w": sys_cfg.max_discharge_w,
             "max_charge_w": sys_cfg.max_charge_w,
@@ -754,6 +848,7 @@ def save_result(
             "max_soc_pct": sys_cfg.max_soc_pct,
             "discharge_target_w": sys_cfg.discharge_target_w,
             "charge_target_w": sys_cfg.charge_target_w,
+            "delay_steps": sys_cfg.delay_steps,
         },
         "optimization": {
             "generations": generations,
@@ -891,13 +986,16 @@ def main():
     p = model_data["plant"]
     traces = model_data["traces"]
     plant_abc = (p["a"], p["b"], p["c"])
+    delay_steps = p.get("delay_steps", 0)
 
     print("=" * 65)
     print("  Zero Feed-In Controller — Gain Optimizer")
     print("=" * 65)
-    print(f"\n  Plant model:")
-    print(f"    batt[k] = {p['a']:.4f} * batt[k-1] + {p['b']:.4f} * desired[k] + {p['c']:.2f}")
-    print(f"    tau={p['tau_s']:.1f}s  DC gain={p['dc_gain']:.3f}  R^2={p['r_squared']:.4f}")
+    print(f"\n  Plant model (identified at dt={IDENT_DT_S}s):")
+    print(f"    batt[k] = {p['a']:.4f} * batt[k-1] + {p['b']:.4f} * desired[k-{delay_steps}] + {p['c']:.2f}")
+    pm = PlantModel(*plant_abc, delay_steps=delay_steps)
+    print(f"    tau={pm.tau:.1f}s  K={pm.dc_gain:.3f}  c_cont={pm.c_cont:.2f}  R²={p['r_squared']:.4f}")
+    print(f"    Transport delay: {delay_steps} steps ({delay_steps * IDENT_DT_S:.0f}s)")
     print(f"  Trace: {len(traces['disturbance_w'])} timesteps")
     if args.workers > 1:
         print(f"  Workers: {args.workers}")
@@ -914,6 +1012,7 @@ def main():
         discharge_target_w=30, charge_target_w=0,
         mode_hysteresis_w=50, charge_confirm_s=20,
         deadband_leak_ws=250, interval_s=5,
+        delay_steps=delay_steps,
         ff_pv_entity="sensor.pv",
         ff_load_entities=("sensor.load",),
     )

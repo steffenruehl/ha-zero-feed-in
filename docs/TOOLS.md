@@ -29,12 +29,14 @@ consumption by the optimizer.
 ### Model
 
 ```
-batt[k] = a · batt[k-1] + b · desired[k] + c
+batt[k] = a · batt[k-1] + b · desired[k-d] + c
 ```
 
-Only rows with a nominal 5 s tick (`4 ≤ dt ≤ 6 s`) and active control
-(`|desired| > 10 W`) are used.  Output includes the time constant
-τ = −5 / ln(a), DC gain = b / (1 − a), and R².
+The tool scans transport delays d = 0, 1, 2, 3 steps and picks the
+delay that maximises R².  Only rows with a nominal 5 s tick
+(`4 ≤ dt ≤ 6 s`) and active control (`|desired| > 10 W`) are used.
+Output includes the time constant τ = −dt / ln(a), DC gain = b / (1 − a),
+R², and the best-fit delay d in steps.
 
 ### CLI
 
@@ -54,9 +56,10 @@ python3 tools/identify_plant.py data/controller_2026-04-21.csv data/controller_2
 ```json
 {
   "plant": {
-    "a": 0.9094, "b": 0.0804, "c": -1.96,
-    "tau_s": 52.6, "dc_gain": 0.888, "r_squared": 0.976,
-    "n_samples": 1847
+    "a": 0.8879, "b": 0.1015, "c": -2.38,
+    "delay_steps": 1,
+    "tau_s": 42.1, "dc_gain": 0.906, "r_squared": 0.977,
+    "n_samples": 15607
   },
   "traces": {
     "timestamps": ["2026-04-21T10:30:45", "..."],
@@ -179,7 +182,9 @@ Canonical output consumed by `plot_response.py`:
   "baseline_cost":    9100.2,
   "optimized_cost":   7430.1,
   "improvement_pct":  { "feed_in": -25.1, "cost": -18.3 },
-  "plant":            { "a": 0.9094, "b": 0.0804, "c": -1.96 },
+  "plant":            { "a": 0.8879, "b": 0.1015, "c": -2.38,
+                        "delay_steps": 1, "ident_dt_s": 5.0, "tau_s": 42.1,
+                        "dc_gain": 0.906, "c_cont": -21.3 },
   "system_config":    { "max_discharge_w": 1200, "..." : "..." },
   "optimization":     { "generations": 47, "converged": true, "elapsed_s": 1245.3 }
 }
@@ -194,9 +199,47 @@ Two simulation paths exist:
 | **Fast** | `simulate_fast()` | ~5× faster | Optimizer (via `cost()`) |
 | **Full** | `_simulate_full()` | 1× (baseline) | Validation against real data |
 
-Both produce identical results — verified by 17 parity tests in
+Both produce identical results — verified by 20 parity tests
+(including variable-dt, jitter, and transport-delay scenarios) in
 `tests/test_optimize_gains.py`.  The fast path inlines the PI loop
 in pure numpy; the full path instantiates the real `ControlLogic` class.
+
+### Jitter-Aware Plant Model
+
+The discrete plant model `batt[k] = a·batt[k-1] + b·desired[k] + c`
+was identified at a fixed 5 s sampling interval.  To handle timing
+jitter (real intervals vary between 3–15 s), the simulator derives
+continuous-time parameters from the discrete coefficients:
+
+$$\tau = -\frac{dt_{\text{ident}}}{\ln a}, \quad K = \frac{b}{1-a}, \quad c_{\text{cont}} = \frac{c}{1-a}$$
+
+Then for each step with actual elapsed time $dt$:
+
+$$\alpha = e^{-dt/\tau}$$
+$$a(dt) = \alpha, \quad b(dt) = K(1-\alpha), \quad c(dt) = c_{\text{cont}}(1-\alpha)$$
+
+At the nominal dt=5 s, this reproduces the original coefficients
+exactly.  With real jitter, the plant model correctly accounts for
+how much the battery state evolves over longer or shorter intervals.
+
+### Transport Delay
+
+`identify_plant.py` scans transport delays d = 0 … 3 steps (each 5 s)
+and picks the delay that maximises R².  The selected `delay_steps` is
+stored in `plant_model.json` and flows through to the optimizer via
+`SystemConfig.delay_steps`.
+
+In simulation, a FIFO buffer defers the controller's desired output
+by d steps before the plant sees it:
+
+```
+effective[k] = desired[k - d]
+```
+
+This models the real 10–15 s command-to-effect latency of the Zendure
+device.  With d = 1 (5 s), the re-identified model improves from
+R² = 0.976 to 0.977 with a faster time constant (τ = 42.1 s vs 52.6 s)
+and higher DC gain (0.906 vs 0.888).
 
 ---
 
@@ -260,5 +303,5 @@ interactive window.
 
 | Test file | Covers |
 |-----------|--------|
-| `tests/test_optimize_gains.py` | Parity (17), I/O round-trip (11), params_to_config (5), cost function (3), simulate dispatch (3), bounds (3) |
+| `tests/test_optimize_gains.py` | Parity (17), plant model (7), jitter parity (3), plant delay (3), delay parity (5), I/O round-trip (11), params_to_config (5), cost function (3), simulate dispatch (3), bounds (3) |
 | `tests/test_plot_response.py` | Scenario shapes (12), trace conversion (2), real-data slicing (2), simulation on scenarios (8) |
