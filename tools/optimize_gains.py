@@ -150,8 +150,8 @@ PARAM_NAMES = [
 BOUNDS = [
     (0.01, 0.8),  # kp_discharge_up
     (0.05, 0.8),  # kp_discharge_down
-    (0.05, 0.8),  # kp_charge_up
-    (0.05, 0.8),  # kp_charge_down
+    (0.517, 0.517),  # kp_charge_up  (frozen: ablation shows ~0% impact)
+    (0.529, 0.529),  # kp_charge_down (frozen: ablation shows ~0% impact)
     (0.001, 0.3),  # ki_discharge_up
     (0.005, 0.3),  # ki_discharge_down
     (0.005, 0.3),  # ki_charge_up
@@ -160,7 +160,7 @@ BOUNDS = [
     (3, 120),      # ff_filter_tau_s
     (0, 60),       # ff_deadband_w
     (0.1, 1.5),   # ff_gain_pv
-    (0.1, 1.5),   # ff_gain_load
+    (0, 0),        # ff_gain_load  (frozen: ablation shows 0% impact)
     (500, 20000),  # relay_lockout_ws
     (10, 200),     # relay_lockout_cutoff_w
     (10, 300),     # relay_lockout_idle_s
@@ -1316,7 +1316,7 @@ def main():
         0.005, 0.300, 0.261, 0.020,  # ki (optimized 2026-04-23)
         5.1,                          # deadband
         30.6, 49.4,                   # ff_tau, ff_deadband
-        1.41, 0.57,                   # ff_gain_pv, ff_gain_load
+        1.41, 0.0,                    # ff_gain_pv, ff_gain_load (load disabled)
         10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
     ])
 

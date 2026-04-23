@@ -43,11 +43,11 @@ from tools.optimize_gains import (
 PLANT_ABC = (0.9094, 0.0804, -1.96)
 
 DEFAULT_PARAMS = np.array([
-    0.25, 0.35, 0.17, 0.23,     # kp
+    0.25, 0.35, 0.517, 0.529,   # kp (charge Kp frozen at optimized values)
     0.05, 0.05, 0.07, 0.07,     # ki
     35.0,                         # deadband
     30.0, 30.0,                   # ff_tau, ff_deadband
-    0.8, 0.6,                     # ff_gain_pv, ff_gain_load
+    0.8, 0.0,                    # ff_gain_pv, ff_gain_load (load disabled)
     10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
 ])
 
@@ -600,7 +600,7 @@ class TestParamsToConfig:
         assert pv_src.sign == -1.0
         assert pv_src.gain == pytest.approx(0.8)
         assert load_src.sign == 1.0
-        assert load_src.gain == pytest.approx(0.6)
+        assert load_src.gain == pytest.approx(0.0)
 
     def test_deadband_and_ff_params(self) -> None:
         """Deadband, FF tau, and FF deadband passed correctly."""
@@ -701,9 +701,9 @@ class TestBounds:
         assert len(BOUNDS) == len(PARAM_NAMES)
 
     def test_all_lower_less_than_upper(self) -> None:
-        """Every bound has lo < hi."""
+        """Every bound has lo <= hi (lo == hi for frozen params)."""
         for i, (lo, hi) in enumerate(BOUNDS):
-            assert lo < hi, f"BOUNDS[{i}] ({PARAM_NAMES[i]}): {lo} >= {hi}"
+            assert lo <= hi, f"BOUNDS[{i}] ({PARAM_NAMES[i]}): {lo} > {hi}"
 
     def test_default_params_within_bounds(self) -> None:
         """DEFAULT_PARAMS are within the optimization bounds."""
