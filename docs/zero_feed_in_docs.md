@@ -170,7 +170,7 @@ Instead of a raw delta, the derivative is taken on an **EMA-filtered** value
 slow ramps that merit a feed-forward response:
 
 ```
-α = interval_s / (filter_tau_s + interval_s)   # e.g. 5/(30+5) ≈ 0.14
+α = interval_s / (filter_tau_s + interval_s)   # e.g. 5/(97.4+5) ≈ 0.049
 
 for each source:
     EMA_t = α × current + (1−α) × EMA_{t-1}    # update filter state
@@ -182,7 +182,7 @@ if |contrib| < ff_deadband:
 combined = pi_output + contrib
 ```
 
-With τ=30 s a 200 W spike produces a 28 W FF impulse — below the 30 W deadband,
+With τ=97.4 s a 200 W spike produces a ~10 W FF impulse — below the 13.2 W deadband,
 so short cloud transients are ignored. Sustained slow ramps exceed the deadband
 and do trigger a feed-forward response.
 
@@ -196,8 +196,8 @@ names (e.g. ``name: pv`` → ``sensor.zfi_ff_pv_raw``).
 Example configuration:
 ```yaml
 ff_enabled: true
-ff_deadband: 30
-ff_filter_tau_s: 30     # EMA time constant (s); α = interval/(tau+interval)
+ff_deadband: 13.2
+ff_filter_tau_s: 97.4   # EMA time constant (s); α = interval/(tau+interval)
 feed_forward_sources:
   - entity: sensor.pv_power
     gain: 0.6
@@ -214,14 +214,20 @@ still work and create a single FF source automatically.
 ### Four-Quadrant Gains
 
 Gains are selected per cycle based on operating mode × error sign.
-Derived from step response measurements (SIMC: Kp = interval / (2×T1), Ki = Kp / (4×T1)).
+Theoretical starting points via SIMC (Kp = interval / (2×T1), Ki = Kp / (4×T1)):
 
-| Quadrant | Physical action | T1 (s) | Kp | Ki |
+| Quadrant | Physical action | T1 (s) | SIMC Kp | SIMC Ki |
 | --- | --- | --- | --- | --- |
 | `discharge_up` | increase discharge | 5.0 | 0.50 | 0.025 |
 | `discharge_down` | decrease discharge | 3.5 | 0.71 | 0.051 |
 | `charge_up` | increase charge | 7.5 | 0.33 | 0.011 |
 | `charge_down` | decrease charge | 5.5 | 0.45 | 0.021 |
+
+Production gains are optimizer-tuned (see `tools/optimize_gains.py`). The optimizer
+uses a plant model identified from real trace data and minimizes a euro-weighted cost
+function (IAE + feed-in + relay wear + control effort). Optimized gains differ
+significantly from SIMC — in particular, discharge gains are much lower and charge
+gains higher, reflecting the asymmetric device dynamics and relay wear cost.
 
 Selection matrix:
 
@@ -294,7 +300,7 @@ IDLE transitions use an accumulated-time lockout (`idle_lockout_s`): time is onl
 
 A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
-During lockout, power is **clamped** to the current direction's minimum active power (`min_active_power_w`, default 25 W), keeping the device responsive while preventing relay chatter.
+During lockout, power is **clamped** to the current direction's minimum active power (`min_active_power_w`, code default 25 W, configurable via `apps.yaml`), keeping the device responsive while preventing relay chatter.
 
 ### 4. Rounding and Suppression
 
@@ -305,7 +311,7 @@ During lockout, power is **clamped** to the current direction's minimum active p
 
 ## Protection Mechanisms
 
-### 1. Emergency (Feed-in > 800 W)
+### 1. Emergency (Feed-in > `max_feed_in`)
 
 Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calculated to the forced value so the PI resumes smoothly.
 
@@ -534,7 +540,7 @@ flowchart TD
 
     C --> D["Estimate surplus<br>= -battery_power_w - grid"]
 
-    D --> E{Feed-in > 800W?}
+    D --> E{Feed-in > max_feed_in?}
     E -- Yes --> F["EMERGENCY<br>Curtail, reset integral"]
     F --> PUB
 
@@ -657,7 +663,7 @@ Published only when `debug: true` in the controller config.
 | `zfi_i_term` | number | W | Integral component |
 | `zfi_ff` | number | W | Feed-forward component (post-deadband) |
 | `zfi_ff_pv_raw` | number | W | Live PV sensor reading |
-| `zfi_ff_pv_ema` | number | W | PV EMA filter state (τ = 30 s) |
+| `zfi_ff_pv_ema` | number | W | PV EMA filter state (τ from `ff_filter_tau_s`) |
 | `zfi_ff_pv_contrib` | number | W | PV contribution before deadband |
 | `zfi_ff_others_contrib` | number | W | All non-PV load sources summed, before deadband |
 | `zfi_integral` | number | W | Integral accumulator |
