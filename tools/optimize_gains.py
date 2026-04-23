@@ -267,7 +267,13 @@ def _simulate_full(
     traces: dict,
     sys_cfg: SystemConfig,
 ) -> SimResult:
-    """Slow but exact simulation using the real ControlLogic class."""
+    """Slow but exact simulation using the real ControlLogic class.
+
+    Feed-forward uses the combined disturbance signal as a synthetic PV
+    reading (load entities left absent → contribute 0).  This exercises
+    ``ff_gain_pv`` exactly; ``ff_gain_load`` is not exercised here but
+    *is* exercised in ``simulate_fast`` via asymmetric gain selection.
+    """
     cfg = params_to_config(params, sys_cfg)
     logic = ControlLogic(cfg, log=None)
     logic.seed(None)
@@ -289,10 +295,15 @@ def _simulate_full(
         grid_w = disturbance[k] - plant.battery_w
         grid_out[k] = grid_w
 
+        # Synthetic FF reading: feed disturbance as the PV entity so
+        # FeedForward reacts to PV-dominated disturbance ramps.
+        ff_readings = {sys_cfg.ff_pv_entity: float(disturbance[k])}
+
         m = Measurement(
             grid_power_w=grid_w,
             soc_pct=float(soc[k]),
             battery_power_w=plant.battery_w,
+            ff_readings=ff_readings,
         )
 
         output = logic.compute(m, now=now)
@@ -346,9 +357,15 @@ def simulate_fast(
 ) -> SimResult:
     """Fast closed-loop simulation with inlined PI logic.
 
-    Replicates the exact behavior of ``ControlLogic.compute()`` but
-    avoids per-step overhead: no dataclass creation, no method dispatch,
-    no feed-forward (always 0 without sensor traces), no Enum.
+    Replicates the exact behavior of ``ControlLogic.compute()``
+    including feed-forward, but avoids per-step overhead: no dataclass
+    creation, no method dispatch, no Enum.
+
+    Feed-forward uses the combined disturbance signal as a single source
+    with ``sign=-1`` and ``ff_gain_pv``.  This matches ``_simulate_full``
+    where the disturbance is fed as a synthetic PV reading.
+    ``ff_gain_load`` is not exercised because the trace only contains the
+    combined disturbance (PV − load), not individual signals.
 
     ~4-5× faster than ``_simulate_full`` on 33 K timesteps.
     """
@@ -362,6 +379,10 @@ def simulate_fast(
     ki_charge_up = float(params[6])
     ki_charge_down = float(params[7])
     deadband_w = float(params[8])
+    ff_tau = float(params[9])
+    ff_deadband = float(params[10])
+    ff_gain_pv = float(params[11])
+    ff_gain_load = float(params[12])
 
     # Fixed system params.
     max_discharge_w = sys_cfg.max_discharge_w
@@ -416,6 +437,7 @@ def simulate_fast(
     charge_pending_since: float | None = None
     db_acc = 0.0
     now = 0.0
+    ff_ema: float | None = None  # feed-forward EMA state
 
     # Transport delay buffer (FIFO: oldest at index 0).
     delay_d = sys_cfg.delay_steps
@@ -460,6 +482,12 @@ def simulate_fast(
                 effective = forced
             battery_w = pa_l[k] * battery_w + pb_l[k] * effective + pc_l[k]
             battery_out[k] = battery_w
+            # Update FF EMA even during emergency (match production).
+            _alpha_ff = dt / (ff_tau + dt)
+            if ff_ema is None:
+                ff_ema = disturbance[k]
+            else:
+                ff_ema = _alpha_ff * disturbance[k] + (1 - _alpha_ff) * ff_ema
             now = now_next
             continue
 
@@ -535,7 +563,15 @@ def simulate_fast(
                 new_integral = -max_charge_w - p_term
                 pi_out = -max_charge_w
 
-        desired_w = pi_out  # no FF in fast sim
+        # ── Feed-forward (filtered derivative of disturbance) ──
+        ff_out = 0.0
+        if ff_ema is not None:
+            alpha_ff = dt / (ff_tau + dt)
+            ff_delta = alpha_ff * (disturbance[k] - ff_ema)
+            raw_ff = -ff_gain_pv * ff_delta
+            ff_out = raw_ff if abs(raw_ff) >= ff_deadband else 0.0
+
+        desired_w = pi_out + ff_out
 
         # ── Guards (always checked) ──
         guard_fired = False
@@ -578,6 +614,12 @@ def simulate_fast(
             effective = desired_w
         battery_w = pa_l[k] * battery_w + pb_l[k] * effective + pc_l[k]
         battery_out[k] = battery_w
+        # Update FF EMA (always, matching production update_previous).
+        _alpha_ff = dt / (ff_tau + dt)
+        if ff_ema is None:
+            ff_ema = disturbance[k]
+        else:
+            ff_ema = _alpha_ff * disturbance[k] + (1 - _alpha_ff) * ff_ema
         now = now_next
 
     # ── Metrics (vectorised) ──
@@ -1061,11 +1103,11 @@ def main():
 
     # ── Baseline ──
     current_gains = np.array([
-        0.25, 0.35, 0.17, 0.23,     # kp (unchanged)
-        0.05, 0.05, 0.07, 0.07,     # ki (current production)
-        35.0,                         # deadband
-        30.0, 30.0,                   # ff_tau, ff_deadband
-        0.8, 0.6,                     # ff_gain_pv, ff_gain_load
+        0.051, 0.767, 0.172, 0.739,  # kp (optimized 2026-04-22)
+        0.005, 0.298, 0.280, 0.012,  # ki (optimized 2026-04-22)
+        5.1,                          # deadband
+        10.4, 56.4,                   # ff_tau, ff_deadband
+        0.92, 0.65,                   # ff_gain_pv, ff_gain_load
     ])
 
     print("\n" + "=" * 65)
