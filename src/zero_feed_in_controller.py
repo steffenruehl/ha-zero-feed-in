@@ -535,6 +535,7 @@ class FeedForward:
         ]
         self._deadband_w = deadband_w
         self._enabled = enabled
+        self._filter_tau_s = filter_tau_s
         self._alpha = interval_s / (filter_tau_s + interval_s)
         self.last_debug: list[FeedForwardSourceDebug] = []
 
@@ -543,16 +544,22 @@ class FeedForward:
         """Return entity IDs that the HA adapter must read each cycle."""
         return [s.entity for s in self._sources]
 
-    def compute(self, readings: dict[str, float | None]) -> float:
+    def compute(self, readings: dict[str, float | None], dt: float | None = None) -> float:
         """Compute total feed-forward correction.
 
         For each source, the filtered derivative (α × (current − EMA_state))
         is scaled by ``sign × gain`` and summed. A deadband is applied to the
         total. Returns 0.0 when disabled or on first cycle (EMA not seeded).
+
+        Args:
+            readings: Sensor readings keyed by entity ID.
+            dt: Measured tick interval (s).  When provided, alpha is
+                recomputed per tick for jitter robustness.
         """
         if not self._enabled:
             self.last_debug = []
             return 0.0
+        alpha = dt / (self._filter_tau_s + dt) if dt is not None else self._alpha
         debug: list[FeedForwardSourceDebug] = []
         total = 0.0
         for src in self._sources:
@@ -566,7 +573,7 @@ class FeedForward:
                     contrib_w=0.0,
                 ))
                 continue
-            delta = self._alpha * (current - src.filtered_w)
+            delta = alpha * (current - src.filtered_w)
             contrib = src.sign * src.gain * delta
             debug.append(FeedForwardSourceDebug(
                 name=src.name,
@@ -581,8 +588,9 @@ class FeedForward:
             return 0.0
         return total
 
-    def update_previous(self, readings: dict[str, float | None]) -> None:
+    def update_previous(self, readings: dict[str, float | None], dt: float | None = None) -> None:
         """Advance the EMA filter state for all sources."""
+        alpha = dt / (self._filter_tau_s + dt) if dt is not None else self._alpha
         for src in self._sources:
             current = readings.get(src.entity)
             if current is not None:
@@ -590,7 +598,7 @@ class FeedForward:
                     src.filtered_w = current  # bootstrap: zero delta next cycle
                 else:
                     src.filtered_w = (
-                        self._alpha * current + (1.0 - self._alpha) * src.filtered_w
+                        alpha * current + (1.0 - alpha) * src.filtered_w
                     )
 
 
@@ -698,6 +706,7 @@ class ControlLogic:
         self._last_kp: float = 0.0
         self._last_ki: float = 0.0
         self._db_acc: float = 0.0
+        self._prev_now: float | None = None
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -766,6 +775,13 @@ class ControlLogic:
         if now is None:
             now = time.monotonic()
 
+        # Measure real elapsed time for interval-independent PI/FF math.
+        if self._prev_now is not None:
+            dt = max(0.0, min(now - self._prev_now, self.cfg.interval_s * 3))
+        else:
+            dt = self.cfg.interval_s  # first tick: assume nominal
+        self._prev_now = now
+
         self._last_in_deadband = False
         self._last_kp = 0.0
         self._last_ki = 0.0
@@ -775,17 +791,17 @@ class ControlLogic:
         emergency = self._check_emergency(m)
         if emergency is not None:
             self.state.last_computed_w = emergency.desired_power_w
-            self.ff.update_previous(m.ff_readings)
+            self.ff.update_previous(m.ff_readings, dt)
             return emergency
 
         self._update_operating_mode(surplus, now)
         target = self.target_for_mode()
 
         error = m.grid_power_w - target
-        pi_out, p_term, new_integral = self._run_pi(error, self.cfg.interval_s)
+        pi_out, p_term, new_integral = self._run_pi(error, dt)
         self._last_p = p_term
 
-        ff = self.ff.compute(m.ff_readings)
+        ff = self.ff.compute(m.ff_readings, dt)
         self._last_ff = ff
 
         combined = pi_out + ff
@@ -798,7 +814,7 @@ class ControlLogic:
             self.state.integral = 0.0
             self._last_i = 0.0
             self.state.last_computed_w = guarded.desired_power_w
-            self.ff.update_previous(m.ff_readings)
+            self.ff.update_previous(m.ff_readings, dt)
             return guarded
 
         self.state.integral = new_integral
@@ -825,7 +841,7 @@ class ControlLogic:
             self._last_ff, reason,
         )
         self.state.last_computed_w = output.desired_power_w
-        self.ff.update_previous(m.ff_readings)
+        self.ff.update_previous(m.ff_readings, dt)
         return output
 
     def _check_emergency(self, m: Measurement) -> ControlOutput | None:
@@ -883,7 +899,7 @@ class ControlLogic:
         pi_output, p_term, new_integral = self.pi.update(
             error=error,
             integral=self.state.integral,
-            dt=self.cfg.interval_s,
+            dt=dt,
             gains=gains,
         )
         return pi_output, p_term, new_integral

@@ -912,6 +912,74 @@ class TestComputeEdgeCases:
 
 
 # ═══════════════════════════════════════════════════════════
+#  Interval-independent dt measurement
+# ═══════════════════════════════════════════════════════════
+
+
+class TestMeasuredDt:
+    """Verify that ControlLogic.compute() uses real elapsed time."""
+
+    def test_first_tick_uses_nominal_interval(self):
+        """First call (no previous timestamp) uses cfg.interval_s as dt."""
+        logic = make_logic(deadband_w=0, ki_discharge_up=0.1,
+                           discharge_target_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50)
+        logic.compute(m, now=0)
+        # error = 100 - 0 = 100; Ki contribution = 0.1 * 100 * 5 = 50
+        assert logic.state.integral == pytest.approx(50.0)
+
+    def test_jitter_uses_measured_dt(self):
+        """When tick arrives late (5.3s instead of 5s), Ki uses real dt."""
+        logic = make_logic(deadband_w=0, ki_discharge_up=0.1,
+                           kp_discharge_up=0, discharge_target_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50)
+        logic.compute(m, now=0)
+        integral_after_first = logic.state.integral  # nominal dt=5 → 50
+
+        logic.compute(m, now=5.3)
+        # Second tick: dt=5.3, Ki contribution = 0.1 * 100 * 5.3 = 53
+        expected = integral_after_first + 0.1 * 100 * 5.3
+        assert logic.state.integral == pytest.approx(expected)
+
+    def test_dt_capped_at_three_times_nominal(self):
+        """A stalled tick (huge gap) caps dt at 3 × interval_s."""
+        logic = make_logic(deadband_w=0, ki_discharge_up=0.1,
+                           kp_discharge_up=0, discharge_target_w=0)
+        logic.seed(None)
+        m = make_measurement(grid_power_w=100, soc_pct=50)
+        logic.compute(m, now=0)
+        integral_after_first = logic.state.integral
+
+        # 100s gap → capped to 3 × 5 = 15s
+        logic.compute(m, now=100)
+        expected = integral_after_first + 0.1 * 100 * 15.0
+        assert logic.state.integral == pytest.approx(expected)
+
+    def test_ff_ema_uses_measured_dt(self):
+        """Feed-forward EMA alpha adapts to measured dt."""
+        tau = 30.0
+        src = FeedForwardSource(entity="sensor.pv", gain=1.0, sign=-1.0, name="pv")
+        ff = FeedForward(
+            sources=(src,),
+            deadband_w=0.0,
+            filter_tau_s=tau,
+            interval_s=5.0,
+        )
+        # Seed previous values
+        ff.update_previous({"sensor.pv": 500.0}, dt=5.0)
+
+        # Compute with dt=10 (different from nominal 5)
+        result = ff.compute({"sensor.pv": 400.0}, dt=10.0)
+        alpha_10 = 10.0 / (tau + 10.0)  # 0.25
+        expected_filtered = 500.0 + alpha_10 * (400.0 - 500.0)
+        expected_deriv = expected_filtered - 500.0
+        expected_ff = -1.0 * 1.0 * expected_deriv  # sign * gain * deriv
+        assert result == pytest.approx(expected_ff)
+
+
+# ═══════════════════════════════════════════════════════════
 #  ControllerState defaults
 # ═══════════════════════════════════════════════════════════
 
