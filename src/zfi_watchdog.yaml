@@ -121,12 +121,14 @@ interval:
             if (!id(zfi_safe_active)) {
               ESP_LOGW("zfi_wd", "STALE controller=%s driver=%s -> safe state",
                 c_stale ? "yes" : "no", d_stale ? "yes" : "no");
+              id(zfi_notify_safe).execute();
             }
             id(zfi_safe_active) = true;
             id(zfi_send_safe).execute();
           } else {
             if (id(zfi_safe_active)) {
               ESP_LOGI("zfi_wd", "Heartbeats recovered — releasing safe state");
+              id(zfi_notify_recovered).execute();
             }
             id(zfi_safe_active) = false;
           }
@@ -151,3 +153,19 @@ script:
                 } else {
                   ESP_LOGW("zfi_wd", "Safe state HTTP failed: %d", response->status_code);
                 }
+
+  - id: zfi_notify_safe
+    then:
+      - homeassistant.service:
+          service: persistent_notification.create
+          data:
+            notification_id: zfi_watchdog
+            title: "ZFI Watchdog: Safe State Active"
+            message: "ESP watchdog lost heartbeats — outputLimit and inputLimit set to 0."
+
+  - id: zfi_notify_recovered
+    then:
+      - homeassistant.service:
+          service: persistent_notification.dismiss
+          data:
+            notification_id: zfi_watchdog
