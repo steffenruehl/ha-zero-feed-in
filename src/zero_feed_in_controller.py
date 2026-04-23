@@ -814,7 +814,7 @@ class ControlLogic:
 
         combined = pi_out + ff
 
-        guarded = self._apply_guards(combined, m, surplus)
+        guarded = self._apply_guards(combined, m)
         if guarded is not None:
             if guarded.freeze_integral:
                 # Transient guard (e.g. momentary surplus dip) — keep
@@ -833,18 +833,6 @@ class ControlLogic:
         self._last_i = new_integral
 
         clamped = self._clamp(combined, surplus)
-
-        # Anti-windup: back-calculate when output was clamped.
-        # During relay lock the PI freeze above already prevents normal windup.
-        # But if the surplus clamp fires while relay is locked the integral can
-        # be more aggressive than what the current surplus allows — cap it by
-        # applying anti-windup only when it would bring the integral closer to
-        # zero (less extreme), never when it would push it further away.
-        if clamped != combined:
-            target_integral = clamped - p_term
-            if abs(target_integral) < abs(self.state.integral):
-                self.state.integral = target_integral
-                self._last_i = self.state.integral
 
         suffix = " (relay locked)" if m.relay_locked else ""
         reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name}){suffix}"
@@ -980,7 +968,7 @@ class ControlLogic:
         return self.cfg.discharge_target_w
 
     def _apply_guards(
-        self, raw_limit: float, m: Measurement, surplus: float
+        self, raw_limit: float, m: Measurement,
     ) -> ControlOutput | None:
         """Check safety conditions that override PI output.
 
@@ -1014,12 +1002,6 @@ class ControlLogic:
             )
 
         if raw_limit < 0:
-            if surplus <= 0:
-                return ControlOutput.idle(
-                    self._last_p, self._last_i,
-                    self._last_ff, "No surplus, charge blocked",
-                    freeze_integral=True,
-                )
             if m.soc_pct >= self.cfg.max_soc_pct:
                 return ControlOutput.idle(
                     self._last_p, self._last_i,

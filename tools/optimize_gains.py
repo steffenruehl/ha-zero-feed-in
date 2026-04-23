@@ -544,7 +544,7 @@ def simulate_fast(
             integral = 0.0
             guard_fired = True
         elif desired_w < 0:
-            if surplus <= 0 or soc_k >= max_soc:
+            if soc_k >= max_soc:
                 desired_w = 0.0
                 # Transient guard — freeze integral to avoid large
                 # transients when surplus returns.
@@ -563,12 +563,6 @@ def simulate_fast(
                 limit = -max_charge_w if max_charge_w < max_safe_charge else -max_safe_charge
                 if desired_w < limit:
                     clamped = limit
-
-            # Anti-windup from clamp
-            if clamped != desired_w:
-                target_int = clamped - p_term
-                if (target_int if target_int >= 0 else -target_int) < (integral if integral >= 0 else -integral):
-                    integral = target_int
 
             desired_w = clamped
 

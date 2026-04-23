@@ -262,18 +262,20 @@ class TestGuards:
         assert output.desired_power_w == 0.0
         assert output.reason == "Charge disabled"
 
-    def test_no_surplus_blocks_charge(self):
-        """No solar surplus → charge blocked even if PI wants it."""
+    def test_no_surplus_clamps_charge_to_zero(self):
+        """No solar surplus → charge clamped to zero by surplus cap."""
         logic = make_logic(deadband_w=0)
         logic.seed(None)
+        # Force into charging mode so PI wants to charge.
+        logic.state.mode = OperatingMode.CHARGING
+        logic.state.integral = -200.0
         # Grid slightly negative but battery discharging → surplus negative
         m = make_measurement(
             grid_power_w=-10, soc_pct=50, battery_power_w=200,
         )
-        # surplus = -200 - (-10) = -190 → no surplus
+        # surplus = -200 - (-10) = -190 → _clamp caps charge at 0
         output = logic.compute(m, now=0)
         assert output.desired_power_w == 0.0
-        assert output.reason == "No surplus, charge blocked"
 
     def test_dynamic_min_soc_overrides_config(self):
         """Dynamic min SOC from input_number overrides the static config value."""
@@ -754,9 +756,14 @@ class TestClamp:
 # ═══════════════════════════════════════════════════════════
 
 
-class TestAntiWindupSurplusClamp:
-    def test_integral_back_calculated_when_surplus_clamps(self):
-        """When charge is limited by surplus, integral is back-calculated."""
+class TestSurplusClampPreservesIntegral:
+    def test_integral_preserved_when_surplus_clamps(self):
+        """When charge is limited by surplus, integral is preserved.
+
+        The surplus cap is a transient physical constraint (device latency),
+        not PI saturation.  The PIController's own anti-windup handles
+        the hard output limits.
+        """
         logic = make_logic(deadband_w=0, max_charge_w=2400)
         logic.state.mode = OperatingMode.CHARGING
         logic.state.integral = -500.0
@@ -766,8 +773,9 @@ class TestAntiWindupSurplusClamp:
         output = logic.compute(m, now=0)
         # Result should be clamped to -50W (surplus limited)
         assert output.desired_power_w == pytest.approx(-50.0)
-        # Integral back-calculated: clamped - p_term
-        assert logic.state.integral != -500.0
+        # Integral preserved — NOT back-calculated from surplus clamp
+        # (new_integral from PI update, close to -500)
+        assert logic.state.integral < -400.0
 
     def test_no_back_calculation_when_unclamped(self):
         """When output is not clamped, integral is committed as-is."""
