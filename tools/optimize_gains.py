@@ -841,8 +841,8 @@ _sys_cfg: SystemConfig = SystemConfig()
 COST_FEED_IN_EUR_PER_WH = 0.20 / 1000   # €0.20/kWh = €0.0002/Wh
 """Feed-in: electricity purchased but exported to the grid."""
 
-COST_RELAY_EUR_PER_SWITCH = 700.0 / 300_000  # €0.00233/switch
-"""Relay wear: 300 000 switches = one battery replacement (€700)."""
+COST_RELAY_EUR_PER_SWITCH = 700.0 / 600_000  # €0.00117/switch
+"""Relay wear: 600 000 switches = one battery replacement (€700)."""
 
 COST_IAE_EUR_PER_WS = 0.20 / 3_600_000  # €0.20/kWh → €/W·s
 """Tracking error proxy: each W·s of absolute grid error ≈ misplaced
