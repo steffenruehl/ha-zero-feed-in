@@ -5,3 +5,4 @@ __pycache__/
 config/secrets.yaml
 config/apps.yaml
 run/
+data/
