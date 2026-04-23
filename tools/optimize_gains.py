@@ -235,6 +235,8 @@ class SimResult:
     grid_w: np.ndarray
     desired_w: np.ndarray
     battery_w: np.ndarray
+    p_term_w: np.ndarray       # proportional term per step (W)
+    i_term_w: np.ndarray       # integral term per step (W)
     feed_in_energy_wh: float   # total energy fed into grid (Wh)
     iae: float                 # integral absolute error (W·s)
     max_feed_in_w: float       # worst-case feed-in spike (W)
@@ -279,6 +281,8 @@ def _simulate_full(
     grid_out = np.empty(n)
     desired_out = np.empty(n)
     battery_out = np.empty(n)
+    p_term_out = np.empty(n)
+    i_term_out = np.empty(n)
     now = 0.0
 
     for k in range(n):
@@ -294,6 +298,8 @@ def _simulate_full(
         output = logic.compute(m, now=now)
         desired_w = output.desired_power_w
         desired_out[k] = desired_w
+        p_term_out[k] = output.p_term
+        i_term_out[k] = output.i_term
         step_dt = float(dt_arr[k]) if k + 1 < n else IDENT_DT_S
         battery_out[k] = plant.step(desired_w, step_dt)
         now += step_dt
@@ -318,6 +324,8 @@ def _simulate_full(
         grid_w=grid_out,
         desired_w=desired_out,
         battery_w=battery_out,
+        p_term_w=p_term_out,
+        i_term_w=i_term_out,
         feed_in_energy_wh=feed_in_energy_wh,
         iae=iae,
         max_feed_in_w=max_feed_in,
@@ -397,6 +405,8 @@ def simulate_fast(
     grid_out = np.empty(n)
     desired_out = np.empty(n)
     battery_out = np.empty(n)
+    p_term_out = np.empty(n)
+    i_term_out = np.empty(n)
 
     # Controller state.
     mode = _MODE_DISCHARGING
@@ -440,6 +450,8 @@ def simulate_fast(
             integral = forced
             last_computed = forced
             desired_out[k] = forced
+            p_term_out[k] = 0.0
+            i_term_out[k] = forced
             if delay_d > 0:
                 effective = delay_buf[0]
                 del delay_buf[0]
@@ -534,7 +546,8 @@ def simulate_fast(
         elif desired_w < 0:
             if surplus <= 0 or soc_k >= max_soc:
                 desired_w = 0.0
-                integral = 0.0
+                # Transient guard — freeze integral to avoid large
+                # transients when surplus returns.
                 guard_fired = True
 
         if not guard_fired:
@@ -561,6 +574,8 @@ def simulate_fast(
 
         last_computed = desired_w
         desired_out[k] = desired_w
+        p_term_out[k] = p_term
+        i_term_out[k] = integral
         if delay_d > 0:
             effective = delay_buf[0]
             del delay_buf[0]
@@ -590,6 +605,8 @@ def simulate_fast(
         grid_w=grid_out,
         desired_w=desired_out,
         battery_w=battery_out,
+        p_term_w=p_term_out,
+        i_term_w=i_term_out,
         feed_in_energy_wh=feed_in_energy_wh,
         iae=iae,
         max_feed_in_w=max_feed_in_val,

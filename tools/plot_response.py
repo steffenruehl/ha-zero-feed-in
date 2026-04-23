@@ -223,7 +223,7 @@ def plot_scenario(
     for label, params in gain_sets.items():
         results[label] = simulate_fast(params, plant_abc, ta, sys_cfg)
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
     fig.suptitle(sc.title, fontsize=14, fontweight="bold")
     colors = plt.cm.tab10.colors
 
@@ -251,8 +251,21 @@ def plot_scenario(
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, alpha=0.3)
 
-    # Panel 3: Disturbance (input)
+    # Panel 3: P and I terms
     ax = axes[2]
+    ax.set_ylabel("P / I term (W)")
+    ax.axhline(0, color="black", ls="-", lw=0.5)
+    for i, (label, r) in enumerate(results.items()):
+        c = colors[i % len(colors)]
+        ax.plot(t_min, r.p_term_w, color=c, lw=1.0, ls="-",
+                label=f"{label} P", alpha=0.85)
+        ax.plot(t_min, r.i_term_w, color=c, lw=1.0, ls="--",
+                label=f"{label} I", alpha=0.85)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 4: Disturbance (input)
+    ax = axes[3]
     ax.set_ylabel("Disturbance (W)")
     ax.set_xlabel("Time (min)")
     ax.plot(t_min, sc.disturbance[:n], color="gray", lw=1.0, alpha=0.7, label="disturbance")

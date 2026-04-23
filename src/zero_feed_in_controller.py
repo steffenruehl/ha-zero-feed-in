@@ -447,6 +447,8 @@ class ControlOutput:
     """Feed-forward term (W). Sum of all FF sources."""
     reason: str
     """Human-readable decision reason (e.g. 'EMERGENCY', 'SOC too low')."""
+    freeze_integral: bool = False
+    """If True, the guard is transient — preserve PI integral state."""
 
     @staticmethod
     def from_raw(
@@ -455,6 +457,7 @@ class ControlOutput:
         i_term: float,
         ff_term: float,
         reason: str,
+        freeze_integral: bool = False,
     ) -> ControlOutput:
         """Construct from a raw (possibly clamped) power value."""
         return ControlOutput(
@@ -463,14 +466,19 @@ class ControlOutput:
             i_term=i_term,
             ff_term=ff_term,
             reason=reason,
+            freeze_integral=freeze_integral,
         )
 
     @staticmethod
     def idle(
         p_term: float, i_term: float, ff_term: float, reason: str,
+        freeze_integral: bool = False,
     ) -> ControlOutput:
         """Shorthand for a zero-power (idle) output with a guard reason."""
-        return ControlOutput.from_raw(0.0, p_term, i_term, ff_term, reason)
+        return ControlOutput.from_raw(
+            0.0, p_term, i_term, ff_term, reason,
+            freeze_integral=freeze_integral,
+        )
 
 
 @dataclass
@@ -808,11 +816,15 @@ class ControlLogic:
 
         guarded = self._apply_guards(combined, m, surplus)
         if guarded is not None:
-            # Guard forces idle — reset integral so PI starts fresh when
-            # the guard clears.  The integral is only meaningful in a
-            # closed loop; while the output is blocked there is no feedback.
-            self.state.integral = 0.0
-            self._last_i = 0.0
+            if guarded.freeze_integral:
+                # Transient guard (e.g. momentary surplus dip) — keep
+                # integral so PI resumes smoothly when guard clears.
+                pass
+            else:
+                # Structural guard (SOC too low, charge/discharge disabled)
+                # — integral is meaningless while output is blocked.
+                self.state.integral = 0.0
+                self._last_i = 0.0
             self.state.last_computed_w = guarded.desired_power_w
             self.ff.update_previous(m.ff_readings, dt)
             return guarded
@@ -1006,11 +1018,13 @@ class ControlLogic:
                 return ControlOutput.idle(
                     self._last_p, self._last_i,
                     self._last_ff, "No surplus, charge blocked",
+                    freeze_integral=True,
                 )
             if m.soc_pct >= self.cfg.max_soc_pct:
                 return ControlOutput.idle(
                     self._last_p, self._last_i,
                     self._last_ff, "SOC full",
+                    freeze_integral=True,
                 )
 
         return None
