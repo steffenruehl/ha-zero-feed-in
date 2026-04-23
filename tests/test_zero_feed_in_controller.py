@@ -556,8 +556,6 @@ class TestConfigFromArgs:
         assert cfg.max_soc_pct == 100.0
         assert cfg.dry_run is True
         assert cfg.debug is False
-        assert cfg.battery_sensor_mode == "signed"
-        assert cfg.ac_mode_entity is None
         assert cfg.charge_switch is None
         assert cfg.discharge_switch is None
         assert cfg.relay_locked_sensor is None
@@ -581,8 +579,6 @@ class TestConfigFromArgs:
             "dry_run": False,
             "debug": True,
             "sensor_prefix": "sensor.test",
-            "battery_sensor_mode": "unsigned",
-            "ac_mode_entity": "select.ac_mode",
             "charge_switch": "input_boolean.charge",
             "discharge_switch": "input_boolean.discharge",
         }
@@ -609,8 +605,6 @@ class TestConfigFromArgs:
         assert cfg.dry_run is False
         assert cfg.debug is True
         assert cfg.sensor_prefix == "sensor.test"
-        assert cfg.battery_sensor_mode == "unsigned"
-        assert cfg.ac_mode_entity == "select.ac_mode"
         assert cfg.charge_switch == "input_boolean.charge"
         assert cfg.discharge_switch == "input_boolean.discharge"
 
