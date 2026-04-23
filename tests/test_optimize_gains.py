@@ -24,6 +24,7 @@ from tools.optimize_gains import (
     TraceArrays,
     _simulate_full,
     cost,
+    cost_euros,
     load_checkpoint,
     load_result,
     params_to_config,
@@ -47,6 +48,7 @@ DEFAULT_PARAMS = np.array([
     35.0,                         # deadband
     30.0, 30.0,                   # ff_tau, ff_deadband
     0.8, 0.6,                     # ff_gain_pv, ff_gain_load
+    10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
 ])
 
 DEFAULT_SYS_CFG = SystemConfig(
@@ -120,6 +122,9 @@ def assert_results_match(
     assert fast.control_effort == pytest.approx(
         full.control_effort, rel=1e-4,
     ), f"{prefix}control_effort"
+    assert fast.relay_switches == full.relay_switches, (
+        f"{prefix}relay_switches: fast={fast.relay_switches} != full={full.relay_switches}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -339,6 +344,7 @@ def _make_sim_result(n: int = 10, **overrides) -> SimResult:
         iae=12345.0,
         max_feed_in_w=67.0,
         control_effort=890.0,
+        relay_switches=3,
     )
     defaults.update(overrides)
     return SimResult(**defaults)
@@ -400,7 +406,7 @@ class TestSaveLoadResult:
             generations=1, converged=False, elapsed_s=1.0,
         )
         data = load_result(result_path)
-        for key in ("feed_in_energy_wh", "max_feed_in_w", "iae", "control_effort"):
+        for key in ("feed_in_energy_wh", "max_feed_in_w", "iae", "control_effort", "relay_switches"):
             assert key in data["baseline_metrics"]
             assert key in data["optimized_metrics"]
 
@@ -555,6 +561,7 @@ class TestParamsToConfig:
             0.1, 0.2, 0.3, 0.4,
             0.01, 0.02, 0.03, 0.04,
             20.0, 30.0, 10.0, 0.8, 0.6,
+            10000, 25, 90, 25,
         ])
         cfg = params_to_config(params, DEFAULT_SYS_CFG)
         assert cfg.kp_discharge_up == pytest.approx(0.1)
@@ -568,6 +575,7 @@ class TestParamsToConfig:
             0.1, 0.2, 0.3, 0.4,
             0.01, 0.02, 0.03, 0.04,
             20.0, 30.0, 10.0, 0.8, 0.6,
+            10000, 25, 90, 25,
         ])
         cfg = params_to_config(params, DEFAULT_SYS_CFG)
         assert cfg.ki_discharge_up == pytest.approx(0.01)
@@ -600,6 +608,7 @@ class TestParamsToConfig:
             0.1, 0.2, 0.3, 0.4,
             0.01, 0.02, 0.03, 0.04,
             42.0, 55.0, 15.0, 0.9, 0.7,
+            10000, 25, 90, 25,
         ])
         cfg = params_to_config(params, DEFAULT_SYS_CFG)
         assert cfg.deadband_w == pytest.approx(42.0)
@@ -634,22 +643,18 @@ class TestCostFunction:
         assert c > 0
 
     def test_cost_weight_dominance(self) -> None:
-        """Feed-in energy dominates the cost (weight 100)."""
+        """Feed-in energy dominates the cost."""
         import tools.optimize_gains as og
         r = simulate(DEFAULT_PARAMS, PLANT_ABC, og._traces, DEFAULT_SYS_CFG)
         c = cost(DEFAULT_PARAMS)
-        feedin_term = 100.0 * r.feed_in_energy_wh
+        feedin_term = og.COST_FEED_IN_EUR_PER_WH * r.feed_in_energy_wh
         assert feedin_term <= c
 
     def test_cost_consistent_with_simulate(self) -> None:
-        """cost() equals the manual cost formula applied to simulate()."""
+        """cost() equals cost_euros() applied to simulate()."""
         import tools.optimize_gains as og
         r = simulate(DEFAULT_PARAMS, PLANT_ABC, og._traces, DEFAULT_SYS_CFG)
-        expected = (
-            100.0 * r.feed_in_energy_wh
-            + 0.001 * r.iae
-            + 0.0001 * r.control_effort
-        )
+        expected = cost_euros(r)
         assert cost(DEFAULT_PARAMS) == pytest.approx(expected)
 
 

@@ -36,6 +36,11 @@ from src.zero_feed_in_controller import (
     FeedForwardSource,
     Measurement,
 )
+from src.zendure_solarflow_driver import (
+    AdaptiveLockout,
+    RelayStateMachine,
+    RELAY_SWITCH_DELAY_S,
+)
 
 
 # ── Plant model ──────────────────────────────────────────────
@@ -138,6 +143,8 @@ PARAM_NAMES = [
     "deadband_w",
     "ff_filter_tau_s", "ff_deadband_w",
     "ff_gain_pv", "ff_gain_load",
+    "relay_lockout_ws", "relay_lockout_cutoff_w",
+    "relay_lockout_idle_s", "min_active_power_w",
 ]
 
 BOUNDS = [
@@ -154,6 +161,10 @@ BOUNDS = [
     (0, 60),       # ff_deadband_w
     (0.1, 1.5),   # ff_gain_pv
     (0.1, 1.5),   # ff_gain_load
+    (500, 20000),  # relay_lockout_ws
+    (10, 100),     # relay_lockout_cutoff_w
+    (10, 300),     # relay_lockout_idle_s
+    (10, 100),     # min_active_power_w
 ]
 
 
@@ -241,6 +252,7 @@ class SimResult:
     iae: float                 # integral absolute error (W·s)
     max_feed_in_w: float       # worst-case feed-in spike (W)
     control_effort: float      # Σ|Δdesired| (W)
+    relay_switches: int        # number of relay direction changes
 
 
 def simulate(
@@ -273,11 +285,28 @@ def _simulate_full(
     reading (load entities left absent → contribute 0).  This exercises
     ``ff_gain_pv`` exactly; ``ff_gain_load`` is not exercised here but
     *is* exercised in ``simulate_fast`` via asymmetric gain selection.
+
+    Includes a relay state machine that gates direction changes behind
+    an adaptive energy lockout, matching the production driver.
     """
     cfg = params_to_config(params, sys_cfg)
     logic = ControlLogic(cfg, log=None)
     logic.seed(None)
     plant = PlantModel(*plant_abc, delay_steps=sys_cfg.delay_steps)
+
+    # Relay state machine (uses real driver classes).
+    relay_lockout_ws = float(params[13])
+    relay_lockout_cutoff_w = float(params[14])
+    relay_lockout_idle_s = float(params[15])
+    min_active_power_w = float(params[16])
+
+    sm = RelayStateMachine(
+        idle_lockout_s=relay_lockout_idle_s,
+        charge_lockout=AdaptiveLockout(cutoff_w=relay_lockout_cutoff_w),
+        discharge_lockout=AdaptiveLockout(cutoff_w=relay_lockout_cutoff_w),
+        threshold_ws=relay_lockout_ws,
+        min_active_power_w=min_active_power_w,
+    )
 
     disturbance = np.array(traces["disturbance_w"])
     soc = np.array(traces["soc_pct"])
@@ -290,10 +319,15 @@ def _simulate_full(
     p_term_out = np.empty(n)
     i_term_out = np.empty(n)
     now = 0.0
+    relay_switches = 0
+    relay_locked_until = 0.0
 
     for k in range(n):
         grid_w = disturbance[k] - plant.battery_w
         grid_out[k] = grid_w
+
+        # Relay locked feedback → freeze integral in controller.
+        relay_locked = now < relay_locked_until
 
         # Synthetic FF reading: feed disturbance as the PV entity so
         # FeedForward reacts to PV-dominated disturbance ramps.
@@ -304,15 +338,24 @@ def _simulate_full(
             soc_pct=float(soc[k]),
             battery_power_w=plant.battery_w,
             ff_readings=ff_readings,
+            relay_locked=relay_locked,
         )
 
         output = logic.compute(m, now=now)
         desired_w = output.desired_power_w
-        desired_out[k] = desired_w
+
+        # Pass through relay SM.
+        old_state = sm.state
+        allowed_w = sm.update(desired_w, now)
+        if sm.state != old_state:
+            relay_switches += 1
+            relay_locked_until = now + RELAY_SWITCH_DELAY_S
+
+        desired_out[k] = allowed_w
         p_term_out[k] = output.p_term
         i_term_out[k] = output.i_term
         step_dt = float(dt_arr[k]) if k + 1 < n else IDENT_DT_S
-        battery_out[k] = plant.step(desired_w, step_dt)
+        battery_out[k] = plant.step(allowed_w, step_dt)
         now += step_dt
 
     # Metrics
@@ -341,6 +384,7 @@ def _simulate_full(
         iae=iae,
         max_feed_in_w=max_feed_in,
         control_effort=effort,
+        relay_switches=relay_switches,
     )
 
 
@@ -383,6 +427,10 @@ def simulate_fast(
     ff_deadband = float(params[10])
     ff_gain_pv = float(params[11])
     ff_gain_load = float(params[12])
+    relay_lockout_ws = float(params[13])
+    relay_lockout_cutoff_w = float(params[14])
+    relay_lockout_idle_s = float(params[15])
+    min_active_power_w = float(params[16])
 
     # Fixed system params.
     max_discharge_w = sys_cfg.max_discharge_w
@@ -440,9 +488,123 @@ def simulate_fast(
     ff_ema: float | None = None  # feed-forward EMA state
     surplus_ema: float | None = None  # surplus clamp EMA (τ=10s)
 
+    # Relay SM state (inlined from RelayStateMachine for speed).
+    # States: 0=IDLE, 1=CHARGING, 2=DISCHARGING
+    _SM_IDLE = 0
+    _SM_CHARGING = 1
+    _SM_DISCHARGING = 2
+    _DIRECTION_THRESHOLD = 10.0
+    _RELAY_SWITCH_DELAY_S = 8.0
+
+    sm_state = _SM_IDLE
+    sm_charge_acc_ws = 0.0   # adaptive lockout accumulator for CHARGING
+    sm_discharge_acc_ws = 0.0  # adaptive lockout accumulator for DISCHARGING
+    sm_idle_acc_s = 0.0      # time accumulator for IDLE transition
+    sm_charge_last_t = 0.0
+    sm_discharge_last_t = 0.0
+    sm_idle_last_t = 0.0
+    sm_departure_since = 0.0
+    relay_switches = 0
+    relay_locked_until = 0.0
+
     # Transport delay buffer (FIFO: oldest at index 0).
     delay_d = sys_cfg.delay_steps
     delay_buf = [0.0] * delay_d
+
+    # Inline relay SM update as a local function (closure over SM state).
+    # This avoids class/method overhead while keeping the logic readable.
+    def _sm_update(desired_w: float) -> float:
+        """Apply relay SM: returns allowed power, may change sm_state."""
+        nonlocal sm_state, sm_charge_acc_ws, sm_discharge_acc_ws
+        nonlocal sm_idle_acc_s, sm_charge_last_t, sm_discharge_last_t
+        nonlocal sm_idle_last_t, sm_departure_since, relay_switches
+        nonlocal relay_locked_until
+
+        # Classify desired direction.
+        if desired_w > _DIRECTION_THRESHOLD:
+            sm_target = _SM_DISCHARGING
+        elif desired_w < -_DIRECTION_THRESHOLD:
+            sm_target = _SM_CHARGING
+        else:
+            sm_target = _SM_IDLE
+
+        if sm_target == sm_state:
+            # Stable — reset all transition accumulators.
+            sm_charge_acc_ws = 0.0
+            sm_discharge_acc_ws = 0.0
+            sm_idle_acc_s = 0.0
+            sm_charge_last_t = 0.0
+            sm_discharge_last_t = 0.0
+            sm_idle_last_t = 0.0
+            sm_departure_since = 0.0
+            return _sm_clamp(sm_state, desired_w)
+
+        # Track departure time for safety timeout.
+        if sm_departure_since == 0.0:
+            sm_departure_since = now
+
+        # Tick only the target's accumulator.
+        can_switch = False
+        if sm_target == _SM_IDLE:
+            if sm_idle_last_t > 0.0:
+                idt = now - sm_idle_last_t
+                if idt > 0:
+                    sm_idle_acc_s += idt
+            sm_idle_last_t = now
+            sm_charge_last_t = 0.0
+            sm_discharge_last_t = 0.0
+            can_switch = sm_idle_acc_s >= relay_lockout_idle_s
+        elif sm_target == _SM_CHARGING:
+            if sm_charge_last_t > 0.0:
+                cdt = now - sm_charge_last_t
+                if cdt > 0:
+                    eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
+                    sm_charge_acc_ws += eff_w * cdt
+            sm_charge_last_t = now
+            sm_discharge_last_t = 0.0
+            sm_idle_last_t = 0.0
+            can_switch = sm_charge_acc_ws >= relay_lockout_ws
+        elif sm_target == _SM_DISCHARGING:
+            if sm_discharge_last_t > 0.0:
+                ddt = now - sm_discharge_last_t
+                if ddt > 0:
+                    eff_w = max(abs(desired_w), relay_lockout_cutoff_w)
+                    sm_discharge_acc_ws += eff_w * ddt
+            sm_discharge_last_t = now
+            sm_charge_last_t = 0.0
+            sm_idle_last_t = 0.0
+            can_switch = sm_discharge_acc_ws >= relay_lockout_ws
+
+        # Safety cap.
+        if not can_switch and (now - sm_departure_since) >= 600.0:
+            can_switch = True
+
+        if can_switch:
+            sm_state = sm_target
+            # Reset all accumulators.
+            sm_charge_acc_ws = 0.0
+            sm_discharge_acc_ws = 0.0
+            sm_idle_acc_s = 0.0
+            sm_charge_last_t = 0.0
+            sm_discharge_last_t = 0.0
+            sm_idle_last_t = 0.0
+            sm_departure_since = 0.0
+            relay_switches += 1
+            relay_locked_until = now + _RELAY_SWITCH_DELAY_S
+            return _sm_clamp(sm_state, desired_w)
+
+        # Not ready — stay in current state.
+        return _sm_clamp(sm_state, desired_w)
+
+    def _sm_clamp(state: int, desired_w: float) -> float:
+        """Clamp desired_w to the current relay state constraints."""
+        if state == _SM_IDLE:
+            return 0.0
+        if state == _SM_CHARGING:
+            return min(-min_active_power_w, desired_w)
+        if state == _SM_DISCHARGING:
+            return max(min_active_power_w, desired_w)
+        return 0.0
 
     for k in range(n):
         # ── Grid measurement ──
@@ -471,6 +633,9 @@ def simulate_fast(
         else:
             surplus_ema = _surplus_alpha * surplus + (1.0 - _surplus_alpha) * surplus_ema
 
+        # ── Relay locked? (freeze integral during relay switch delay) ──
+        relay_locked = now < relay_locked_until
+
         # ── Emergency protection ──
         feed_in = -grid_w if grid_w < 0 else 0.0
         if feed_in > max_feed_in_w:
@@ -480,9 +645,13 @@ def simulate_fast(
                 forced = 0.0
             integral = forced
             last_computed = forced
+
+            # Pass emergency output through relay SM.
+            forced = _sm_update(forced)
+
             desired_out[k] = forced
             p_term_out[k] = 0.0
-            i_term_out[k] = forced
+            i_term_out[k] = integral
             if delay_d > 0:
                 effective = delay_buf[0]
                 del delay_buf[0]
@@ -545,6 +714,7 @@ def simulate_fast(
         if in_deadband:
             # Frozen: hold last output, integral unchanged, p_term = 0.
             pi_out = last_computed
+            new_integral = integral  # don't integrate when in deadband
         else:
             if abs_error > deadband_w:
                 db_acc = 0.0
@@ -612,15 +782,19 @@ def simulate_fast(
             desired_w = clamped
 
         last_computed = desired_w
-        desired_out[k] = desired_w
+
+        # ── Relay SM (inlined adaptive lockout) ──
+        allowed_w = _sm_update(desired_w)
+
+        desired_out[k] = allowed_w
         p_term_out[k] = p_term
         i_term_out[k] = integral
         if delay_d > 0:
             effective = delay_buf[0]
             del delay_buf[0]
-            delay_buf.append(desired_w)
+            delay_buf.append(allowed_w)
         else:
-            effective = desired_w
+            effective = allowed_w
         battery_w = pa_l[k] * battery_w + pb_l[k] * effective + pc_l[k]
         battery_out[k] = battery_w
         # Update FF EMA (always, matching production update_previous).
@@ -656,6 +830,7 @@ def simulate_fast(
         iae=iae,
         max_feed_in_w=max_feed_in_val,
         control_effort=effort,
+        relay_switches=relay_switches,
     )
 
 
@@ -668,19 +843,41 @@ _traces: TraceArrays | dict = {}
 _sys_cfg: SystemConfig = SystemConfig()
 
 
-def cost(params: np.ndarray) -> float:
-    """Optimization objective.  Lower = better.
+# ── Cost model (all terms in euros) ──────────────────────────
 
-    Primary: minimize feed-in energy (grid < 0).
-    Secondary: minimize tracking error (IAE).
-    Minor: penalize control effort.
+COST_FEED_IN_EUR_PER_WH = 0.20 / 1000   # €0.20/kWh = €0.0002/Wh
+"""Feed-in: electricity purchased but exported to the grid."""
+
+COST_RELAY_EUR_PER_SWITCH = 700.0 / 100_000  # €0.007/switch
+"""Relay wear: 100 000 switches = one battery replacement (€700)."""
+
+COST_IAE_EUR_PER_WS = 0.20 / 3_600_000  # €0.20/kWh → €/W·s
+"""Tracking error proxy: each W·s of absolute grid error ≈ misplaced
+energy at electricity price.  Small vs feed-in to avoid double-counting."""
+
+COST_EFFORT_EUR_PER_W = 1e-6
+"""Control effort regulariser: minor penalty for actuator churn."""
+
+
+def cost_euros(result: SimResult) -> float:
+    """Compute total cost in euros from simulation metrics."""
+    return (
+        COST_FEED_IN_EUR_PER_WH * result.feed_in_energy_wh
+        + COST_RELAY_EUR_PER_SWITCH * result.relay_switches
+        + COST_IAE_EUR_PER_WS * result.iae
+        + COST_EFFORT_EUR_PER_W * result.control_effort
+    )
+
+
+def cost(params: np.ndarray) -> float:
+    """Optimization objective (euros).  Lower = better.
+
+    Primary: minimize feed-in energy (€0.20/kWh).
+    Secondary: minimize relay switches (€0.007/switch).
+    Minor: tracking error + actuator smoothness.
     """
     result = simulate(params, _plant_abc, _traces, _sys_cfg)
-    return (
-        100.0 * result.feed_in_energy_wh   # primary: Wh fed in
-        + 0.001 * result.iae               # secondary: tracking
-        + 0.0001 * result.control_effort   # minor: smoothness
-    )
+    return cost_euros(result)
 
 
 def _init_worker(plant_abc, traces: TraceArrays, sys_cfg):
@@ -753,11 +950,7 @@ def sensitivity_analysis(optimized: np.ndarray, plant_abc, traces: dict | TraceA
             lo, hi = BOUNDS[i]
             perturbed[i] = np.clip(perturbed[i], lo, hi)
             r = simulate(perturbed, plant_abc, traces, sys_cfg)
-            c = (
-                100.0 * r.feed_in_energy_wh
-                + 0.001 * r.iae
-                + 0.0001 * r.control_effort
-            )
+            c = cost_euros(r)
             costs.append(c)
 
         cost_at_neg5.append(costs[1])  # -5% is index 1
@@ -864,6 +1057,7 @@ def save_result(
             "max_feed_in_w": r.max_feed_in_w,
             "iae": r.iae,
             "control_effort": r.control_effort,
+            "relay_switches": r.relay_switches,
         }
 
     params_dict = {
@@ -955,11 +1149,7 @@ class ProgressTracker:
         """Display progress after each generation and save checkpoint."""
         self.gen += 1
         r = simulate(xk, _plant_abc, _traces, _sys_cfg)
-        c = (
-            100.0 * r.feed_in_energy_wh
-            + 0.001 * r.iae
-            + 0.0001 * r.control_effort
-        )
+        c = cost_euros(r)
         feedin = r.feed_in_energy_wh
         elapsed = time.time() - self.t0
 
@@ -974,9 +1164,9 @@ class ProgressTracker:
 
         print(
             f"  gen {self.gen:3d}  "
-            f"cost={c:9.1f} ({cost_pct:+5.1f}%)  "
+            f"cost=€{c:.4f} ({cost_pct:+5.1f}%)  "
             f"feed-in={feedin:6.1f} Wh ({feedin_pct:+5.1f}%)  "
-            f"best={self.best_cost:9.1f}  "
+            f"best=€{self.best_cost:.4f}  "
             f"[{elapsed:5.0f}s]"
         )
 
@@ -1007,14 +1197,23 @@ def print_comparison(current: np.ndarray, optimized: np.ndarray):
 
 
 def print_metrics(label: str, result: SimResult):
+    """Print simulation metrics with euro cost breakdown."""
+    c = cost_euros(result)
+    feed_eur = COST_FEED_IN_EUR_PER_WH * result.feed_in_energy_wh
+    relay_eur = COST_RELAY_EUR_PER_SWITCH * result.relay_switches
+    iae_eur = COST_IAE_EUR_PER_WS * result.iae
+    effort_eur = COST_EFFORT_EUR_PER_W * result.control_effort
     print(f"  {label}:")
-    print(f"    Feed-in energy:  {result.feed_in_energy_wh:8.1f} Wh")
+    print(f"    Feed-in energy:  {result.feed_in_energy_wh:8.1f} Wh  "
+          f"(€{feed_eur:.4f})")
     print(f"    Max feed-in:     {result.max_feed_in_w:8.0f} W")
-    print(f"    IAE:             {result.iae:11.0f} W*s")
-    print(f"    Control effort:  {result.control_effort:11.0f} W")
-    c = (100.0 * result.feed_in_energy_wh + 0.001 * result.iae
-         + 0.0001 * result.control_effort)
-    print(f"    Cost:            {c:11.1f}")
+    print(f"    Relay switches:  {result.relay_switches:8d}      "
+          f"(€{relay_eur:.4f})")
+    print(f"    IAE:             {result.iae:11.0f} W*s  "
+          f"(€{iae_eur:.4f})")
+    print(f"    Control effort:  {result.control_effort:11.0f} W    "
+          f"(€{effort_eur:.4f})")
+    print(f"    Total cost:      €{c:.4f}")
     return c
 
 
@@ -1086,6 +1285,7 @@ def main():
         35.0,                         # deadband
         30.0, 30.0,                   # ff_tau, ff_deadband
         0.8, 0.6,                     # ff_gain_pv, ff_gain_load
+        10000, 25, 90, 25,           # relay params (production defaults)
     ])
 
     # ── Validate (uses raw dict → _simulate_full for exact parity) ──
@@ -1117,6 +1317,7 @@ def main():
         5.1,                          # deadband
         30.6, 49.4,                   # ff_tau, ff_deadband
         1.41, 0.57,                   # ff_gain_pv, ff_gain_load
+        10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
     ])
 
     print("\n" + "=" * 65)
@@ -1146,9 +1347,16 @@ def main():
         resume_path = args.checkpoint
     if resume_path is not None and resume_path.exists():
         resume_data = load_checkpoint(resume_path)
-        print(f"\n  Resuming from checkpoint: {resume_path}")
-        print(f"    Generation: {resume_data['generation']}")
-        print(f"    Best cost:  {resume_data['best_cost']:.1f}")
+        # Discard checkpoint if param count changed (e.g. new relay params).
+        if len(resume_data.get("best_x", [])) != n_params:
+            print(f"\n  Checkpoint {resume_path} has "
+                  f"{len(resume_data.get('best_x', []))} params, "
+                  f"expected {n_params} — ignoring.")
+            resume_data = None
+        else:
+            print(f"\n  Resuming from checkpoint: {resume_path}")
+            print(f"    Generation: {resume_data['generation']}")
+            print(f"    Best cost:  {resume_data['best_cost']:.1f}")
 
     print("\n" + "=" * 65)
     print(f"  Step 3: Optimization — {n_params} params, "
@@ -1195,7 +1403,7 @@ def main():
 
     print(f"\n  {'gen':>5s}  {'cost':>12s} {'change':>9s}  "
           f"{'feed-in':>10s} {'change':>9s}  {'best':>12s}  {'time':>7s}")
-    print("  " + "-" * 68)
+    print("  " + "-" * 72)
 
     result = differential_evolution(
         cost,
@@ -1244,8 +1452,9 @@ def main():
     for name, cur, opt in [
         ("Feed-in (Wh)", baseline.feed_in_energy_wh, opt_result.feed_in_energy_wh),
         ("Max feed-in (W)", baseline.max_feed_in_w, opt_result.max_feed_in_w),
+        ("Relay switches", float(baseline.relay_switches), float(opt_result.relay_switches)),
         ("IAE (W*s)", baseline.iae, opt_result.iae),
-        ("Cost", baseline_cost, opt_cost),
+        ("Cost (€)", baseline_cost, opt_cost),
     ]:
         delta = opt - cur
         pct = delta / cur * 100 if cur != 0 else 0
@@ -1262,6 +1471,7 @@ def main():
     print("\n" + "=" * 65)
     print("  Recommended apps.yaml snippet")
     print("=" * 65)
+    print("  # Controller:")
     print(f"  kp_discharge_up: {optimized[0]:.3f}")
     print(f"  kp_discharge_down: {optimized[1]:.3f}")
     print(f"  kp_charge_up: {optimized[2]:.3f}")
@@ -1275,6 +1485,11 @@ def main():
     print(f"  ff_deadband: {optimized[10]:.1f}")
     print(f"  # ff_gain_pv: {optimized[11]:.2f}")
     print(f"  # ff_gain_load: {optimized[12]:.2f}")
+    print("  # Driver:")
+    print(f"  relay_lockout_ws: {optimized[13]:.0f}")
+    print(f"  relay_lockout_cutoff_w: {optimized[14]:.0f}")
+    print(f"  relay_lockout_idle_s: {optimized[15]:.0f}")
+    print(f"  min_active_power_w: {optimized[16]:.0f}")
 
     # ── Save result JSON ──
     save_result(

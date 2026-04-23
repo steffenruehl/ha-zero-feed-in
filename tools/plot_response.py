@@ -53,6 +53,7 @@ CURRENT_GAINS = np.array([
     35.0,                         # deadband
     30.0, 30.0,                   # ff_tau, ff_deadband
     0.8, 0.6,                     # ff_gain_pv, ff_gain_load
+    10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
 ])
 
 DEFAULT_SYS_CFG = SystemConfig(
