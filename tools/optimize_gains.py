@@ -148,11 +148,11 @@ PARAM_NAMES = [
 ]
 
 BOUNDS = [
-    (0.05, 0.8),  # kp_discharge_up
+    (0.01, 0.8),  # kp_discharge_up
     (0.05, 0.8),  # kp_discharge_down
     (0.05, 0.8),  # kp_charge_up
     (0.05, 0.8),  # kp_charge_down
-    (0.005, 0.3),  # ki_discharge_up
+    (0.001, 0.3),  # ki_discharge_up
     (0.005, 0.3),  # ki_discharge_down
     (0.005, 0.3),  # ki_charge_up
     (0.005, 0.3),  # ki_charge_down
@@ -162,7 +162,7 @@ BOUNDS = [
     (0.1, 1.5),   # ff_gain_pv
     (0.1, 1.5),   # ff_gain_load
     (500, 20000),  # relay_lockout_ws
-    (10, 100),     # relay_lockout_cutoff_w
+    (10, 200),     # relay_lockout_cutoff_w
     (10, 300),     # relay_lockout_idle_s
     (10, 100),     # min_active_power_w
 ]
@@ -841,8 +841,8 @@ _sys_cfg: SystemConfig = SystemConfig()
 COST_FEED_IN_EUR_PER_WH = 0.20 / 1000   # €0.20/kWh = €0.0002/Wh
 """Feed-in: electricity purchased but exported to the grid."""
 
-COST_RELAY_EUR_PER_SWITCH = 700.0 / 100_000  # €0.007/switch
-"""Relay wear: 100 000 switches = one battery replacement (€700)."""
+COST_RELAY_EUR_PER_SWITCH = 700.0 / 300_000  # €0.00233/switch
+"""Relay wear: 300 000 switches = one battery replacement (€700)."""
 
 COST_IAE_EUR_PER_WS = 0.20 / 3_600_000  # €0.20/kWh → €/W·s
 """Tracking error proxy: each W·s of absolute grid error ≈ misplaced
@@ -1189,19 +1189,26 @@ def print_comparison(current: np.ndarray, optimized: np.ndarray):
         print(f"  {name:<22s}  {cur:7.4f}   {opt:7.4f}  {arrow} {abs(pct):5.1f}%")
 
 
-def print_metrics(label: str, result: SimResult):
-    """Print simulation metrics with euro cost breakdown."""
+def print_metrics(label: str, result: SimResult,
+                  trace_days: float = 1.0) -> float:
+    """Print simulation metrics with euro cost breakdown.
+
+    *trace_days* normalises relay switches to a per-day rate so the
+    displayed count is independent of trace length.
+    """
     c = cost_euros(result)
     feed_eur = COST_FEED_IN_EUR_PER_WH * result.feed_in_energy_wh
     relay_eur = COST_RELAY_EUR_PER_SWITCH * result.relay_switches
     iae_eur = COST_IAE_EUR_PER_WS * result.iae
     effort_eur = COST_EFFORT_EUR_PER_W * result.control_effort
+    sw_per_day = result.relay_switches / trace_days if trace_days > 0 else 0
     print(f"  {label}:")
     print(f"    Feed-in energy:  {result.feed_in_energy_wh:8.1f} Wh  "
           f"(€{feed_eur:.4f})")
     print(f"    Max feed-in:     {result.max_feed_in_w:8.0f} W")
     print(f"    Relay switches:  {result.relay_switches:8d}      "
-          f"(€{relay_eur:.4f})")
+          f"(€{relay_eur:.4f})  "
+          f"= {sw_per_day:.0f}/day")
     print(f"    IAE:             {result.iae:11.0f} W*s  "
           f"(€{iae_eur:.4f})")
     print(f"    Control effort:  {result.control_effort:11.0f} W    "
@@ -1313,11 +1320,14 @@ def main():
         10000, 25, 90, 25,           # relay: lockout_ws, cutoff_w, idle_s, min_active_w
     ])
 
+    trace_days = float(trace_arrays.dt.sum()) / 86400.0
+    print(f"  Trace duration: {trace_days:.2f} days")
+
     print("\n" + "=" * 65)
     print("  Step 2: Baseline — current production gains")
     print("=" * 65)
     baseline = simulate(current_gains, plant_abc, trace_arrays, sys_cfg)
-    baseline_cost = print_metrics("Current gains", baseline)
+    baseline_cost = print_metrics("Current gains", baseline, trace_days)
 
     print("\n  Current parameter values:")
     for i, name in enumerate(PARAM_NAMES):
@@ -1439,13 +1449,15 @@ def main():
     print_comparison(current_gains, optimized)
 
     print()
-    opt_cost = print_metrics("Optimized", opt_result)
+    opt_cost = print_metrics("Optimized", opt_result, trace_days)
 
+    sw_cur_d = baseline.relay_switches / trace_days
+    sw_opt_d = opt_result.relay_switches / trace_days
     print(f"\n  Improvement:")
     for name, cur, opt in [
         ("Feed-in (Wh)", baseline.feed_in_energy_wh, opt_result.feed_in_energy_wh),
         ("Max feed-in (W)", baseline.max_feed_in_w, opt_result.max_feed_in_w),
-        ("Relay switches", float(baseline.relay_switches), float(opt_result.relay_switches)),
+        ("Relay sw/day", sw_cur_d, sw_opt_d),
         ("IAE (W*s)", baseline.iae, opt_result.iae),
         ("Cost (€)", baseline_cost, opt_cost),
     ]:
