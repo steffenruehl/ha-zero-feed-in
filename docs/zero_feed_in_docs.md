@@ -58,7 +58,7 @@ Controller (every 5s):
   relay_locked_sensor────────┤               (integral frozen when locked)
   dynamic_min_soc_entity ────┘               (forecast-adjusted min SOC)
 
-Driver (event-driven + watchdog every 5 s):
+Driver (every 2s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
                                 sensor.zfi_device_output, relay, etc.
 ```
@@ -70,7 +70,7 @@ Driver (event-driven + watchdog every 5 s):
 | What it knows | Grid power, SOC, surplus | Device protocol, relay timing |
 | What it doesn't know | outputLimit, inputLimit, acMode | PI gains, targets, modes |
 | Reusable for | Any battery | Only Zendure SolarFlow |
-| Update rate | 5 s (PI cycle) | Event-driven + watchdog (typically 5 s) |
+| Update rate | 5 s (PI cycle) | 2 s (react to new desired power) |
 
 ---
 
@@ -273,26 +273,26 @@ Power limits (outputLimit, inputLimit) are sent whenever their values change. No
 
 ### 3. Relay Lockout (adaptive, energy-integrator)
 
-The `RelayStateMachine` gates relay transitions behind an energy integrator (`AdaptiveLockout`).  Each tick accumulates `|power| × dt`; the transition fires when the accumulated energy reaches the configured `relay_lockout_ws` threshold (in W·s).
+The `RelayStateMachine` gates relay transitions behind an energy integrator (`AdaptiveLockout`).  Each tick accumulates `|power| × dt`; the transition fires when the accumulated energy reaches `full_power_w × base_lockout_s`.
 
 ```
-threshold = relay_lockout_ws   (e.g. 10 000 W·s)
+threshold = full_power_w × base_lockout_s   (e.g. 200 W × 30 s = 6 000 W·s)
 ```
 
-For sustained constant power the effective lockout is `threshold / |power|`:
+For sustained constant power the effective lockout is:
 
-| |desired_power| | Lockout (relay_lockout_ws=10000) | Rationale |
+| |desired_power| | Lockout (base=30s, ref=200W) | Rationale |
 | --- | --- | --- |
-| 500 W+ | 20 s | High surplus — worth switching |
-| 200 W | 50 s | Moderate — wait longer |
-| 100 W | 100 s | Marginal — probably not worth the relay wear |
-| <cutoff_w | Capped at 600 s (safety timeout) | Negligible — idle instead |
+| 200 W+ | 30 s | High surplus — worth switching |
+| 100 W | 60 s | Moderate — wait longer |
+| 50 W | 120 s | Marginal — probably not worth the relay wear |
+| <20 W | ≥300 s (safety cap) | Negligible — idle instead |
 
 IDLE transitions use an accumulated-time lockout (`idle_lockout_s`): time is only counted during ticks where IDLE is the target, so oscillations between non-current states accumulate IDLE time across interruptions.
 
 **Independent accumulators:** Each non-current state tracks its own transition progress independently. Switching between two non-current targets (e.g. oscillating between IDLE and DISCHARGE while in CHARGING) does **not** reset the other's accumulator. This ensures that even with oscillating desired power, the state machine eventually transitions — whichever accumulator reaches its threshold first wins. All accumulators are reset only when the desired state matches the current state (stable) or when an actual transition fires.
 
-A 600 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
+A 300 s safety timeout (`RELAY_SAFETY_TIMEOUT_S`) forces the transition if the integrator hasn't reached threshold (e.g. very low power).
 
 During lockout, power is **clamped** to the current direction's minimum active power (`min_active_power_w`, default 25 W), keeping the device responsive while preventing relay chatter.
 
@@ -311,7 +311,7 @@ Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calc
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
-... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the configured `relay_lockout_ws` threshold (in W·s) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 600 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
+... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
 
 ### 3. SOC Protection
 
@@ -334,103 +334,6 @@ Three layers:
 1. **Mode gate**: surplus ≤ 0 → charging blocked
 2. **Surplus clamp**: charge capped at available surplus
 3. **Asymmetric target**: target = 0 prevents PI from requesting grid power
-
-### 5. Controller Stale-Check (driver)
-
-If the controller app dies but AppDaemon continues running, the driver
-would perpetually act on a stale `sensor.zfi_desired_power`. The driver
-checks the entity's `last_updated` timestamp on every tick:
-
-- **Fresh** (age ≤ `controller_stale_s`, default 30 s): normal operation.
-- **Stale** (age > threshold): driver publishes its own output sensors as
-  **0 W** (`device_output`, `discharge_limit`, `charge_limit`) and sets
-  `sensor.zfi_controller_stale = true`.  The driver does **not** overwrite
-  `sensor.zfi_desired_power` (that is the controller's entity).
-  The watchdog handles sending 0 W to the physical device.
-- Logs a WARNING on the stale → fresh transition and vice versa.
-- Set `controller_stale_s: 0` to disable the check.
-
-### 6. MQTT Heartbeat Publishing
-
-Both the controller and driver can publish an ISO-8601 UTC timestamp to
-a configurable MQTT topic on every tick.  This enables external
-monitoring by an independent device (e.g. an ESP32 fallback controller)
-that watches the heartbeat topic and takes action when it goes stale.
-
-- Controller: `heartbeat_mqtt_topic: zfi/heartbeat/controller`
-- Driver: `heartbeat_mqtt_topic: zfi/heartbeat/driver`
-- Omit or leave empty to disable.
-
-### 7. Watchdog Heartbeat Monitoring + Safe State
-
-The MQTT Watchdog app (`solarflow_mqtt_watchdog.py`) can optionally
-monitor a list of HA entities for staleness.  When any entity's
-`last_updated` exceeds `heartbeat_stale_s` (default 60 s):
-
-- A HA **persistent notification** is created (one per entity).
-- If `output_limit_entity` and `input_limit_entity` are configured,
-  both are set to **0 W** (device safe state).  This catches the case
-  where the driver itself has died — the driver's own stale-check
-  only covers a dead controller, not a dead driver.
-- Safe state is sent once per stale transition.  When **all** entities
-  recover, safe state is released and normal operation resumes.
-- When the entity recovers, the notification is dismissed.
-- Entities to monitor are configured via `heartbeat_entities` (e.g.
-  `sensor.zfi_desired_power`, `sensor.zfi_device_output`).
-
-A **startup grace period** (`heartbeat_grace_s`, default 120 s)
-suppresses all stale checks after the watchdog starts, giving the
-controller, driver, and device time to boot without triggering
-spurious notifications or safe-state enforcement.
-
-The future ESP32 watchdog runs independently of HA — it subscribes to
-the MQTT heartbeat topics and only needs to **notify** the user.
-Safe-state enforcement lives in the HA watchdog because it has direct
-access to device entities via HA services.
-
-### 8. ESP Watchdog (`zfi_watchdog.yaml`)
-
-An ESPHome package (`src/zfi_watchdog.yaml`) that runs on an existing
-ESP8266 alongside other sensors (e.g. `heizung.yaml`).  Included via
-ESPHome `packages:` directive for clean separation.
-
-**How it works:**
-
-1. Connects to the MQTT broker and subscribes to
-   `zfi/heartbeat/controller` and `zfi/heartbeat/driver`.
-2. Tracks the last-received timestamp for each heartbeat.
-3. Every 30 s, checks if either heartbeat is older than 2 minutes.
-4. If stale: sends HTTP POST to the SolarFlow's **local HTTP API**
-   (`http://{ip}/properties/write`) with
-   `{"sn":"...","properties":{"outputLimit":0,"inputLimit":0}}`.
-5. When heartbeats resume: stops sending safe-state.
-
-**Independence:** The safe-state path is HA → MQTT broker → ESP → HTTP →
-SolarFlow.  If HA/AppDaemon die, only the broker and the SolarFlow
-need to be reachable on the LAN.  The HTTP API
-(`/properties/write`, `/properties/report`) is a direct device
-interface discovered in the Zendure HA integration source
-(`ZendureZenSdk.httpPost`).
-
-**Grace period:** 3 minutes after boot, all stale checks are
-suppressed to allow the controller and driver to start up.
-
-**HA entities published (via native API):**
-- `binary_sensor.heizung_zfi_watchdog_safe_state` — `problem` when
-  safe-state is active
-- `sensor.heizung_zfi_controller_heartbeat_age` — seconds since last
-  controller heartbeat
-- `sensor.heizung_zfi_driver_heartbeat_age` — seconds since last
-  driver heartbeat
-
-**Configuration:** Add to ESPHome secrets:
-```yaml
-mqtt_broker: "192.168.x.x"
-mqtt_user: "your_mqtt_user"
-mqtt_pass: "your_mqtt_password"
-solarflow_ip: "192.168.x.x"
-solarflow_serial: "HECxxxxxxxxxx"
-```
 
 ---
 
@@ -486,12 +389,9 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([Tick: event-driven + watchdog]) --> B{desired_power<br>available?}
+    A([Tick: every 2s]) --> B{desired_power<br>available?}
     B -- No --> Z([Skip])
-    B -- Yes --> STALE{Controller stale?<br>last_updated > 30s}
-    STALE -- Yes --> SAFE["Safe sensors: 0W out, limits<br>Publish controller_stale=true"]
-    SAFE --> Z2([Done])
-    STALE -- No --> SM{SM enabled?}
+    B -- Yes --> SM{SM enabled?}
     SM -- Yes --> SMU["RelayStateMachine.update()<br>clamps power to current state"]
     SM -- No --> PASS["allowed = desired"]
     SMU --> RND
@@ -587,7 +487,6 @@ Published only when `debug: true` in the controller config.
 | `zfi_charge_limit` | number | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | — | Physical relay state from AC mode entity |
 | `zfi_relay_locked` | text | — | `true` when SM is clamping output or relay is physically switching (8 s holdoff) |
-| `zfi_controller_stale` | text | — | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver publishes safe sensors (0 W) |
 
 ### Driver sensors (debug only)
 
@@ -606,29 +505,253 @@ Published only when `debug: true` in the driver config.
 
 ---
 
-## Lovelace Dashboards
+## Debug Dashboards
 
-This repository includes pre-built Lovelace dashboard YAML files for different purposes.
+### Full Debug Dashboard
 
-**For detailed setup, signal descriptions, and troubleshooting, see [DASHBOARDS.md](DASHBOARDS.md).**
+Shows all controller and driver states for troubleshooting. Copy to a manual HA dashboard card (YAML mode):
 
-### Quick Reference
+```yaml
+type: vertical-stack
+cards:
+  # ── Power overview ──────────────────────────────
+  - type: history-graph
+    title: Power & Control
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Grid Power
+      - entity: sensor.zfi_desired_power
+        name: Desired Power
+      - entity: sensor.zfi_device_output
+        name: Device Output
+      - entity: sensor.zfi_surplus
+        name: Surplus
+      - entity: sensor.zfi_battery_power
+        name: Battery Power
 
-| Dashboard | File | Purpose | Requirements |
-|-----------|------|---------|--------------|
-| **Operations** | `config/lovelace_zfi_operations.yaml` | Main control loop view: grid power, surplus, battery, desired power, device commands | Always available |
-| **PI Debug** | `config/lovelace_zfi_pi_debug.yaml` | PI controller internals: P/I terms, integral, target, error, deadband, mode changes | `debug: true` |
-| **Relay State Machine** | `config/lovelace_zfi_relay_sm_debug.yaml` | Relay transitions: current state, pending target, lockout progress, energy accumulation | `debug: true` |
-| **Feed-Forward Debug** | `config/lovelace_ff_debug.yaml` | Feed-forward filtering: PV EMA, contribution sources, forecast min SOC | `debug: true` (if FF enabled) |
+  # ── Device commands ─────────────────────────────
+  - type: history-graph
+    title: Device Commands
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.zfi_discharge_limit
+        name: Discharge Limit
+      - entity: sensor.zfi_charge_limit
+        name: Charge Limit
 
-### Setup Instructions
+  # ── PI internals ────────────────────────────────
+  - type: history-graph
+    title: PI Controller
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.zfi_error
+        name: Error
+      - entity: sensor.zfi_p_term
+        name: P Term
+      - entity: sensor.zfi_i_term
+        name: I Term
+      - entity: sensor.zfi_integral
+        name: Integral
+      - entity: sensor.zfi_target
+        name: Target
 
-1. **In Home Assistant**, navigate to **Dashboards** → Create a new dashboard (or edit an existing one)
-2. In **raw YAML edit mode**, paste the entire contents of one of the dashboard files above
-3. Replace sensor entity IDs (e.g., `sensor.zfi_*`) if you customized your sensor prefix
-4. Save and view
+  # ── Battery ─────────────────────────────────────
+  - type: history-graph
+    title: Battery
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.hec4nencn492140_electriclevel
+        name: SOC %
 
-For detailed signal descriptions, tuning guidance, and troubleshooting, see [DASHBOARDS.md](DASHBOARDS.md).
+  # ── Relay state machine ─────────────────────────
+  - type: history-graph
+    title: Relay State Machine
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout Progress %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+
+  # ── Current state (entities card) ───────────────
+  - type: entities
+    title: ZFI Status
+    entities:
+      - entity: sensor.zfi_desired_power
+        name: Desired Power
+      - entity: sensor.zfi_device_output
+        name: Device Output
+      - entity: sensor.zfi_mode
+        name: Mode
+      - entity: sensor.zfi_relay
+        name: Relay
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
+      - entity: sensor.zfi_surplus
+        name: Surplus
+      - entity: sensor.zfi_battery_power
+        name: Battery Power
+      - entity: sensor.zfi_target
+        name: Target
+      - entity: sensor.zfi_error
+        name: Error
+      - entity: sensor.zfi_p_term
+        name: P Term
+      - entity: sensor.zfi_i_term
+        name: I Term
+      - entity: sensor.zfi_integral
+        name: Integral
+      - entity: sensor.zfi_discharge_limit
+        name: Discharge Limit
+      - entity: sensor.zfi_charge_limit
+        name: Charge Limit
+      - entity: sensor.zfi_reason
+        name: Reason
+      - type: divider
+      - entity: sensor.zfi_relay_sm_state
+        name: SM State
+      - entity: sensor.zfi_relay_sm_pending
+        name: SM Pending
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: SM Lockout %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: SM Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: SM Threshold (W·s)
+      - type: divider
+      - entity: select.hec4nencn492140_acmode
+        name: AC Mode (device)
+      - entity: number.hec4nencn492140_outputlimit
+        name: outputLimit (device)
+      - entity: number.hec4nencn492140_inputlimit
+        name: inputLimit (device)
+      - entity: sensor.hec4nencn492140_electriclevel
+        name: SOC (device)
+      - type: divider
+      - entity: input_boolean.zfi_charge_enabled
+        name: Charge Enabled
+      - entity: input_boolean.zfi_discharge_enabled
+        name: Discharge Enabled
+```
+
+### Compact Overview Dashboard
+
+For daily monitoring (not debugging):
+
+```yaml
+type: vertical-stack
+cards:
+  - type: history-graph
+    title: Zero Feed-In
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Grid
+      - entity: sensor.zfi_surplus
+        name: Surplus
+      - entity: sensor.zfi_desired_power
+        name: Desired
+      - entity: sensor.zfi_device_output
+        name: Output
+
+  - type: entities
+    title: Status
+    entities:
+      - entity: sensor.zfi_mode
+      - entity: sensor.zfi_reason
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
+      - entity: sensor.hec4nencn492140_electriclevel
+        name: SOC
+      - entity: input_boolean.zfi_charge_enabled
+      - entity: input_boolean.zfi_discharge_enabled
+```
+
+### Relay State Machine Debug Dashboard
+
+For diagnosing relay transitions and adaptive lockout behaviour:
+
+```yaml
+type: vertical-stack
+cards:
+  # ── Lockout energy integrator over time ─────────
+  - type: history-graph
+    title: Adaptive Lockout Progress
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Lockout %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+
+  # ── Per-direction progress (independent accumulators) ─
+  - type: history-graph
+    title: Direction Progress (independent)
+    hours_to_show: 0.5
+    entities:
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge %
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge %
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle %
+
+  # ── AC mode & power context ────────────────────
+  - type: history-graph
+    title: AC Mode & Power
+    hours_to_show: 0.5
+    entities:
+      - entity: select.hec4nencn492140_acmode
+        name: AC Mode (device)
+      - entity: sensor.zfi_relay
+        name: Relay (driver)
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
+      - entity: sensor.zfi_desired_power
+        name: Desired Power
+      - entity: sensor.zfi_discharge_limit
+        name: Discharge Sent
+      - entity: sensor.zfi_charge_limit
+        name: Charge Sent
+
+  # ── Current SM state ───────────────────────────
+  - type: entities
+    title: Relay State Machine
+    entities:
+      - entity: sensor.zfi_relay_sm_state
+        name: Current State
+      - entity: sensor.zfi_relay_sm_pending
+        name: Last Target
+      - entity: sensor.zfi_relay_sm_lockout_pct
+        name: Last Target Lockout %
+      - entity: sensor.zfi_relay_sm_accumulated_ws
+        name: Accumulated Energy (W·s)
+      - entity: sensor.zfi_relay_sm_threshold_ws
+        name: Threshold (W·s)
+      - type: divider
+      - entity: sensor.zfi_relay_sm_charge_pct
+        name: Charge Progress %
+      - entity: sensor.zfi_relay_sm_discharge_pct
+        name: Discharge Progress %
+      - entity: sensor.zfi_relay_sm_idle_pct
+        name: Idle Progress %
+      - type: divider
+      - entity: select.hec4nencn492140_acmode
+        name: AC Mode (device)
+      - entity: sensor.zfi_relay
+        name: Relay (driver)
+      - entity: sensor.zfi_relay_locked
+        name: Relay Locked
+      - entity: sensor.zfi_desired_power
+        name: Desired Power
+      - entity: sensor.zfi_device_output
+        name: Device Output
+```
 
 ---
 
@@ -662,7 +785,6 @@ Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections for 
 | `output_limit_entity` | Driver | `number.*_outputlimit` |
 | `input_limit_entity` | Driver | `number.*_inputlimit` |
 | `ac_mode_entity` | Driver | `select.*_acmode` |
-| `smart_mode_entity` | Driver | `switch.*_smartmode` (optional — enables RAM-only writes) |
 | `forecast_entities` | Forecast | `sensor.energy_production_tomorrow*` |
 | `watch_entity` | Watchdog | `sensor.*_electriclevel` |
 
@@ -675,26 +797,13 @@ Optional switches (create as HA helpers → Toggle):
 
 Add secrets to your AppDaemon `secrets.yaml` (see `config/secrets.yaml.example`).
 
-### 4. Runtime Files
-
-State files (PI integral, relay SM state, relay switch count) are stored in `zero_feed_in/run/`.  This directory is auto-created on first start and git-ignored, so `git pull` never overwrites runtime state.
-
-### 5. Start in Dry Run
+### 4. Start in Dry Run
 
 Set `dry_run: true` (the YAML anchor at the top of `apps.yaml` applies to all apps). Set `debug: true` to publish internal sensors for the debug dashboards. Monitor via AppDaemon log and `sensor.zfi_*` entities.
 
-### 6. Go Live
+### 5. Go Live
 
 Set `dry_run: false`. Start with `max_output: 200`. Once stable, set `debug: false` to reduce HA sensor churn.
-
-### 7. Updating
-
-```bash
-cd /root/addon_configs/a0d7b954_appdaemon/apps/zero_feed_in
-git pull origin main
-```
-
-AppDaemon detects file changes and reloads automatically.  State in `run/` is preserved across updates.
 
 ---
 
@@ -794,9 +903,6 @@ PI wants to charge → guard: SOC ≥ max → idle
 ## Known Limitations
 
 - **Device response time**: 10–15 s (not 2–4 s as Zendure docs suggest)
-- **Flash writes**: `setOutputLimit`/`setInputLimit` write to device flash by
-  default.  Mitigated by enabling `smartMode` via `smart_mode_entity` config —
-  routes all writes to RAM.  The driver re-enables smartMode automatically
-  after device reboot.
+- **Flash writes**: `setOutputLimit`/`setInputLimit` may write to device flash
 - **Single phase**: SolarFlow feeds one phase; three-phase balancing at meter works
 - **Single instance only**: no multi-device HEMS support

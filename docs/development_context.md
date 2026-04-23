@@ -36,7 +36,7 @@ Existing PV → Q.HOME+ inverter → House grid ← Utility grid
 - Controller handles PI control, mode switching, surplus estimation — reusable for any battery
 - Driver handles Zendure-specific protocol: AC mode relay, power rounding, lockout timing
 - Controller publishes `sensor.zfi_desired_power` (signed W, +discharge/-charge)
-- Driver reacts to desired-power state changes and runs a watchdog every `watchdog_s` (default 15 s, typically 5 s)
+- Driver polls this sensor every 2 s and translates to device commands
 - Separation allows swapping the driver for other batteries without touching control logic
 
 ### Why AppDaemon (not HA Blueprint)
@@ -141,7 +141,7 @@ src/
 ├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
 ├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
 ├── csv_logger.py                 # shared daily-rotating CSV file logger
-└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog + heartbeat safe-state
+└── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog (HTTP API trigger)
 run/                              # runtime state (git-ignored, auto-created)
 ├── zfi_controller_state.json
 ├── zfi_driver_state.json
@@ -154,7 +154,6 @@ tests/
 ├── __init__.py
 ├── test_zero_feed_in_controller.py
 ├── test_zendure_solarflow_driver.py
-├── test_solarflow_mqtt_watchdog.py
 ├── test_pv_forecast_manager.py
 └── test_csv_logger.py
 docs/
@@ -202,10 +201,9 @@ ControlLogic:     — pure-computation control logic (no HA dependency)
 ZeroFeedInController(hass.Hass): — thin HA adapter
   initialize()                  — config, seed, restore state, CsvLogger, schedule
   terminate()                   — save state to JSON on shutdown
-  _on_tick()                    — read → compute → log → publish → heartbeat → csv → periodic save
+  _on_tick()                    — read → compute → log → publish → csv → periodic save
   _read_measurement()           — assemble Measurement from HA sensors
   _publish_ha_sensors()         — publishes sensor.zfi_* entities
-  _publish_heartbeat()          — MQTT heartbeat for external monitoring
   _log_csv()                    — append row to CSV file (if log_dir set)
   _save_state()                 — atomically write state snapshot to JSON
   _restore_state()              — restore ControlLogic state from JSON file
@@ -242,10 +240,6 @@ ZendureSolarFlowDriver(_HASS_BASE):
   _send_limits()            — AC mode + power limits
   _set_ac_mode()            — send-once with 30 s retry timeout
   _set_sensor()             — publish sensor.zfi_* driver states
-  _ensure_smart_mode()      — turn on smartMode switch if off (RAM-only writes)
-  _is_controller_stale()    — check desired_power entity last_updated age
-  _send_safe_state()        — reset last-sent tracking (watchdog handles device)
-  _publish_heartbeat()      — MQTT heartbeat for external monitoring
   _save_state()             — atomically write SM state snapshot to JSON
   _restore_state()          — restore RelayStateMachine state from JSON file
 ```
@@ -279,7 +273,6 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `zfi_charge_limit` | W | inputLimit sent (≥ 0) |
 | `zfi_relay` | text | Physical relay state from AC mode entity |
 | `zfi_relay_locked` | text | `true` when SM is clamping output or relay is physically switching (8 s holdoff after SM transition) |
-| `zfi_controller_stale` | text | `true` when the controller's desired-power sensor hasn't updated within `controller_stale_s` — driver publishes safe sensors (0 W) |
 | `zfi_relay_sm_state` | text | Current SM state (idle/charging/discharging) *(debug)* |
 | `zfi_relay_sm_pending` | text | Pending transition target (or "none") *(debug)* |
 | `zfi_relay_sm_lockout_pct` | % | Unified lockout progress for active transition *(debug)* |
@@ -303,14 +296,10 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Driver publishes `sensor.zfi_relay_locked` (always, not debug-only) so the controller can freeze the integral during relay lockout
 - `relay_locked` stays `true` for 8 seconds after each SM transition (`RELAY_SWITCH_DELAY_S`) to account for physical relay switching time
 - Redundant sends suppressed (only send when values change)
-- State persistence: controller saves integral/mode/last_computed_w to JSON every 60s and on shutdown; driver saves SM state on each transition and on shutdown. All JSON state files default to the `run/` directory (auto-created, git-ignored). On restart, persisted state is restored before the battery_power seed, so the PI resumes where it left off instead of starting from zero.
+- State persistence: controller saves integral/mode/last_computed_w to JSON every 60s and on shutdown; driver saves SM state on each transition and on shutdown. On restart, persisted state is restored before the battery_power seed, so the PI resumes where it left off instead of starting from zero.
 - Charge confirmation: surplus must hold for `charge_confirm_s` (default 15 s, apps.yaml 20 s) before CHARGING
 - `set_state` uses `str(value)` and `replace=True` with try/except
 - Device response latency: **10-15 seconds** (not 2-4 s as originally assumed)
-- Driver stale-check: if `sensor.zfi_desired_power` is older than `controller_stale_s` (default 30 s), the driver publishes safe sensors (0 W to device_output, limits) and sets `sensor.zfi_controller_stale = true`; uses `last_reported` (HA 2024.4+) with `last_updated` fallback; watchdog handles device commands
-- MQTT heartbeat publishing: controller and driver can publish ISO-8601 timestamps to configurable MQTT topics on every tick for external monitoring (e.g. ESP32 fallback)
-- Watchdog heartbeat monitoring: optionally checks `last_updated` of configured HA entities and creates HA persistent notifications when stale; when device entities are configured, also sends safe state (0W to outputLimit + inputLimit) catching both controller and driver failures
-- ESP watchdog (`zfi_watchdog.yaml`): ESPHome package included via `packages:` on existing ESP8266. Subscribes to MQTT heartbeat topics, sends HTTP POST to SolarFlow local API (`/properties/write`) to set limits to 0 when stale >2 min. Fully independent of HA/AppDaemon — only needs MQTT broker + SolarFlow on LAN.
 
 ### Entity names (current setup)
 
@@ -320,24 +309,19 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 - Output limit: `number.hec4nencn492140_outputlimit`
 - Input limit: `number.hec4nencn492140_inputlimit`
 - AC mode: `select.hec4nencn492140_acmode`
-- Smart mode: `switch.hec4nencn492140_smartmode`
 
 ## Known Issues / Not Yet Implemented
 
 ### Operational observations
 
 - Device response time is 10-15 s — much slower than docs suggest
-- Flash writes: `setOutputLimit`/`setInputLimit` write to device flash by default.
-  **Mitigated** by enabling `smartMode` (HA switch entity exposed by the Zendure
-  MQTT integration).  When ON, all property writes go to RAM instead of flash.
-  The driver enables smartMode automatically at startup and re-enables it on
-  each watchdog tick (device reboot resets it to OFF).  Configure via
-  `smart_mode_entity` in apps.yaml.
+- Flash writes: whether `setOutputLimit`/`setInputLimit` write to flash is unknown
+- `setDeviceAutomationInOutLimit` as flash-safe alternative — not yet tested
 
 ### Missing features
 
 - **No unit tests**: PIController, compute pipeline, guards are testable pure functions  
-  → **Resolved**: 277 tests (123 driver, 103 controller, 26 watchdog, 17 PV forecast, 8 CSV logger) covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, state persistence, watchdog safe-state, CSV logging
+  → **Resolved**: 208 tests (101 controller, 99 driver, 8 CSV logger) covering ControlLogic, PIController, FeedForward, AdaptiveLockout, RelayStateMachine, state persistence, CSV logging
 - **No time-of-use / dynamic tariff support**: could charge from grid during negative prices
 - **Emergency only curtails discharge**: doesn't start charging to absorb existing PV surplus
 - **Single-instance only**: no multi-device HEMS support
@@ -360,8 +344,8 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `ki_discharge_down` | 0.051 | Integral gain: decrease discharge. |
 | `ki_charge_up` | 0.011 | Integral gain: increase charge. |
 | `ki_charge_down` | 0.021 | Integral gain: decrease charge. |
-| `deadband` | 25W (prod: 35W) | No action within this error range. |
-| `deadband_leak_ws` | 500 W·s (prod: 250) | Deadband leak correction to prevent persistent bias. |
+| `deadband` | 35W | No action within this error range. |
+| `deadband_leak_ws` | 250 W·s | Deadband leak correction to prevent persistent bias. |
 | `feed_forward_sources` | (list) | Feed-forward sources: entity, gain, sign. |
 | `ff_enabled` | true | Master switch to enable/disable feed-forward. |
 | `ff_deadband` | 30W | Ignore total FF correction below this threshold. |
@@ -371,13 +355,14 @@ Sensors marked *(debug)* are only published when `debug: true` in the respective
 | `mode_hysteresis` | 50W | Surplus band for mode switching. Increase if mode flaps. |
 | `charge_confirm` | 20s | Seconds surplus must hold before entering CHARGING. |
 | `relay_locked_sensor` | (entity) | HA entity for relay lockout feedback from driver. |
-| `relay_lockout_ws` | 1000 W·s (prod: 10000) | Energy threshold for relay direction change. |
-| `relay_lockout_cutoff_w` | 1.0W (prod: 25W) | Floor power for lockout accumulator (prevents infinite wait). |
-| `relay_lockout_idle_s` | 5.0s (prod: 90s) | Time before switching to idle state. |
+| `relay_lockout_ws` | 10000 W·s | Energy threshold for relay direction change. |
+| `relay_lockout_cutoff_w` | 25W | Floor power for lockout accumulator (prevents infinite wait). |
+| `relay_lockout_idle_s` | 90s | Time before switching to idle state. |
 | `max_output` | 1200W | Max discharge (W). |
 | `max_charge` | 800W | AC charge limit. |
 | `max_feed_in` | 800W | Emergency threshold. |
-| `state_file` | `run/*.json` | JSON file path for state persistence (controller/driver). Defaults to `run/` directory in the repo root. |
+| `emergency_kp_multiplier` | 4.0 | Loaded but currently unused in emergency logic. |
+| `state_file` | (auto) | JSON file path for state persistence (controller/driver). |
 
 ### Gain tuning
 Gains are derived from step response measurements per quadrant using SIMC rules.
@@ -402,4 +387,3 @@ Kp values above 1.0 risk oscillation with this latency.
 - **solarflow-control** (GitHub: reinhard-brandstaedter): Python tool for DC-coupled SolarFlow hubs + OpenDTU. More mature, but targets Hub 2000/AIO with Hoymiles WR, not AC-coupled storage.
 - **ioBroker zendure-solarflow adapter**: full-featured adapter with `setDeviceAutomationInOutLimit`, cloud relay, and PI controller script. The PI script for 2400 AC by forum user "schimi" was a reference for the PI approach.
 - **z-master42/solarflow**: HA MQTT YAML config for SolarFlow entities. Useful reference for MQTT topic structure.
-- **Zendure/Zendure-HA**: Official HA integration (HACS). Source for the local HTTP API discovery: SF2400 AC+ (ZenSDK devices) expose `GET /properties/report` and `POST /properties/write` endpoints that work independently of HA/MQTT. Used by the ESP watchdog for safe-state enforcement.
