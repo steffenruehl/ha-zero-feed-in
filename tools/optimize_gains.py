@@ -1112,11 +1112,11 @@ def main():
 
     # ── Baseline ──
     current_gains = np.array([
-        0.051, 0.767, 0.172, 0.739,  # kp (optimized 2026-04-22)
-        0.005, 0.298, 0.280, 0.012,  # ki (optimized 2026-04-22)
+        0.061, 0.794, 0.233, 0.323,  # kp (optimized 2026-04-23)
+        0.005, 0.300, 0.261, 0.020,  # ki (optimized 2026-04-23)
         5.1,                          # deadband
-        10.4, 56.4,                   # ff_tau, ff_deadband
-        0.92, 0.65,                   # ff_gain_pv, ff_gain_load
+        30.6, 49.4,                   # ff_tau, ff_deadband
+        1.41, 0.57,                   # ff_gain_pv, ff_gain_load
     ])
 
     print("\n" + "=" * 65)
