@@ -27,7 +27,9 @@ class RelaySwitchCounter(hass.Hass):
         self._sensor_prefix: str = self.args.get("sensor_prefix", "sensor.zfi")
 
         self._count, self._last_switch_ts = self._load()
-        self._last_active = self._is_active(self.get_state(self._desired_entity))
+        init_state = self.get_state(self._desired_entity)
+        self._last_active = self._is_active(init_state)
+        self._last_sign = self._sign(init_state)
 
         self.listen_state(self._on_desired_power, self._desired_entity)
         self._publish()
@@ -45,13 +47,26 @@ class RelaySwitchCounter(hass.Hass):
         self, entity: str, attribute: str, old: str, new: str, kwargs: dict
     ) -> None:
         active = self._is_active(new)
+        sign = self._sign(new)
+
+        switched = False
         if active and not self._last_active:
+            # idle → active
+            switched = True
+        elif active and self._last_active and sign != self._last_sign:
+            # direction change while active (e.g. discharge → charge)
+            switched = True
+
+        if switched:
             self._count += 1
             self._last_switch_ts = datetime.now(timezone.utc).isoformat()
             self._save()
             self._publish()
             self.log(f"Relay switch #{self._count} at {self._last_switch_ts}")
+
         self._last_active = active
+        if sign != 0:
+            self._last_sign = sign
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -60,6 +75,18 @@ class RelaySwitchCounter(hass.Hass):
             return abs(float(state)) >= self._min_active_w
         except (TypeError, ValueError):
             return False
+
+    def _sign(self, state: str | None) -> int:
+        """Return +1, -1, or 0 for the sign of the desired power."""
+        try:
+            v = float(state)
+            if v > 0:
+                return 1
+            elif v < 0:
+                return -1
+            return 0
+        except (TypeError, ValueError):
+            return 0
 
     def _publish(self) -> None:
         self.set_state(
