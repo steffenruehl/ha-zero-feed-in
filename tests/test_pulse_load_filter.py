@@ -1,6 +1,7 @@
-"""Tests for pulse_load_filter — SignFlipDetector, BaselineEstimator, PulseLoadFilterLogic.
+"""Tests for pulse_load_filter — BaselineEstimator, PulseLoadFilterLogic, FilterConfig.
 
 All tests exercise pure computation classes (no HA/AppDaemon mocking needed).
+The filter now receives its active state externally (from the detector).
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from src.pulse_load_filter import (
     BaselineEstimator,
     FilterConfig,
     PulseLoadFilterLogic,
-    SignFlipDetector,
 )
 
 
@@ -24,6 +24,7 @@ def make_config(**overrides: object) -> FilterConfig:
     """Create a FilterConfig with sensible test defaults."""
     defaults: dict[str, object] = dict(
         grid_sensor="sensor.grid",
+        active_entity="sensor.pld_active",
     )
     defaults.update(overrides)
     return FilterConfig(**defaults)  # type: ignore[arg-type]
@@ -40,22 +41,20 @@ class TestFilterConfig:
     def test_defaults(self) -> None:
         """Default values match the design document."""
         cfg = make_config()
-        assert cfg.flip_thresh_w == 500.0
-        assert cfg.flip_window_s == 20.0
-        assert cfg.activate_count == 2
-        assert cfg.activate_window_s == 120.0
-        assert cfg.deactivate_quiet_s == 120.0
         assert cfg.measurement_duration_s == 60.0
         assert cfg.drift_target_w == 30.0
         assert cfg.drift_ki == 0.3
         assert cfg.drift_cycle_s == 60.0
 
     def test_from_args_minimal(self) -> None:
-        """Only required key produces valid config with defaults."""
-        args = {"grid_power_sensor": "sensor.grid"}
+        """Only required keys produce valid config with defaults."""
+        args = {
+            "grid_power_sensor": "sensor.grid",
+            "active_entity": "sensor.pld_active",
+        }
         cfg = FilterConfig.from_args(args)
         assert cfg.grid_sensor == "sensor.grid"
-        assert cfg.flip_thresh_w == 500.0
+        assert cfg.active_entity == "sensor.pld_active"
         assert cfg.filtered_power_entity == "sensor.zfi_plf_filtered_grid_power"
         assert cfg.dry_run is True
 
@@ -63,112 +62,15 @@ class TestFilterConfig:
         """Custom values in args override defaults."""
         args = {
             "grid_power_sensor": "sensor.grid",
-            "flip_thresh_w": 400,
+            "active_entity": "sensor.pld_active",
             "drift_ki": 0.5,
             "filtered_power_entity": "sensor.custom_output",
             "dry_run": False,
         }
         cfg = FilterConfig.from_args(args)
-        assert cfg.flip_thresh_w == 400.0
         assert cfg.drift_ki == 0.5
         assert cfg.filtered_power_entity == "sensor.custom_output"
         assert cfg.dry_run is False
-
-
-# ═══════════════════════════════════════════════════════════
-#  SignFlipDetector
-# ═══════════════════════════════════════════════════════════
-
-
-class TestSignFlipDetector:
-    """Test sign-flip detection logic."""
-
-    def test_no_flips_stays_inactive(self) -> None:
-        """Small grid values never activate the detector."""
-        cfg = make_config()
-        det = SignFlipDetector(cfg)
-        for i in range(100):
-            det.update(50.0, float(i * 5))
-        assert not det.active
-        assert det.flip_count == 0
-
-    def test_single_flip_not_enough(self) -> None:
-        """One sign flip does not activate (need >= 2)."""
-        cfg = make_config()
-        det = SignFlipDetector(cfg)
-        # Create one sign flip: +600 then -600 within 20s
-        det.update(600.0, 0.0)
-        det.update(-600.0, 10.0)
-        assert det.flip_count == 1
-        assert not det.active
-
-    def test_two_flips_activate(self) -> None:
-        """Two sign flips within the activation window activate the detector."""
-        cfg = make_config()
-        det = SignFlipDetector(cfg)
-        # First flip
-        det.update(600.0, 0.0)
-        det.update(-600.0, 10.0)
-        # Quiet gap (> flip_window_s so a new flip can register)
-        det.update(0.0, 35.0)
-        # Second flip
-        det.update(700.0, 60.0)
-        det.update(-700.0, 70.0)
-        assert det.flip_count == 2
-        assert det.active
-
-    def test_deactivate_after_quiet(self) -> None:
-        """Detector deactivates when no large grid values for deactivate_quiet_s."""
-        cfg = make_config(deactivate_quiet_s=60.0)
-        det = SignFlipDetector(cfg)
-        # Activate
-        det.update(600.0, 0.0)
-        det.update(-600.0, 10.0)
-        det.update(0.0, 35.0)
-        det.update(600.0, 60.0)
-        det.update(-600.0, 70.0)
-        assert det.active
-
-        # Stay quiet for deactivate_quiet_s — small values only
-        t = 70.0
-        while t < 70.0 + 65.0:
-            t += 5.0
-            det.update(30.0, t)
-        assert not det.active
-
-    def test_large_grid_resets_quiet_timer(self) -> None:
-        """A large grid reading resets the deactivation quiet timer."""
-        cfg = make_config(deactivate_quiet_s=60.0)
-        det = SignFlipDetector(cfg)
-        # Activate
-        det.update(600.0, 0.0)
-        det.update(-600.0, 10.0)
-        det.update(0.0, 35.0)
-        det.update(600.0, 60.0)
-        det.update(-600.0, 70.0)
-        assert det.active
-
-        # Quiet for 50s, then one large spike
-        for i in range(10):
-            det.update(30.0, 75.0 + i * 5)
-        det.update(800.0, 125.0)  # resets quiet timer
-        # Another 55s of quiet — still under 60s since spike
-        for i in range(11):
-            det.update(30.0, 130.0 + i * 5)
-        assert det.active  # should still be active
-
-    def test_step_load_no_flip(self) -> None:
-        """A step load (positive only) does not register as a flip."""
-        cfg = make_config()
-        det = SignFlipDetector(cfg)
-        # Step from low to high — never negative
-        for i in range(30):
-            det.update(50.0, float(i * 5))
-        det.update(2000.0, 150.0)
-        det.update(1500.0, 155.0)
-        det.update(500.0, 160.0)
-        assert det.flip_count == 0
-        assert not det.active
 
 
 # ═══════════════════════════════════════════════════════════
@@ -234,10 +136,7 @@ class TestBaselineEstimator:
         est.update(80.0, 5.0)  # measurement with higher value → baseline=80
         assert est.baseline == 80.0
 
-        # House load drops to 30W (still above 0)
-        # With battery active: battery_cmd = baseline - target = 50W
-        # grid_off = 30 - 50 = -20 → min(grid) = -20
-        # But we simulate the actual grid observation: min(grid) = 10
+        # House load drops — min(grid) = 10 each cycle
         for cycle in range(10):
             t_base = 10.0 + cycle * 10.0
             est.update(10.0, t_base + 5.0)
@@ -266,36 +165,21 @@ class TestBaselineEstimator:
 
 
 class TestPulseLoadFilterLogic:
-    """Integration tests for the full filter pipeline."""
-
-    def _activate(self, logic: PulseLoadFilterLogic, t: float) -> float:
-        """Drive the logic through activation with two sign flips.
-
-        Returns the timestamp after activation.
-        """
-        # First flip
-        logic.update(600.0, t)
-        logic.update(-600.0, t + 10.0)
-        # Gap
-        logic.update(0.0, t + 35.0)
-        # Second flip
-        logic.update(700.0, t + 60.0)
-        logic.update(-700.0, t + 70.0)
-        return t + 70.0
+    """Integration tests for the filter pipeline (externally driven)."""
 
     def test_passthrough_when_inactive(self) -> None:
-        """When no pulse load, output equals raw grid value."""
+        """When detector is inactive, output equals raw grid value."""
         cfg = make_config()
         logic = PulseLoadFilterLogic(cfg)
         for val in [50.0, -20.0, 300.0, 0.0]:
-            assert logic.update(val, 0.0) == val
+            assert logic.update(val, 0.0, active=False) == val
         assert not logic.active
 
     def test_activation_starts_measurement(self) -> None:
-        """Activation triggers measurement pause."""
+        """External activation triggers measurement pause."""
         cfg = make_config()
         logic = PulseLoadFilterLogic(cfg)
-        self._activate(logic, 0.0)
+        logic.update(600.0, 0.0, active=True)
         assert logic.active
         assert logic.measuring
 
@@ -303,9 +187,13 @@ class TestPulseLoadFilterLogic:
         """After measurement, filter outputs the baseline."""
         cfg = make_config(measurement_duration_s=30.0)
         logic = PulseLoadFilterLogic(cfg)
-        t = self._activate(logic, 0.0)
+
+        # Activate
+        logic.update(600.0, 0.0, active=True)
+        assert logic.measuring
 
         # Feed measurement samples (oven cycling, battery paused)
+        t = 0.0
         samples = [
             (1330.0, t + 5),
             (1330.0, t + 10),
@@ -316,126 +204,52 @@ class TestPulseLoadFilterLogic:
             (30.0, t + 35),
         ]
         for grid_w, ts in samples:
-            logic.update(grid_w, ts)
+            logic.update(grid_w, ts, active=True)
 
         assert not logic.measuring
         assert logic.baseline == 30.0
 
         # Now filter should output baseline, not raw
-        result = logic.update(1300.0, t + 40)
+        result = logic.update(1300.0, t + 40, active=True)
         assert result == pytest.approx(30.0, abs=1.0)
 
     def test_deactivation_resumes_passthrough(self) -> None:
         """After deactivation, filter passes raw value through."""
-        cfg = make_config(
-            measurement_duration_s=10.0,
-            deactivate_quiet_s=30.0,
-        )
+        cfg = make_config(measurement_duration_s=10.0)
         logic = PulseLoadFilterLogic(cfg)
-        t = self._activate(logic, 0.0)
 
-        # Complete measurement
-        logic.update(30.0, t + 5)
-        logic.update(30.0, t + 15)
+        # Activate and complete measurement
+        logic.update(600.0, 0.0, active=True)
+        logic.update(30.0, 5.0, active=True)
+        logic.update(30.0, 15.0, active=True)
         assert not logic.measuring
         assert logic.active
 
-        # Quiet period → deactivate
-        t_quiet = t + 15
-        for i in range(10):
-            t_quiet += 5
-            logic.update(25.0, t_quiet)
-
+        # Deactivate
+        result = logic.update(25.0, 20.0, active=False)
         assert not logic.active
-        # Passthrough resumes
-        assert logic.update(123.0, t_quiet + 5) == 123.0
-        assert logic.baseline is None  # reset
+        assert result == 25.0
 
-    def test_full_oven_cycle_simulation(self) -> None:
-        """Simulate a realistic oven scenario end-to-end.
+        # Passthrough continues
+        result = logic.update(100.0, 25.0, active=False)
+        assert result == 100.0
 
-        1. Normal operation (low grid)
-        2. Oven turns on, controller chases, sign flips appear
-        3. Filter activates → battery paused → measurement with true load
-        4. Filter outputs stable baseline through cycling
-        5. Oven stops, no large swings, filter deactivates
-        """
-        cfg = make_config(
-            measurement_duration_s=60.0,
-            deactivate_quiet_s=60.0,
-            drift_cycle_s=60.0,
-        )
+    def test_reactivation_remeasures(self) -> None:
+        """Re-activation after deactivation starts a fresh measurement."""
+        cfg = make_config(measurement_duration_s=10.0)
         logic = PulseLoadFilterLogic(cfg)
-        dt = 5.0
-        t = 0.0
-        oven_on_samples = 3   # 15s at 5s intervals
-        oven_off_samples = 9  # 45s at 5s intervals
 
-        # Phase 1: Normal operation (30W house load, battery idle)
-        for _ in range(20):
-            out = logic.update(30.0, t)
-            assert out == 30.0
-            t += dt
-        assert not logic.active
+        # First activation cycle
+        logic.update(600.0, 0.0, active=True)
+        logic.update(30.0, 5.0, active=True)
+        logic.update(30.0, 15.0, active=True)
+        assert logic.baseline == 30.0
 
-        # Phase 2: Oven cycling — controller chases, sign flips
-        # Grid oscillates between +1300 and -1200 as battery chases.
-        # We need 2 sign flips to activate.  Keep feeding until active.
-        activated = False
-        while not activated:
-            for _ in range(oven_on_samples):
-                logic.update(1300.0, t)
-                t += dt
-                if logic.active:
-                    activated = True
-                    break
-            if activated:
-                break
-            for _ in range(oven_off_samples):
-                logic.update(-1200.0, t)
-                t += dt
-                if logic.active:
-                    activated = True
-                    break
-        assert logic.active
+        # Deactivate
+        logic.update(25.0, 20.0, active=False)
+        assert logic.baseline is None
+
+        # Re-activate
+        logic.update(600.0, 30.0, active=True)
         assert logic.measuring
-
-        # Phase 3: Battery is now paused (HA adapter sends pause on activation).
-        # Grid shows true house load during oven OFF, house+oven during ON.
-        # The measurement window captures these realistic values.
-        for cycle in range(2):
-            for _ in range(oven_on_samples):
-                logic.update(1330.0, t)  # house(30) + oven(1300)
-                t += dt
-            for _ in range(oven_off_samples):
-                logic.update(30.0, t)    # just house load
-                t += dt
-
-        # Measurement should be complete, baseline ≈ 30
-        assert not logic.measuring
-        assert logic.baseline is not None
-        assert logic.baseline == pytest.approx(30.0, abs=5.0)
-
-        # Phase 4: Ongoing cycling — filter outputs baseline
-        # In production, battery is now set to (baseline - target).
-        # Grid still shows cycling from the oven.
-        for cycle in range(3):
-            for _ in range(oven_on_samples):
-                out = logic.update(1300.0, t)
-                # Output should be near baseline, not 1300
-                assert out < 100.0
-                t += dt
-            for _ in range(oven_off_samples):
-                out = logic.update(-1200.0, t)
-                # Output should be near baseline, not -1200
-                assert out < 100.0
-                t += dt
-
-        # Phase 5: Oven stops, small grid values
-        for _ in range(20):
-            logic.update(30.0, t)
-            t += dt
-
-        assert not logic.active
-        # Back to passthrough
-        assert logic.update(42.0, t) == 42.0
+        assert logic.baseline is None

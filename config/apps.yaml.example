@@ -211,22 +211,52 @@ solarflow_mqtt_watchdog:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  6. Pulse-Load Filter (oven duty-cycling suppression)
+#  6. Pulse-Load Detector (oven duty-cycling detection)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 #  Detects when the controller futilely chases periodic loads (e.g. oven
-#  duty-cycling 15 s ON / 45 s OFF) and outputs a stable baseline instead
-#  of the oscillating grid signal.
+#  duty-cycling 15 s ON / 45 s OFF) via sign-flip analysis: the grid
+#  rapidly alternates between large import and large export.
 #
-#  Three stages:
-#    1. Sign-flip detection — grid flips between large import and export
-#    2. Measurement pause   — pause battery, measure true baseline
-#    3. I-controller        — track slow drift in house load
+#  Detection only — mitigation is handled by a separate module (see below).
+#
+pulse_load_detector:
+  module: pulse_load_detector
+  class: PulseLoadDetector
+  debug:          *debug
+
+  # ══════ MANDATORY ═════════════════════════════════════════════════════════
+
+  # Same grid sensor as the controller
+  grid_power_sensor: sensor.YOUR_GRID_POWER_SENSOR
+
+  # ══════ TUNING — safe defaults, adjust if needed ══════════════════════════
+
+  flip_thresh_w: 500           # min |grid| for a flip leg (W)
+  # flip_window_s: 20          # max time between flip legs (s)
+  # activate_count: 2          # flips needed to activate
+  # activate_window_s: 120     # sliding window for counting flips (s)
+  # deactivate_quiet_s: 120    # no |grid| > threshold for this long → deactivate (s)
+
+  # Output entities
+  sensor_prefix: sensor.zfi_pld
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. Pulse-Load Filter — baseline mitigation
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Reacts to the detector's active signal by measuring a stable baseline
+#  and outputting it instead of the oscillating grid signal.
+#
+#  Two stages:
+#    1. Measurement pause   — pause battery, measure true baseline
+#    2. I-controller        — track slow drift in house load
 #
 #  Start with dry_run: true to observe behaviour on dashboards before
 #  connecting to the controller.
 #
-#  Integration: set the controller's grid_power_sensor to the PLF's
+#  Integration: set the controller's grid_power_sensor to the filter's
 #  filtered_power_entity to close the loop.
 #
 pulse_load_filter:
@@ -239,15 +269,10 @@ pulse_load_filter:
 
   # Same grid sensor as the controller
   grid_power_sensor: sensor.YOUR_GRID_POWER_SENSOR
+  # Active signal from the detector
+  active_entity: sensor.zfi_pld_active
 
   # ══════ TUNING — safe defaults, adjust if needed ══════════════════════════
-
-  # Sign-flip detection
-  flip_thresh_w: 500           # min |grid| for a flip leg (W)
-  # flip_window_s: 20          # max time between flip legs (s)
-  # activate_count: 2          # flips needed to activate
-  # activate_window_s: 120     # sliding window for counting flips (s)
-  # deactivate_quiet_s: 120    # no |grid| > threshold for this long → deactivate (s)
 
   # Measurement pause
   # measurement_duration_s: 60 # battery pause duration for baseline measurement (s)

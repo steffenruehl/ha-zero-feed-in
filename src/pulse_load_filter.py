@@ -1,16 +1,15 @@
 """
-Pulse-Load Filter — Removes periodic pulse loads from the grid sensor.
+Pulse-Load Filter — Baseline mitigation for periodic pulse loads.
 
-Standalone AppDaemon app that sits between the raw grid sensor and the
-controller.  During oven-style duty-cycling (e.g. 15 s ON / 45 s OFF),
-it outputs a stable baseline instead of the raw oscillating signal.
+Subscribes to a detector's ``active`` entity (e.g. from
+``pulse_load_detector``) and the raw grid sensor.  When the detector
+signals a pulse load, this filter outputs a stable baseline instead
+of the oscillating grid signal.
 
-Three stages:
-  1. **Sign-flip detection** — grid rapidly flips between large import
-     and large export → controller is futilely chasing oscillations.
-  2. **Measurement pause** — pause battery for ~60 s, measure
+Two stages once activated:
+  1. **Measurement pause** — pause battery for ~60 s, measure
      ``min(grid)`` → exact baseline with no inverter-loss offset.
-  3. **I-controller drift tracking** — correct baseline every 60 s to
+  2. **I-controller drift tracking** — correct baseline every 60 s to
      track slow house-load changes.
 
 Output convention:
@@ -19,16 +18,13 @@ Output convention:
 
 Published entities:
   - ``filtered_power_entity`` — the main output (configurable entity ID)
-  - ``{sensor_prefix}_active``    — 1 when filter is engaged, 0 otherwise
   - ``{sensor_prefix}_measuring`` — 1 during measurement pause, 0 otherwise
   - ``{sensor_prefix}_baseline``  — current baseline estimate (W)
-  - ``{sensor_prefix}_flip_count`` — sign flips in the activation window
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -65,26 +61,16 @@ DEFAULT_SENSOR_PREFIX = "sensor.zfi_plf"
 
 @dataclass
 class FilterConfig:
-    """Typed configuration for the pulse-load filter.
+    """Typed configuration for the pulse-load filter (mitigation).
 
     Loaded from ``apps.yaml`` via ``from_args()``.
     """
 
-    # Sensor
+    # Input sensors
     grid_sensor: str
     """HA entity ID for raw grid power sensor (W)."""
-
-    # Sign-flip detection
-    flip_thresh_w: float = 500.0
-    """Minimum grid magnitude for each leg of a sign flip (W)."""
-    flip_window_s: float = 20.0
-    """Max time between positive and negative legs of a flip (s)."""
-    activate_count: int = 2
-    """Number of sign flips needed to activate the filter."""
-    activate_window_s: float = 120.0
-    """Sliding window for counting sign flips (s)."""
-    deactivate_quiet_s: float = 120.0
-    """Deactivate when no |grid| > flip_thresh_w for this long (s)."""
+    active_entity: str
+    """HA entity ID published by the detector (``1`` = active)."""
 
     # Measurement pause
     measurement_duration_s: float = 60.0
@@ -102,26 +88,18 @@ class FilterConfig:
     filtered_power_entity: str = DEFAULT_FILTERED_POWER_ENTITY
     """Entity ID for the filtered grid power output (W)."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
-    """Prefix for status/debug HA entities (active, measuring, baseline)."""
+    """Prefix for status/debug HA entities (measuring, baseline)."""
     dry_run: bool = True
-    """When True, publish sensors but don't override desired power."""
+    """When True, publish sensors but don't pause battery."""
     debug: bool = False
-    """Publish extra debug sensors (flip_count, etc.)."""
+    """Publish extra debug sensors."""
 
     @classmethod
     def from_args(cls, args: dict[str, Any]) -> FilterConfig:
         """Create a ``FilterConfig`` from the AppDaemon ``args`` dict."""
         return cls(
             grid_sensor=args["grid_power_sensor"],
-            flip_thresh_w=float(args.get("flip_thresh_w", cls.flip_thresh_w)),
-            flip_window_s=float(args.get("flip_window_s", cls.flip_window_s)),
-            activate_count=int(args.get("activate_count", cls.activate_count)),
-            activate_window_s=float(
-                args.get("activate_window_s", cls.activate_window_s)
-            ),
-            deactivate_quiet_s=float(
-                args.get("deactivate_quiet_s", cls.deactivate_quiet_s)
-            ),
+            active_entity=args["active_entity"],
             measurement_duration_s=float(
                 args.get("measurement_duration_s", cls.measurement_duration_s)
             ),
@@ -137,91 +115,6 @@ class FilterConfig:
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
         )
-
-
-# ═══════════════════════════════════════════════════════════
-#  Sign-Flip Detector
-# ═══════════════════════════════════════════════════════════
-
-
-class SignFlipDetector:
-    """Detects futile controller response via grid power sign flips.
-
-    A sign flip is registered when, within ``flip_window_s``, both a
-    sample with ``grid > +flip_thresh_w`` and one with
-    ``grid < -flip_thresh_w`` are observed.
-
-    Activation: ``>= activate_count`` flips within ``activate_window_s``.
-    Deactivation: no ``|grid| > flip_thresh_w`` for ``deactivate_quiet_s``.
-    """
-
-    def __init__(self, cfg: FilterConfig) -> None:
-        self._cfg = cfg
-        self._recent: deque[tuple[float, float]] = deque()
-        """Recent ``(timestamp, grid_w)`` samples within the flip window."""
-        self._flip_times: deque[float] = deque()
-        """Timestamps of detected sign flips."""
-        self._last_flip_check_t: float = -cfg.flip_window_s - 1.0
-        """Prevents double-counting the same flip event."""
-        self._last_large_t: float = 0.0
-        """Last time |grid| exceeded the flip threshold."""
-        self.active: bool = False
-        """Whether the detector considers the filter should be active."""
-
-    @property
-    def flip_count(self) -> int:
-        """Number of sign flips in the current activation window."""
-        return len(self._flip_times)
-
-    def update(self, grid_w: float, now: float) -> bool:
-        """Process one grid sample, return whether detector is active.
-
-        Args:
-            grid_w: Current grid power reading (W).
-            now: Monotonic timestamp (seconds).
-
-        Returns:
-            ``True`` if the filter should be active.
-        """
-        cfg = self._cfg
-
-        # Track large grid excursions for deactivation
-        if abs(grid_w) > cfg.flip_thresh_w:
-            self._last_large_t = now
-
-        # Maintain recent-sample window
-        self._recent.append((now, grid_w))
-        cutoff = now - cfg.flip_window_s
-        while self._recent and self._recent[0][0] < cutoff:
-            self._recent.popleft()
-
-        # Check for sign flip in current window
-        has_pos = any(g > cfg.flip_thresh_w for _, g in self._recent)
-        has_neg = any(g < -cfg.flip_thresh_w for _, g in self._recent)
-        is_flip = has_pos and has_neg
-
-        # Register flip (debounce: one per flip_window_s)
-        if is_flip and (now - self._last_flip_check_t) > cfg.flip_window_s:
-            self._flip_times.append(now)
-            self._last_flip_check_t = now
-
-        # Prune old flips
-        flip_cutoff = now - cfg.activate_window_s
-        while self._flip_times and self._flip_times[0] < flip_cutoff:
-            self._flip_times.popleft()
-
-        # State transitions
-        if not self.active:
-            if len(self._flip_times) >= cfg.activate_count:
-                self.active = True
-        else:
-            quiet_duration = now - self._last_large_t
-            if self._last_large_t > 0 and quiet_duration > cfg.deactivate_quiet_s:
-                self.active = False
-                self._flip_times.clear()
-                self._last_flip_check_t = -cfg.flip_window_s - 1.0
-
-        return self.active
 
 
 # ═══════════════════════════════════════════════════════════
@@ -329,23 +222,22 @@ class BaselineEstimator:
 
 
 class PulseLoadFilterLogic:
-    """Stateful filter combining sign-flip detection and baseline estimation.
+    """Stateful filter driven by an external active signal.
 
     Pure computation — no HA or AppDaemon dependency.  The HA adapter
-    feeds samples in and reads the output.
+    feeds samples and the active flag, and reads the filtered output.
     """
 
     def __init__(self, cfg: FilterConfig) -> None:
         self.cfg = cfg
-        self.detector = SignFlipDetector(cfg)
         self.estimator = BaselineEstimator(cfg)
         self._was_active: bool = False
         """Previous active state for edge detection."""
 
     @property
     def active(self) -> bool:
-        """Whether the filter is currently engaged."""
-        return self.detector.active
+        """Whether the filter is currently engaged (last known state)."""
+        return self._was_active
 
     @property
     def measuring(self) -> bool:
@@ -357,41 +249,36 @@ class PulseLoadFilterLogic:
         """Current baseline estimate, or None if not yet measured."""
         return self.estimator.baseline
 
-    @property
-    def flip_count(self) -> int:
-        """Number of sign flips in the activation window."""
-        return self.detector.flip_count
-
-    def update(self, grid_w: float, now: float) -> float:
+    def update(self, grid_w: float, now: float, active: bool) -> float:
         """Process one grid sample and return the filtered output.
 
         Args:
             grid_w: Raw grid power reading (W).
             now: Monotonic timestamp (seconds).
+            active: Whether the detector considers a pulse load present.
 
         Returns:
             Filtered grid power — either the raw value (inactive) or
             the estimated baseline (active).
         """
         was_active = self._was_active
-        is_active = self.detector.update(grid_w, now)
 
         # Rising edge: just activated → start measurement pause
         # Don't feed the activation sample to the estimator — the
         # battery hasn't been paused yet, so this sample is from the
         # old (chasing) state.
-        if is_active and not was_active:
+        if active and not was_active:
             self.estimator.start_measurement(now)
-            self._was_active = is_active
+            self._was_active = active
             return grid_w
 
         # Falling edge: deactivated → reset estimator
-        if not is_active and was_active:
+        if not active and was_active:
             self.estimator.reset()
 
-        self._was_active = is_active
+        self._was_active = active
 
-        if not is_active:
+        if not active:
             return grid_w
 
         # Active: update estimator and return baseline (or raw if measuring)
@@ -408,12 +295,10 @@ class PulseLoadFilterLogic:
 
 
 class PulseLoadFilter(_HASS_BASE):
-    """AppDaemon app: filters periodic pulse loads from the grid sensor.
+    """AppDaemon app: baseline mitigation for periodic pulse loads.
 
-    Subscribes to the raw grid sensor, runs ``PulseLoadFilterLogic``,
-    and publishes the filtered output as ``sensor.zfi_plf_filtered_grid_power``.
-    In dry-run mode (default), does not pause the battery — only publishes
-    sensor entities for dashboard observation.
+    Subscribes to a detector's active entity and the raw grid sensor.
+    When active, outputs a stable baseline via ``filtered_power_entity``.
     """
 
     cfg: FilterConfig
@@ -424,12 +309,37 @@ class PulseLoadFilter(_HASS_BASE):
         self.cfg = FilterConfig.from_args(self.args)
         self.logic = PulseLoadFilterLogic(self.cfg)
         self._monotonic_offset = time.monotonic()
+        self._detector_active: bool = False
+        """Last known detector state from the active entity."""
 
+        # Subscribe to grid sensor for value updates
         self.listen_state(
             self._on_grid_change,
             self.cfg.grid_sensor,
         )
-        self.log("PulseLoadFilter initialized (dry_run=%s)", self.cfg.dry_run)
+        # Subscribe to detector active entity for state changes
+        self.listen_state(
+            self._on_active_change,
+            self.cfg.active_entity,
+        )
+        self.log(
+            "PulseLoadFilter initialized (active_entity=%s, dry_run=%s)",
+            self.cfg.active_entity,
+            self.cfg.dry_run,
+        )
+
+    def _on_active_change(
+        self,
+        entity: str,
+        attribute: str,
+        old: str,
+        new: str,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Called by AppDaemon when the detector active entity changes."""
+        if new in UNAVAILABLE_STATES:
+            return
+        self._detector_active = new == "1"
 
     def _on_grid_change(
         self,
@@ -450,7 +360,7 @@ class PulseLoadFilter(_HASS_BASE):
         now = time.monotonic() - self._monotonic_offset
         was_measuring = self.logic.measuring
 
-        filtered = self.logic.update(grid_w, now)
+        filtered = self.logic.update(grid_w, now, self._detector_active)
 
         # Publish filtered output
         self._set_entity(
@@ -460,13 +370,9 @@ class PulseLoadFilter(_HASS_BASE):
         )
 
         # Publish state sensors
-        self._set_sensor("active", int(self.logic.active))
         self._set_sensor("measuring", int(self.logic.measuring))
         if self.logic.baseline is not None:
             self._set_sensor("baseline", round(self.logic.baseline, 1), unit="W")
-
-        if self.cfg.debug:
-            self._set_sensor("flip_count", self.logic.flip_count)
 
         # Log state transitions
         if self.logic.measuring and not was_measuring:
@@ -477,9 +383,8 @@ class PulseLoadFilter(_HASS_BASE):
                 self.logic.baseline,
             )
         # TODO: battery pause mechanism for non-dry-run mode.
-        # The controller should read sensor.zfi_plf_active and zero its
-        # output during measurement.  Overwriting desired_power from here
-        # would race with the controller.  For now, dry_run only.
+        # The controller should read the detector's active entity and
+        # zero its output during measurement.  For now, dry_run only.
 
     def _set_entity(
         self,
@@ -510,7 +415,7 @@ class PulseLoadFilter(_HASS_BASE):
         value: object,
         unit: str | None = None,
     ) -> None:
-        """Create or update a ``sensor.zfi_plf_<name>`` entity in HA."""
+        """Create or update a ``{sensor_prefix}_{name}`` entity in HA."""
         self._set_entity(
             f"{self.cfg.sensor_prefix}_{name}", value, unit=unit
         )
