@@ -775,11 +775,6 @@ class ZeroFeedInController(_HASS_BASE):
         if self._csv is None:
             return
         target = self.logic.target_for_mode()
-        now = time.monotonic()
-        muting_remaining = max(
-            0.0,
-            self.cfg.muting_s - (now - self.logic.state.last_command_t),
-        )
         self._csv.log_row({
             "grid_w": round(m.grid_power_w),
             "soc_pct": round(m.soc_pct, 1),
@@ -790,7 +785,7 @@ class ZeroFeedInController(_HASS_BASE):
             "error_w": round(m.grid_power_w - target),
             "target_w": round(target),
             "drift_acc": round(self.logic.state.drift_acc),
-            "muting": round(muting_remaining, 1),
+            "muting": 0,
             "reason": output.reason,
         })
 
@@ -899,16 +894,11 @@ class ZeroFeedInController(_HASS_BASE):
             "drift_acc", round(self.logic.state.drift_acc), "W", "mdi:sigma",
         )
 
-        now = time.monotonic()
-        muting_remaining = max(
-            0.0,
-            self.cfg.muting_s - (now - self.logic.state.last_command_t),
+        self._set_sensor(
+            "muting", 0, icon="mdi:timer-sand",
         )
         self._set_sensor(
-            "muting", 1 if muting_remaining > 0 else 0, icon="mdi:timer-sand",
-        )
-        self._set_sensor(
-            "muting_remaining", round(muting_remaining, 1), "s", "mdi:timer-sand",
+            "muting_remaining", 0, "s", "mdi:timer-sand",
         )
         self._set_sensor("reason", output.reason, icon="mdi:information-outline")
 
