@@ -4,7 +4,7 @@
 
 Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter at ~0 W:
 
-1. **Controller** (`zero_feed_in_controller.py`) — Device-agnostic PI controller. Reads grid power, SOC, and battery power sensors. Publishes a signed desired-power value.
+1. **Controller** (`zero_feed_in_controller.py`) — Device-agnostic event-based controller. Reads grid power, SOC, and battery power sensors. Publishes a signed desired-power value.
 2. **Driver** (`zendure_solarflow_driver.py`) — Zendure-specific driver. Reads the desired power and translates it into `outputLimit`, `inputLimit`, and `acMode` commands.
 
 - **Solar surplus** → charge battery (absorb excess PV)
@@ -50,13 +50,11 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
 ### Data flow
 
 ```
-Controller (every 5s):
+Controller (event-driven, reacts to grid sensor changes):
   grid_power_sensor ─────────┐
-  soc_sensor ────────────────┤
-  battery_power_sensor───────┤──▸ PI + FF ──▸ sensor.zfi_desired_power
-  ff_sources (optional)──────┤               sensor.zfi_mode, surplus, etc.
-  relay_locked_sensor────────┤               (integral frozen when locked)
-  dynamic_min_soc_entity ────┘               (forecast-adjusted min SOC)
+  soc_sensor ────────────────┤──▸ direct calc ──▸ sensor.zfi_desired_power
+  battery_power_sensor───────┤                    sensor.zfi_mode, surplus, etc.
+  dynamic_min_soc_entity ────┘                    (forecast-adjusted min SOC)
 
 Driver (every 2s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
@@ -68,9 +66,9 @@ Driver (every 2s):
 | Concern | Controller | Driver |
 | --- | --- | --- |
 | What it knows | Grid power, SOC, surplus | Device protocol, relay timing |
-| What it doesn't know | outputLimit, inputLimit, acMode | PI gains, targets, modes |
+| What it doesn't know | outputLimit, inputLimit, acMode | ki, targets, modes |
 | Reusable for | Any battery | Only Zendure SolarFlow |
-| Update rate | 5 s (PI cycle) | 2 s (react to new desired power) |
+| Update rate | Event-driven (grid sensor) | 2 s (react to new desired power) |
 
 ---
 
@@ -110,7 +108,7 @@ This is more accurate than the old `last_sent_w` approach because it reflects wh
 
 - **DISCHARGING → CHARGING**: Surplus must stay above threshold for `charge_confirm_s` (default 15–20 s). Prevents transient spikes from triggering expensive relay switches.
 - **CHARGING → DISCHARGING**: Instant. Cover demand quickly.
-- On mode transition: integral and last_computed_w reset to 0.
+- On mode transition: drift accumulator reset to 0.
 
 ### 3. Asymmetric Targets
 
@@ -137,127 +135,55 @@ Optional `input_boolean` entities for HA UI control:
 | `discharge_switch` | Controller idles instead of discharging |
 
 When any guard forces the controller to idle (direction switches, SOC limits,
-no-surplus protection), the **integral is reset to zero**.  The integral only
-has meaning in a closed control loop; while the output is blocked (loop open),
-there is no feedback, so the integral becomes stale.  Resetting ensures the PI
-starts fresh when the guard clears.
+no-surplus protection), the **drift accumulator is reset to zero**.  The
+accumulator only has meaning in a closed control loop; while the output is
+blocked (loop open), there is no feedback, so the accumulated drift becomes
+stale.  Resetting ensures the controller starts fresh when the guard clears.
 
 ---
 
-## Controller: PI Controller + Feed-Forward
+## Controller: Direct Calculation with Muting
 
-### Position Form
+### Core Algorithm
+
+The controller uses direct calculation instead of PI control:
 
 ```
 error = grid_power - target
-
-gains = gain_set.select(mode, error)    # four-quadrant lookup
-P = gains.kp × error
-I = I_prev + gains.ki × error × dt
-
-pi_output = P + I
+correction = ki * error
+new_limit = last_sent + correction
 ```
 
-NOT velocity/incremental form. Critical with the SolarFlow's 10-15 s response latency.
+The `ki` parameter (default 1.0) scales the correction. With `ki=1.0`, the controller
+applies the full error as correction in one step. Lower values (e.g. 0.5) produce
+more conservative, slower corrections.
 
-### Multi-Source Feed-Forward
+### Muting
 
-The ``FeedForward`` class processes an arbitrary list of sensor sources.
-Each source has a sign (+1 for loads, -1 for generation) and a gain.
+After sending a command, the controller **mutes** (ignores) sensor updates for
+`muting_s` seconds (default 8 s). This prevents reacting to stale data while the
+device is still executing the previous command. The Zendure SolarFlow has a 10-15 s
+response latency, so the muting window avoids oscillation from stale readings.
 
-Instead of a raw delta, the derivative is taken on an **EMA-filtered** value
-(ISA PID D-filter). This attenuates high-frequency sensor noise while preserving
-slow ramps that merit a feed-forward response:
+### Hysteresis and Drift Accumulator
 
-```
-α = interval_s / (filter_tau_s + interval_s)   # e.g. 5/(97.4+5) ≈ 0.049
+Changes are classified as **large** or **small** based on the `hysteresis_w`
+threshold (default 15 W):
 
-for each source:
-    EMA_t = α × current + (1−α) × EMA_{t-1}    # update filter state
-    delta = α × (current − EMA_{t-1})           # filtered derivative
-    contrib += sign × gain × delta
+- **Large change** (`|correction| > hysteresis`): sent immediately.
+- **Small change** (`|correction| <= hysteresis`): accumulated in a drift register.
+  When `|drift_acc| > hysteresis`, a drift correction is sent.
 
-if |contrib| < ff_deadband:
-    contrib = 0
-combined = pi_output + contrib
-```
+This avoids sending frequent tiny adjustments while still correcting persistent
+small errors over time.
 
-With τ=97.4 s a 200 W spike produces a ~10 W FF impulse — below the 13.2 W deadband,
-so short cloud transients are ignored. Sustained slow ramps exceed the deadband
-and do trigger a feed-forward response.
+### Event-Driven Updates
 
-PV drops → positive ff (increase discharge). Load increases → positive ff.
-New sources are a YAML entry, no code changes required.
-Set ``ff_enabled: false`` to disable feed-forward without removing sources.
-
-Each source can carry an optional ``name`` that is used for HA debug sensor
-names (e.g. ``name: pv`` → ``sensor.zfi_ff_pv_raw``).
-
-Example configuration:
-```yaml
-ff_enabled: true
-ff_deadband: 13.2
-ff_filter_tau_s: 97.4   # EMA time constant (s); α = interval/(tau+interval)
-feed_forward_sources:
-  - entity: sensor.pv_power
-    gain: 0.6
-    sign: -1.0          # generation
-    name: pv            # → sensor.zfi_ff_pv_raw / _ema / _contrib
-  - entity: sensor.wallbox_power
-    gain: 0.8
-    sign: 1.0           # load
-```
-
-Backward compatible: legacy ``pv_sensor`` / ``ff_pv_gain`` keys
-still work and create a single FF source automatically.
-
-### Four-Quadrant Gains
-
-Gains are selected per cycle based on operating mode × error sign.
-Theoretical starting points via SIMC (Kp = interval / (2×T1), Ki = Kp / (4×T1)):
-
-| Quadrant | Physical action | T1 (s) | SIMC Kp | SIMC Ki |
-| --- | --- | --- | --- | --- |
-| `discharge_up` | increase discharge | 5.0 | 0.50 | 0.025 |
-| `discharge_down` | decrease discharge | 3.5 | 0.71 | 0.051 |
-| `charge_up` | increase charge | 7.5 | 0.33 | 0.011 |
-| `charge_down` | decrease charge | 5.5 | 0.45 | 0.021 |
-
-Production gains are optimizer-tuned (see `tools/optimize_gains.py`). The optimizer
-uses a plant model identified from real trace data and minimizes a euro-weighted cost
-function (IAE + feed-in + relay wear + control effort). Optimized gains differ
-significantly from SIMC — in particular, discharge gains are much lower and charge
-gains higher, reflecting the asymmetric device dynamics and relay wear cost.
-
-Selection matrix:
-
-|  | error ≥ 0 | error < 0 |
-| --- | --- | --- |
-| DISCHARGING | discharge_up | discharge_down |
-| CHARGING | charge_down | charge_up |
-
-### Anti-Windup (Back-Calculation)
-
-When output hits limits, `integral = limit - P_term`. Prevents windup during saturation.
-
-### Relay Lockout Anti-Windup
-
-When the driver’s relay state machine is clamping output (e.g. during a relay
-transition lockout), the driver publishes `sensor.zfi_relay_locked = "true"`.Additionally, `relay_locked` stays `true` for 8 seconds after each SM
-transition (`RELAY_SWITCH_DELAY_S`) to account for the physical relay
-switching time. This prevents the controller from winding up the integral
-while the relay is physically switching and the device cannot yet actuate
-the new setpoint.The controller reads this via the optional `relay_locked_sensor` config and
-**freezes the integral**: no new integral is committed, and no back-calculation
-is performed. The normal output pipeline still runs (P + I + FF → clamp), so
-the driver sees the controller’s intent, but the integral does not wind up
-while the device cannot actuate.
-
-The reason string includes a " (relay locked)" suffix when active.
-
-### Deadband
-
-When |error| ≤ deadband_w: P = 0, integral frozen, output unchanged.
+The controller reacts to grid sensor state changes (`listen_state`) instead of
+polling on a fixed interval. This means:
+- Faster response to sudden load changes
+- No wasted cycles when the grid sensor hasn't changed
+- A safety tick every 30 s detects stale sensors and publishes a safe (0 W) state
 
 ---
 
@@ -313,7 +239,7 @@ During lockout, power is **clamped** to the current direction's minimum active p
 
 ### 1. Emergency (Feed-in > `max_feed_in`)
 
-Direct curtailment: output reduced by (excess + 50 W margin). Integral back-calculated to the forced value so the PI resumes smoothly.
+Direct curtailment: output reduced by (excess + 50 W margin). Drift accumulator reset.
 
 ### 2. Direction Lockout (adaptive, direction-aware)
 
@@ -339,7 +265,7 @@ Otherwise resets to 10%. This prevents pointless deep discharge on days when PV 
 Three layers:
 1. **Mode gate**: surplus ≤ 0 → charging blocked
 2. **Surplus clamp**: charge capped at available surplus
-3. **Asymmetric target**: target = 0 prevents PI from requesting grid power
+3. **Asymmetric target**: target = 0 prevents controller from requesting grid power
 
 ---
 
@@ -347,7 +273,7 @@ Three layers:
 
 ### Why two apps (controller + driver)?
 
-- **Controller** handles PI control, mode switching, surplus estimation — reusable for any battery
+- **Controller** handles direct calculation control, mode switching, surplus estimation — reusable for any battery
 - **Driver** handles Zendure-specific protocol: AC mode relay, power rounding, lockout timing
 - Controller publishes `sensor.zfi_desired_power` (signed W, +discharge/-charge)
 - Driver polls this sensor every 2 s and translates to device commands
@@ -355,7 +281,7 @@ Three layers:
 
 ### Why AppDaemon (not HA Blueprint)?
 
-- PI controller with state, mode machine, guards, and lockouts doesn't fit YAML templates
+- Controller with state, mode machine, guards, and lockouts doesn't fit YAML templates
 - AppDaemon gives real Python: dataclasses, enums, testable methods, proper logging
 
 ### Why two actuators (not one)?
@@ -369,7 +295,7 @@ Three layers:
 ### Why sensors are read-only, actuators write-only
 
 - Number entities show *commanded* value, not actual output
-- PI uses its own state (`last_computed_w`), surplus uses `battery_power_sensor`
+- PI uses its own state (`last_sent_w`), surplus uses `battery_power_sensor`
 - Only external sensors needed by controller: `grid_power`, `soc`, `battery_power`
 
 ### AC Mode Management in Driver
@@ -388,7 +314,7 @@ Three layers:
 4. **"Never charge from grid" is a guard, not a mode.** Surplus ≤ 0 → charge blocked.
 5. **Relay protection lives in the driver.** The controller can freely request any power level. The driver's state machine decides when and how to execute it.
 6. **Forecast is conservative, not optimizing.** One threshold (1.5 kWh) switches between two min_soc values (10% / 30%). No complex optimization.
-7. **D-term and high-frequency FF don't work with current sensors.** Grid and PV noise levels are too high for derivative-based control.
+7. **Muting replaces complex anti-windup.** Instead of integral anti-windup, the controller simply ignores sensor updates while the device is responding. Simpler and more robust.
 
 ---
 
@@ -396,7 +322,7 @@ Three layers:
 
 ```
 src/
-├── zero_feed_in_controller.py    # device-agnostic PI controller + ControlLogic
+├── zero_feed_in_controller.py    # device-agnostic direct calculation controller
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
 ├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
 ├── relay_switch_counter.py       # relay switch event counter (persists to JSON)
@@ -431,28 +357,22 @@ Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX, EMERGENCY_SAFETY_MARGIN_W
 Enums:      OperatingMode (CHARGING, DISCHARGING)
 
 Dataclasses:
-  Config          — typed config from apps.yaml
-  FeedForwardSource — entity, gain, sign, previous_w
-  Measurement     — grid_power_w, soc_pct, battery_power_w, ff_readings, switch states, relay_locked, dynamic_min_soc_pct
-  ControlOutput   — desired_power_w, p/i/ff terms, reason
-  ControllerState — integral, last_computed_w, mode, charge_pending_since
-
-PIController:     — anti-windup back-calculation, gains supplied per call (PIGains)
-  PIGains:          — Kp/Ki pair for one quadrant
-  PIGainSet:        — four quadrant gain sets with select(mode, error)
-
-FeedForward:      — multi-source feed-forward compensation (deadband on sum)
+  Config          — typed config from apps.yaml (ki, hysteresis, muting, targets, limits)
+  Measurement     — grid_power_w, soc_pct, battery_power_w, switch states, dynamic_min_soc_pct
+  ControlOutput   — desired_power_w, reason
+  ControllerState — last_sent_w, last_command_t, current_muting_s, drift_acc, mode, charge_pending_since
 
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
-  compute()                     — emergency → mode → PI+FF → guards → clamp → relay-lock freeze
-  state_snapshot()              — return dict of integral/mode/last_computed_w/db_acc
+  compute()                     — muting → emergency → mode → direct calc → guards → clamp
+  state_snapshot()              — return dict of last_sent/mode/drift_acc/surplus_ema
   restore_from_snapshot()       — restore state from dict (returns bool)
 
 ZeroFeedInController(hass.Hass): — thin HA adapter
-  initialize()                  — config, seed, restore state, CsvLogger, schedule
+  initialize()                  — config, seed, restore state, CsvLogger, listen_state
   terminate()                   — save state to JSON on shutdown
-  _on_tick()                    — read → compute → log → publish → csv → periodic save
+  _on_grid_change()             — event callback: read → compute → log → publish → csv → save
+  _safety_tick()                — periodic stale sensor check (30 s)
 ```
 
 ### Driver (`src/zendure_solarflow_driver.py`)
@@ -488,8 +408,8 @@ ZendureSolarFlowDriver(_HASS_BASE):
 
 ### Test Coverage
 
-274 unit tests covering:
-- **Controller** (103 tests): ControlLogic, PIController, FeedForward, state persistence
+221 unit tests covering:
+- **Controller** (42 tests): ControlLogic, direct calculation, muting, drift, guards, state persistence
 - **Driver** (128 tests): RelayStateMachine, AdaptiveLockout, command sequencing
 - **PV Forecast** (17 tests): sensor reading, dynamic min SOC logic
 - **CSV Logger** (8 tests): file rotation, CSV formatting
@@ -534,46 +454,40 @@ Relay switching:
 
 ```mermaid
 flowchart TD
-    A([Tick: every 5s]) --> B{Sensors OK?}
+    A([Grid sensor change]) --> B{Sensors OK?}
     B -- No --> Z([Skip])
     B -- Yes --> C[Read grid, SOC, battery_power]
 
-    C --> D["Estimate surplus<br>= -battery_power_w - grid"]
+    C --> MUT{Muted?}
+    MUT -- Yes --> Z2([Skip: wait for device])
+    MUT -- No --> D["Estimate surplus<br>= -battery_power_w - grid"]
 
     D --> E{Feed-in > max_feed_in?}
-    E -- Yes --> F["EMERGENCY<br>Curtail, reset integral"]
+    E -- Yes --> F["EMERGENCY<br>Curtail, reset drift"]
     F --> PUB
 
     E -- No --> G[Update operating mode<br>Schmitt trigger on surplus]
     G --> H[Select target<br>CHARGING→0W / DISCHARGING→30W]
-    H --> I["error = grid - target"]
+    H --> I["error = grid - target<br>correction = ki × error"]
 
-    I --> J{"|error| ≤ deadband?"}
-    J -- Yes --> K3["Freeze PI, keep output"]
-    J -- No --> L["PI step: P + I"]
+    I --> J{"|correction| > hysteresis?"}
+    J -- Yes --> DIRECT["new_limit = last_sent + correction"]
+    J -- No --> DRIFT["drift_acc += correction"]
 
-    K3 --> FF
-    L --> FF["Feed-forward<br>sum(sign × gain × delta)<br>deadband on total"]
+    DRIFT --> DCHK{"|drift_acc| > hysteresis?"}
+    DCHK -- No --> Z3([No action needed])
+    DCHK -- Yes --> DLIM["new_limit = last_sent + drift_acc"]
+    DLIM --> GUARD
+    DIRECT --> GUARD
 
-    FF --> N{"|raw| > 0?<br>(discharge)"}
-    N -- Yes --> O{SOC ≤ min?}
-    O -- Yes --> P["Idle: SOC too low"]
-    O -- No --> CL
-
-    N -- No --> R{surplus ≤ 0?}
-    R -- Yes --> S["Idle: No surplus"]
-    R -- No --> T{SOC ≥ max?}
-    T -- Yes --> U["Idle: SOC full"]
-    T -- No --> CL
-
-    CL["Clamp to limits<br>Cap charge at surplus"]
+    GUARD{Guards OK?}
+    GUARD -- "SOC too low / full /<br>direction disabled" --> IDLE["Idle: 0W"]
+    GUARD -- Yes --> CL["Clamp to limits<br>Cap charge at surplus"]
 
     CL --> PUB
-    P --> PUB
-    S --> PUB
-    U --> PUB
+    IDLE --> PUB
 
-    PUB["Publish sensor.zfi_desired_power<br>+ all sensor.zfi_* states"]
+    PUB["Publish sensor.zfi_desired_power<br>+ all sensor.zfi_* states<br>Start muting window"]
 ```
 
 ### Driver Loop
@@ -657,17 +571,13 @@ Published only when `debug: true` in the controller config.
 | --- | --- | --- | --- |
 | `zfi_surplus` | number | W | Estimated PV surplus |
 | `zfi_battery_power` | number | W | Actual battery power (+discharge, -charge) |
-| `zfi_target` | number | W | Active PI target (0 or 30) |
+| `zfi_target` | number | W | Active target (0 or 30) |
 | `zfi_error` | number | W | Regulation error |
-| `zfi_p_term` | number | W | Proportional component |
-| `zfi_i_term` | number | W | Integral component |
-| `zfi_ff` | number | W | Feed-forward component (post-deadband) |
-| `zfi_ff_pv_raw` | number | W | Live PV sensor reading |
-| `zfi_ff_pv_ema` | number | W | PV EMA filter state (τ from `ff_filter_tau_s`) |
-| `zfi_ff_pv_contrib` | number | W | PV contribution before deadband |
-| `zfi_ff_others_contrib` | number | W | All non-PV load sources summed, before deadband |
-| `zfi_integral` | number | W | Integral accumulator |
+| `zfi_drift_acc` | number | W | Drift accumulator value |
+| `zfi_muting` | number | — | 1 if muted, 0 otherwise |
+| `zfi_muting_remaining` | number | s | Seconds remaining in muting window |
 | `zfi_reason` | text | — | Decision reason |
+| `zfi_effective_min_soc` | number | % | Effective min SOC after dynamic clamping |
 
 ### Driver sensors (always published)
 
@@ -731,19 +641,17 @@ cards:
       - entity: sensor.zfi_charge_limit
         name: Charge Limit
 
-  # ── PI internals ────────────────────────────────
+  # ── Controller internals ─────────────────────────
   - type: history-graph
-    title: PI Controller
+    title: Controller Internals
     hours_to_show: 0.5
     entities:
       - entity: sensor.zfi_error
         name: Error
-      - entity: sensor.zfi_p_term
-        name: P Term
-      - entity: sensor.zfi_i_term
-        name: I Term
-      - entity: sensor.zfi_integral
-        name: Integral
+      - entity: sensor.zfi_drift_acc
+        name: Drift Acc
+      - entity: sensor.zfi_muting_remaining
+        name: Muting Remaining
       - entity: sensor.zfi_target
         name: Target
 
@@ -789,12 +697,10 @@ cards:
         name: Target
       - entity: sensor.zfi_error
         name: Error
-      - entity: sensor.zfi_p_term
-        name: P Term
-      - entity: sensor.zfi_i_term
-        name: I Term
-      - entity: sensor.zfi_integral
-        name: Integral
+      - entity: sensor.zfi_drift_acc
+        name: Drift Acc
+      - entity: sensor.zfi_muting_remaining
+        name: Muting Remaining
       - entity: sensor.zfi_discharge_limit
         name: Discharge Limit
       - entity: sensor.zfi_charge_limit
@@ -1011,7 +917,7 @@ grid = house - PV + charge = 500 - 1200 + 400 = -300W (feeding in)
 surplus = -battery_power_w - grid = -(-400) - (-300) = 400 + 300 = 700W
 mode: 700 > 50 → CHARGING, target = 0W
 error = -300 - 0 = -300W
-PI increases charge
+correction increases charge
 clamp: cap at surplus=700 → charge up to 700W
 → desired_power ≈ -650W
 → driver: inputLimit=650W, outputLimit=0W
@@ -1027,7 +933,7 @@ grid = 500 - 600 + 650 = +550W (drawing from grid!)
 surplus = -(-650) - 550 = 650 - 550 = 100W
 mode: 100 > -50 → stays CHARGING (hysteresis!), target = 0W
 error = 550 - 0 = 550
-PI reduces charge significantly
+correction reduces charge significantly
 clamp: cap at surplus=100W
 → desired_power ≈ -100W
 → driver: inputLimit=100W
@@ -1043,7 +949,7 @@ grid = +400W
 surplus = 0 - 400 = -400W
 mode: -400 < -50 → DISCHARGING, target = 30W
 error = 400 - 30 = 370
-PI increases discharge
+correction increases discharge
 → desired_power ≈ +370W
 → driver: outputLimit=370W, inputLimit=0W
 ```
@@ -1056,7 +962,7 @@ battery_sensor = +300, battery_power_w = +300
 grid = 100 - 0 - 300 = -200W (feeding in!)
 
 surplus = -(+300) - (-200) = -300 + 200 = -100W
-mode: stays DISCHARGING, PI reduces output
+mode: stays DISCHARGING, correction reduces output
 → desired_power drops toward 100W
 ```
 
@@ -1067,26 +973,25 @@ grid = -1100W (1100W flowing to grid)
 feed_in = 1100 > 800 → EMERGENCY
 excess = 1100 - 800 = 300
 forced = current_output - 300 - 50 (safety margin)
-integral → forced (back-calculated)
+drift accumulator reset
 ```
 
 ### 6. Battery full — surplus goes to grid
 
 ```
 SOC=85%, surplus=500W, mode=CHARGING
-PI wants to charge → guard: SOC ≥ max → idle
+controller wants to charge → guard: SOC ≥ max → idle
 → desired_power = 0W
 → Surplus flows to grid (unavoidable)
 ```
 
 | Problem | Action |
 | --- | --- |
-| Output oscillates | Reduce Kp for the relevant quadrant, increase deadband |
-| Persistent offset | Increase Ki for the relevant quadrant |
-| Sluggish on load changes | Increase Kp for the relevant quadrant, reduce interval |
-| Relay clicks frequently | Increase direction_lockout (30+ s), lower adaptive_lockout_ref_w (100 W), increase deadband |
+| Output oscillates | Reduce ki, increase hysteresis or muting |
+| Persistent offset | Increase ki (default 1.0 should eliminate offsets) |
+| Sluggish on load changes | Increase ki, reduce muting |
+| Relay clicks frequently | Increase hysteresis, increase muting |
 | Mode flaps | Increase mode_hysteresis (80–100 W), increase charge_confirm (25 s) |
-| Relay switches on marginal surplus | Lower adaptive_lockout_ref_w, increase adaptive_lockout_max_mult |
 | Charges from grid briefly | Check surplus in logs, increase hysteresis |
 
 ---

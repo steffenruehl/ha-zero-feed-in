@@ -16,7 +16,7 @@ Five apps with clear separation of concerns:
 ┌──────────────────────────────┐        ┌──────────────────┐
 │  Controller (device-agnostic)│        │  SolarFlow       │
 │  ┌────────────────────────┐  │  MQTT  │  2400 AC+        │
-│  │ PI controller          │  │◂─────▸│                  │
+│  │ Direct calculation    │  │◂─────▸│                  │
 │  │ Mode switching         │  │       │  outputLimit     │
 │  │ Surplus estimation     │──┤       │  inputLimit      │
 │  └──────────┬─────────────┘  │       │  acMode          │
@@ -33,7 +33,7 @@ Five apps with clear separation of concerns:
 
 | App | File | Responsibility |
 | --- | --- | --- |
-| Controller | `src/zero_feed_in_controller.py` | PI control, mode switching, surplus estimation, safety guards |
+| Controller | `src/zero_feed_in_controller.py` | Direct calculation control, mode switching, surplus estimation, safety guards |
 | Driver | `src/zendure_solarflow_driver.py` | AC mode, relay lockout, 5 W rounding, redundant-send suppression |
 | Forecast | `src/pv_forecast_manager.py` | Adjusts dynamic min SOC based on PV forecast |
 | Counter | `src/relay_switch_counter.py` | Tracks daily relay switch count |
@@ -41,8 +41,8 @@ Five apps with clear separation of concerns:
 
 ### Key Features
 
-- **Position-form PI** with asymmetric gains — cautious ramp-up, aggressive ramp-down
-- **Anti-windup back-calculation** — integral stays sane at output limits
+- **Event-driven direct calculation** with muting — reacts to grid sensor changes, waits for device response
+- **Drift accumulator** — sub-hysteresis errors accumulate for eventual correction
 - **Schmitt trigger mode switching** with charge confirmation delay
 - **AC mode send-once** — command sent on intent change, retried after 30 s timeout
 - **Relay lockout** — driver tracks own intent, not MQTT entity (10-15 s device lag)
@@ -96,9 +96,8 @@ Pre-built debug dashboards included in `config/`:
 | Dashboard | Purpose |
 | --- | --- |
 | [`lovelace_zfi_operations.yaml`](config/lovelace_zfi_operations.yaml) | Main control loop: grid power, surplus, battery, desired power, device state |
-| [`lovelace_zfi_pi_debug.yaml`](config/lovelace_zfi_pi_debug.yaml) | PI internals: P/I terms, integral, error, deadband, mode transitions (requires `debug: true`) |
+| [`lovelace_zfi_pi_debug.yaml`](config/lovelace_zfi_pi_debug.yaml) | Controller internals: error, muting, drift, mode transitions (requires `debug: true`) |
 | [`lovelace_zfi_relay_sm_debug.yaml`](config/lovelace_zfi_relay_sm_debug.yaml) | Relay state machine: transitions, lockout progress, energy accumulation (requires `debug: true`) |
-| [`lovelace_ff_debug.yaml`](config/lovelace_ff_debug.yaml) | Feed-forward: PV filtering, load sources, forecast integration (requires `debug: true`) |
 
 **Setup**: In Home Assistant, go to **Dashboards** → **Create new** → **Edit in YAML** → paste the entire contents of a dashboard file.
 
@@ -109,7 +108,7 @@ See [docs/zero_feed_in_docs.md#lovelace-dashboards](docs/zero_feed_in_docs.md#lo
 - **[docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md)** — Complete technical documentation:
   - System architecture and design decisions
   - Controller and driver concepts
-  - PI controller tuning and feed-forward control
+  - Direct calculation controller tuning (ki, hysteresis, muting)
   - Protection mechanisms (SOC, grid-charge, relay switching)
   - Configuration reference and published sensors
   - Flowcharts, example scenarios, and troubleshooting guide

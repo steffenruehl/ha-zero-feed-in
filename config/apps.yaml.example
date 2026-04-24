@@ -6,7 +6,7 @@
 #  Tuning parameters have safe defaults — adjust only if needed.
 #
 #  Five apps:
-#    1. Controller  — device-agnostic PI, publishes desired power
+#    1. Controller  — device-agnostic direct calculation, publishes desired power
 #    2. Driver      — translates desired power into Zendure SolarFlow commands
 #    3. Forecast    — adjusts dynamic min SOC based on PV forecast
 #    4. Counter     — tracks daily relay switch count
@@ -23,7 +23,7 @@
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1. Controller (device-agnostic PI)
+#  1. Controller (event-based direct calculation)
 # ══════════════════════════════════════════════════════════════════════════════
 zero_feed_in_controller:
   module: zero_feed_in_controller
@@ -55,8 +55,6 @@ zero_feed_in_controller:
   # charge_switch: input_boolean.zfi_charge_enabled
   # discharge_switch: input_boolean.zfi_discharge_enabled
 
-  # Relay lockout feedback (from driver) — freeze integral during transitions
-  relay_locked_sensor: sensor.zfi_relay_locked
 
   # Dynamic min SOC — published by the PV Forecast Manager app (below)
   dynamic_min_soc_entity: sensor.zfi_dynamic_min_soc
@@ -67,43 +65,11 @@ zero_feed_in_controller:
   charge_target_power: 0       # charge target (W)
   mode_hysteresis: 50          # Schmitt trigger band for mode switching (W)
   charge_confirm: 20           # seconds surplus must hold before entering CHARGING
-  deadband: 35                 # ignore errors below this (W)
-  interval: 5                  # control loop period (s)
-  deadband_leak_ws: 250        # leak correction for persistent deadband bias (W·s)
 
-  # Four-quadrant PI gains.  Tuned for Zendure SolarFlow 2400 AC+ step response.
-  #
-  #   Quadrant          Physical action      T1     Kp    Ki
-  #   discharge_up      increase discharge   5.0s   0.50  0.025
-  #   discharge_down    decrease discharge   3.5s   0.71  0.051
-  #   charge_up         increase charge      7.5s   0.33  0.011
-  #   charge_down       decrease charge      5.5s   0.45  0.021
-  #
-  kp_discharge_up: 0.50
-  kp_discharge_down: 0.71
-  kp_charge_up: 0.33
-  kp_charge_down: 0.45
-  ki_discharge_up: 0.025
-  ki_discharge_down: 0.051
-  ki_charge_up: 0.011
-  ki_charge_down: 0.021
-
-  # Feed-forward (optional).  Set ff_enabled: false to disable entirely.
-  # Each source tracks a power sensor and applies sign × gain × delta.
-  #   sign: -1.0 for generation (PV), +1.0 for loads
-  #   gain: how aggressively to react (0.0–1.0)
-  #   name: label for the first source tagged "pv" (used for debug sensors)
-  ff_enabled: false
-  ff_deadband: 30              # ignore total FF below this (W)
-  ff_filter_tau_s: 30          # EMA time constant (s)
-  # feed_forward_sources:
-  #   - entity: sensor.YOUR_PV_POWER_SENSOR
-  #     gain: 0.8
-  #     sign: -1.0
-  #     name: pv
-  #   - entity: sensor.YOUR_LOAD_SENSOR
-  #     gain: 0.6
-  #     sign: 1.0
+  # Direct calculation parameters
+  ki: 1.0                      # integral gain (1.0 = full correction per step)
+  hysteresis: 15               # ignore errors below this (W)
+  muting: 8                    # seconds after a command before reacting to new readings
 
   # Power limits
   max_output: 800              # max discharge power (W)

@@ -1,7 +1,8 @@
 """
-Zero Feed-In Controller – Device-Agnostic PI Controller
+Zero Feed-In Controller – Event-Based Direct Calculation
 
-Bidirectional PI controller that keeps the grid meter at ~0 W.
+Bidirectional controller that keeps the grid meter at ~0 W.
+Uses direct calculation with muting instead of PI control.
 Publishes a signed desired-power value to a HA sensor entity.
 A separate device driver reads that sensor and translates it
 into hardware-specific commands.
@@ -17,10 +18,10 @@ import json
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 try:
     from .csv_logger import CsvLogger
@@ -47,10 +48,8 @@ EMERGENCY_SAFETY_MARGIN_W = 50
 CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
-    "p_term", "i_term", "ff_term",
-    "integral", "target_w", "error_w",
-    "in_deadband", "relay_locked", "charge_pending",
-    "kp_used", "ki_used",
+    "error_w", "target_w",
+    "drift_acc", "muting",
     "reason",
 ]
 """Column names for controller CSV log (excluding timestamp)."""
@@ -78,95 +77,14 @@ class OperatingMode(Enum):
 
 
 @dataclass
-class PIGains:
-    """Kp/Ki pair for one physical quadrant."""
-
-    kp: float
-    """Proportional gain."""
-    ki: float
-    """Integral gain."""
-
-
-@dataclass
-class PIGainSet:
-    """Four gain sets indexed by mode × error-sign quadrant.
-
-    Selection logic::
-
-                      error >= 0           error < 0
-        DISCHARGING   discharge_up         discharge_down
-        CHARGING      charge_down          charge_up
-
-    Note CHARGING is flipped: error >= 0 means "charging too much,
-    reduce" → charge_down.  Error < 0 means "surplus available,
-    charge more" → charge_up.
-    """
-
-    discharge_up: PIGains
-    """Increase discharge (error >= 0 in DISCHARGING)."""
-    discharge_down: PIGains
-    """Decrease discharge (error < 0 in DISCHARGING)."""
-    charge_up: PIGains
-    """Increase charge (error < 0 in CHARGING)."""
-    charge_down: PIGains
-    """Decrease charge (error >= 0 in CHARGING)."""
-
-    def select(self, mode: OperatingMode, error: float) -> PIGains:
-        """Return the gain pair for the current mode and error sign."""
-        if mode == OperatingMode.DISCHARGING:
-            return self.discharge_up if error >= 0 else self.discharge_down
-        return self.charge_up if error < 0 else self.charge_down
-
-
-@dataclass
-class FeedForwardSource:
-    """A single feed-forward input source.
-
-    Each source tracks a HA sensor entity and applies a gain-scaled
-    delta to the control output.  The ``sign`` field determines the
-    effect direction:
-
-    * ``-1.0`` for generation (PV): drop → increase discharge.
-    * ``+1.0`` for loads (wallbox, dryer): increase → increase discharge.
-    """
-
-    entity: str
-    """HA sensor entity ID."""
-    gain: float
-    """Fraction of delta to apply (0.0–1.0)."""
-    sign: float
-    """+1.0 for loads, -1.0 for generation."""
-    filtered_w: float | None = None
-    """EMA filter state. None until first reading; bootstrapped on first cycle."""
-    name: str | None = None
-    """Short label used for HA sensor names (e.g. 'pv'). Defaults to 'src{index}'."""
-
-
-@dataclass
-class FeedForwardSourceDebug:
-    """Per-source feed-forward snapshot after one control cycle."""
-
-    name: str
-    """Source label (matches FeedForwardSource.name)."""
-    raw_w: float | None
-    """Current sensor reading (W)."""
-    ema_w: float | None
-    """EMA filter state before this cycle's update (W)."""
-    delta_w: float
-    """EMA derivative: α × (raw − EMA). Zero when EMA not seeded."""
-    contrib_w: float
-    """Per-source contribution: sign × gain × delta_w (pre-deadband, W)."""
-
-
-@dataclass
 class Config:
     """Typed, validated configuration loaded from ``apps.yaml``.
 
     Covers three domains:
 
     * **Sensor entity IDs** — grid power, SOC, battery power.
-    * **Controller tuning** — PI gains, deadband, targets, limits.
-    * **Protection** — max feed-in, emergency multiplier.
+    * **Controller tuning** — ki, hysteresis, muting, targets, limits.
+    * **Protection** — max feed-in.
 
     Constructed via the ``from_args`` classmethod which maps the
     free-form ``args`` dict from AppDaemon into typed fields with
@@ -185,11 +103,6 @@ class Config:
     charge_switch: str | None = None
     discharge_switch: str | None = None
 
-    # Relay lockout feedback from driver
-    relay_locked_sensor: str | None = None
-    """HA entity published by the driver when the relay SM is clamping output.
-    When 'true', the controller freezes the integral to prevent windup."""
-
     # Dynamic min SOC from forecast automation
     dynamic_min_soc_entity: str | None = None
     """``input_number`` entity that carries the forecast-adjusted min SOC (%).
@@ -201,43 +114,15 @@ class Config:
 
     # Controller tuning
     discharge_target_w: float = 30.0
+    """Grid power target when discharging (W). Small positive = slight grid draw."""
     charge_target_w: float = 0.0
-    kp_discharge_up: float = 0.50
-    """Kp for increasing discharge (DISCHARGING, error >= 0)."""
-    kp_discharge_down: float = 0.71
-    """Kp for decreasing discharge (DISCHARGING, error < 0)."""
-    kp_charge_up: float = 0.33
-    """Kp for increasing charge (CHARGING, error < 0)."""
-    kp_charge_down: float = 0.45
-    """Kp for decreasing charge (CHARGING, error >= 0)."""
-    ki_discharge_up: float = 0.025
-    """Ki for increasing discharge."""
-    ki_discharge_down: float = 0.051
-    """Ki for decreasing discharge."""
-    ki_charge_up: float = 0.011
-    """Ki for increasing charge."""
-    ki_charge_down: float = 0.021
-    """Ki for decreasing charge."""
-    deadband_w: float = 25.0
-    deadband_leak_ws: float = 500.0
-    """Error×time threshold (W·s) for in-deadband leak correction.
-
-    Accumulates ``error × dt`` while the PI is frozen inside the deadband.
-    When the magnitude reaches this threshold the PI is allowed to run
-    once (bypassing the deadband) and the accumulator resets.  Set to 0
-    to disable.  Default 500 W·s ≈ 26 s at a persistent 19 W error.
-    """
-    interval_s: int = 5
-
-    # Feed-forward
-    ff_enabled: bool = True
-    """Master switch to enable/disable feed-forward compensation."""
-    ff_deadband_w: float = 20.0
-    """Ignore total FF correction below this threshold (W)."""
-    ff_filter_tau_s: float = 30.0
-    """EMA filter time constant for the FF derivative (s). Higher = smoother but slower response."""
-    ff_sources: tuple[FeedForwardSource, ...] = ()
-    """Feed-forward input sources (PV, loads, etc.). Empty = FF disabled."""
+    """Grid power target when charging (W). Zero = absorb all surplus."""
+    ki: float = 1.0
+    """Integral gain applied to error. 1.0 = full correction in one step."""
+    hysteresis_w: float = 15.0
+    """Suppress commands when |change| <= this (W). Also drift threshold."""
+    muting_s: float = 8.0
+    """Seconds to ignore sensor updates after sending a command."""
 
     # Power limits
     max_discharge_w: float = 800.0
@@ -255,13 +140,13 @@ class Config:
     # Debug
     dry_run: bool = True
     debug: bool = False
-    """If True, publish internal PI sensors (p_term, i_term, integral, etc.)."""
+    """If True, publish internal controller sensors (drift, muting, etc.)."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
 
     # Heartbeat
     heartbeat_mqtt_topic: str = ""
     """MQTT topic for heartbeat publishing.  When set, the controller publishes
-    an ISO-8601 UTC timestamp on every tick for external monitoring
+    an ISO-8601 UTC timestamp on every callback for external monitoring
     (e.g. by an ESP fallback controller).  Empty = disabled."""
 
     # File logging
@@ -269,25 +154,19 @@ class Config:
     """Directory for CSV log files. Empty = file logging disabled."""
 
     @classmethod
-    def from_args(cls, args: dict[str, object]) -> Config:
+    def from_args(cls, args: dict[str, Any]) -> Config:
         """Create a ``Config`` from the raw ``args`` dict provided by AppDaemon.
 
         Maps apps.yaml keys (e.g. ``target_grid_power``) to dataclass
         fields (``discharge_target_w``).  Falls back to class-level
         defaults for any omitted key.
-
-        Backward compatibility: if old-style ``kp``/``ki`` keys are
-        present (without quadrant suffixes), they are mapped to all
-        four quadrants.
         """
-        gains = cls._parse_gains(args)
         return cls(
             grid_sensor=args["grid_power_sensor"],
             soc_sensor=args["soc_sensor"],
             battery_power_sensor=args["battery_power_sensor"],
             charge_switch=args.get("charge_switch"),
             discharge_switch=args.get("discharge_switch"),
-            relay_locked_sensor=args.get("relay_locked_sensor"),
             dynamic_min_soc_entity=args.get("dynamic_min_soc_entity"),
             discharge_target_w=float(
                 args.get("target_grid_power", cls.discharge_target_w)
@@ -295,10 +174,9 @@ class Config:
             charge_target_w=float(
                 args.get("charge_target_power", cls.charge_target_w)
             ),
-            **gains,
-            deadband_w=float(args.get("deadband", cls.deadband_w)),
-            deadband_leak_ws=float(args.get("deadband_leak_ws", cls.deadband_leak_ws)),
-            interval_s=int(args.get("interval", cls.interval_s)),
+            ki=float(args.get("ki", cls.ki)),
+            hysteresis_w=float(args.get("hysteresis", cls.hysteresis_w)),
+            muting_s=float(args.get("muting", cls.muting_s)),
             max_discharge_w=float(args.get("max_output", cls.max_discharge_w)),
             max_charge_w=float(args.get("max_charge", cls.max_charge_w)),
             min_soc_pct=float(args.get("min_soc", cls.min_soc_pct)),
@@ -310,10 +188,6 @@ class Config:
                 args.get("charge_confirm", cls.charge_confirm_s)
             ),
             max_feed_in_w=float(args.get("max_feed_in", cls.max_feed_in_w)),
-            ff_enabled=bool(args.get("ff_enabled", cls.ff_enabled)),
-            ff_deadband_w=float(args.get("ff_deadband", cls.ff_deadband_w)),
-            ff_filter_tau_s=float(args.get("ff_filter_tau_s", cls.ff_filter_tau_s)),
-            ff_sources=cls._parse_ff_sources(args),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
@@ -323,77 +197,10 @@ class Config:
             log_dir=args.get("log_dir", cls.log_dir),
         )
 
-    @classmethod
-    def _parse_gains(cls, args: dict[str, object]) -> dict[str, float]:
-        """Extract four-quadrant PI gains from args, with legacy fallback.
-
-        New-style keys (``kp_discharge_up``, etc.) take priority.
-        If absent, falls back to legacy ``kp``/``ki`` applied uniformly.
-        """
-        if "kp_discharge_up" in args:
-            return {
-                "kp_discharge_up": float(args.get("kp_discharge_up", cls.kp_discharge_up)),
-                "kp_discharge_down": float(args.get("kp_discharge_down", cls.kp_discharge_down)),
-                "kp_charge_up": float(args.get("kp_charge_up", cls.kp_charge_up)),
-                "kp_charge_down": float(args.get("kp_charge_down", cls.kp_charge_down)),
-                "ki_discharge_up": float(args.get("ki_discharge_up", cls.ki_discharge_up)),
-                "ki_discharge_down": float(args.get("ki_discharge_down", cls.ki_discharge_down)),
-                "ki_charge_up": float(args.get("ki_charge_up", cls.ki_charge_up)),
-                "ki_charge_down": float(args.get("ki_charge_down", cls.ki_charge_down)),
-            }
-        if "kp" not in args and "ki" not in args:
-            return {}
-        # Legacy: single kp/ki applied to all quadrants
-        kp = float(args.get("kp", cls.kp_discharge_up))
-        ki = float(args.get("ki", cls.ki_discharge_up))
-        return {
-            "kp_discharge_up": kp,
-            "kp_discharge_down": kp,
-            "kp_charge_up": kp,
-            "kp_charge_down": kp,
-            "ki_discharge_up": ki,
-            "ki_discharge_down": ki,
-            "ki_charge_up": ki,
-            "ki_charge_down": ki,
-        }
-
-    @classmethod
-    def _parse_ff_sources(
-        cls, args: dict[str, object],
-    ) -> tuple[FeedForwardSource, ...]:
-        """Parse feed-forward sources from args.
-
-        Supports the new ``feed_forward_sources`` list format and the
-        legacy ``pv_sensor`` / ``ff_pv_gain`` / ``ff_pv_deadband``
-        single-source shorthand.
-        """
-        raw = args.get("feed_forward_sources")
-        if raw is not None:
-            return tuple(
-                FeedForwardSource(
-                    entity=src["entity"],
-                    gain=float(src.get("gain", 0.6)),
-                    sign=float(src.get("sign", -1.0)),
-                    name=src.get("name"),
-                )
-                for src in raw
-            )
-        # Backward compat: old pv_sensor key
-        pv_sensor = args.get("pv_sensor", "")
-        if pv_sensor:
-            return (
-                FeedForwardSource(
-                    entity=pv_sensor,
-                    gain=float(args.get("ff_pv_gain", 0.6)),
-                    sign=-1.0,
-                ),
-            )
-        return ()
-
 
 @dataclass
 class Measurement:
-    """Snapshot of all external inputs needed for one control cycle.
+    """Snapshot of all external inputs needed for one control evaluation.
 
     Assembled by the HA adapter from sensor readings and switch states.
     Passed into ``ControlLogic.compute()`` as a single immutable bundle
@@ -410,14 +217,10 @@ class Measurement:
     """Battery state of charge in percent (0–100)."""
     battery_power_w: float
     """Actual battery power (W).  +discharge / -charge."""
-    ff_readings: dict[str, float | None] = field(default_factory=dict)
-    """Sensor readings for feed-forward sources, keyed by entity ID."""
     discharge_enabled: bool = True
     """Whether the user's discharge switch (``input_boolean``) is on."""
     charge_enabled: bool = True
     """Whether the user's charge switch (``input_boolean``) is on."""
-    relay_locked: bool = False
-    """Whether the driver's relay SM is clamping output (lockout active)."""
     dynamic_min_soc_pct: float | None = None
     """Dynamic minimum SOC (%) from ``sensor.zfi_dynamic_min_soc``.
 
@@ -430,244 +233,46 @@ class Measurement:
 
 @dataclass
 class ControlOutput:
-    """Result of a single control cycle.
+    """Result of a single control evaluation.
 
-    Carries the desired power setpoint together with the PI terms
-    and a human-readable reason string for logging / HA sensor
-    publishing.
+    Carries the desired power setpoint together with a human-readable
+    reason string for logging / HA sensor publishing.
     """
 
     desired_power_w: float
     """Signed desired power (W).  +discharge / -charge."""
-    p_term: float
-    """Proportional term of the PI output (W)."""
-    i_term: float
-    """Integral term of the PI output (W)."""
-    ff_term: float
-    """Feed-forward term (W). Sum of all FF sources."""
     reason: str
     """Human-readable decision reason (e.g. 'EMERGENCY', 'SOC too low')."""
-    freeze_integral: bool = False
-    """If True, the guard is transient — preserve PI integral state."""
 
     @staticmethod
-    def from_raw(
-        raw: float,
-        p_term: float,
-        i_term: float,
-        ff_term: float,
-        reason: str,
-        freeze_integral: bool = False,
-    ) -> ControlOutput:
-        """Construct from a raw (possibly clamped) power value."""
-        return ControlOutput(
-            desired_power_w=raw,
-            p_term=p_term,
-            i_term=i_term,
-            ff_term=ff_term,
-            reason=reason,
-            freeze_integral=freeze_integral,
-        )
-
-    @staticmethod
-    def idle(
-        p_term: float, i_term: float, ff_term: float, reason: str,
-        freeze_integral: bool = False,
-    ) -> ControlOutput:
+    def idle(reason: str) -> ControlOutput:
         """Shorthand for a zero-power (idle) output with a guard reason."""
-        return ControlOutput.from_raw(
-            0.0, p_term, i_term, ff_term, reason,
-            freeze_integral=freeze_integral,
-        )
+        return ControlOutput(desired_power_w=0.0, reason=reason)
 
 
 @dataclass
 class ControllerState:
-    """Mutable state carried across control cycles by ``ControlLogic``.
+    """Mutable state carried across control evaluations by ``ControlLogic``.
 
     Reset semantics:
-        * ``integral`` is reset to 0 on mode transitions.
-        * ``last_computed_w`` is set by each cycle's output (not
-          explicitly reset on mode change).
+        * ``last_sent_w`` is updated on each send (or seeded at startup).
+        * ``drift_acc`` is reset on every send and on guard blocks.
         * ``charge_pending_since`` is set when a charge-mode candidate
           is first detected and cleared on confirmation or cancellation.
     """
 
-    integral: float = 0.0
-    """PI integral accumulator (W).  Committed only on normal output."""
-    last_computed_w: float = 0.0
-    """Most recent output power (W).  Used as hold value in deadband."""
+    last_sent_w: float = 0.0
+    """What was last sent to the device. Base for next calculation."""
+    last_command_t: float = 0.0
+    """Monotonic timestamp of last command. Muting reference."""
+    current_muting_s: float = 0.0
+    """Duration of the current muting window (s)."""
+    drift_acc: float = 0.0
+    """Accumulated small errors for drift correction (W)."""
     mode: OperatingMode = OperatingMode.DISCHARGING
     """Current operating mode (Schmitt trigger output)."""
     charge_pending_since: float | None = None
     """Monotonic timestamp when charge-mode candidacy started, or None."""
-
-
-# ═══════════════════════════════════════════════════════════
-#  Feed-Forward (pure computation)
-# ═══════════════════════════════════════════════════════════
-
-
-class FeedForward:
-    """Multi-source feed-forward compensation using a filtered derivative.
-
-    Each source tracks an EMA of its sensor value. The FF term for each
-    source is ``sign × gain × α × (current − EMA_state)``, i.e. the EMA
-    derivative scaled by gain. This is the standard derivative-with-filter
-    form (ISA PID D-filter) and attenuates high-frequency noise by
-    1/(1 + jωτ) while preserving slow ramps.
-
-    ``τ = filter_tau_s``, ``α = interval_s / (τ + interval_s)``.
-
-    A deadband is applied to the sum of all sources after filtering.
-    First-cycle bootstrap: the EMA is seeded from the first reading to
-    produce zero delta on the second cycle.
-    """
-
-    def __init__(
-        self,
-        sources: tuple[FeedForwardSource, ...],
-        deadband_w: float = 20.0,
-        enabled: bool = True,
-        filter_tau_s: float = 30.0,
-        interval_s: float = 5.0,
-    ) -> None:
-        self._sources: list[FeedForwardSource] = [
-            FeedForwardSource(
-                entity=s.entity,
-                gain=s.gain,
-                sign=s.sign,
-                name=s.name if s.name is not None else f"src{i}",
-            )
-            for i, s in enumerate(sources)
-        ]
-        self._deadband_w = deadband_w
-        self._enabled = enabled
-        self._filter_tau_s = filter_tau_s
-        self._alpha = interval_s / (filter_tau_s + interval_s)
-        self.last_debug: list[FeedForwardSourceDebug] = []
-
-    @property
-    def entities(self) -> list[str]:
-        """Return entity IDs that the HA adapter must read each cycle."""
-        return [s.entity for s in self._sources]
-
-    def compute(self, readings: dict[str, float | None], dt: float | None = None) -> float:
-        """Compute total feed-forward correction.
-
-        For each source, the filtered derivative (α × (current − EMA_state))
-        is scaled by ``sign × gain`` and summed. A deadband is applied to the
-        total. Returns 0.0 when disabled or on first cycle (EMA not seeded).
-
-        Args:
-            readings: Sensor readings keyed by entity ID.
-            dt: Measured tick interval (s).  When provided, alpha is
-                recomputed per tick for jitter robustness.
-        """
-        if not self._enabled:
-            self.last_debug = []
-            return 0.0
-        alpha = dt / (self._filter_tau_s + dt) if dt is not None else self._alpha
-        debug: list[FeedForwardSourceDebug] = []
-        total = 0.0
-        for src in self._sources:
-            current = readings.get(src.entity)
-            if current is None or src.filtered_w is None:
-                debug.append(FeedForwardSourceDebug(
-                    name=src.name,
-                    raw_w=current,
-                    ema_w=src.filtered_w,
-                    delta_w=0.0,
-                    contrib_w=0.0,
-                ))
-                continue
-            delta = alpha * (current - src.filtered_w)
-            contrib = src.sign * src.gain * delta
-            debug.append(FeedForwardSourceDebug(
-                name=src.name,
-                raw_w=current,
-                ema_w=src.filtered_w,
-                delta_w=delta,
-                contrib_w=contrib,
-            ))
-            total += contrib
-        self.last_debug = debug
-        if abs(total) < self._deadband_w:
-            return 0.0
-        return total
-
-    def update_previous(self, readings: dict[str, float | None], dt: float | None = None) -> None:
-        """Advance the EMA filter state for all sources."""
-        alpha = dt / (self._filter_tau_s + dt) if dt is not None else self._alpha
-        for src in self._sources:
-            current = readings.get(src.entity)
-            if current is not None:
-                if src.filtered_w is None:
-                    src.filtered_w = current  # bootstrap: zero delta next cycle
-                else:
-                    src.filtered_w = (
-                        alpha * current + (1.0 - alpha) * src.filtered_w
-                    )
-
-
-# ═══════════════════════════════════════════════════════════
-#  PI Controller (pure computation)
-# ═══════════════════════════════════════════════════════════
-
-
-class PIController:
-    """PI controller with anti-windup back-calculation.
-
-    Anti-windup uses *back-calculation*: when the output saturates at
-    ``output_min`` or ``output_max``, the integral term is
-    back-calculated so that ``p_term + integral == saturated_output``.
-    This prevents integral build-up during sustained saturation.
-
-    Gains are supplied per call via ``PIGains`` so the caller can
-    switch gains every cycle (four-quadrant selection).
-    """
-
-    def __init__(
-        self,
-        output_min: float,
-        output_max: float,
-    ) -> None:
-        self.output_min: float = output_min
-        self.output_max: float = output_max
-
-    def update(
-        self,
-        error: float,
-        integral: float,
-        dt: float,
-        gains: PIGains,
-    ) -> tuple[float, float, float]:
-        """Compute one PI step.
-
-        Args:
-            error: Regulation error (W).  Positive = grid importing.
-            integral: Current integral accumulator value (W).
-            dt: Time since last update (s).
-            gains: Kp/Ki pair for this cycle.
-
-        Returns:
-            ``(output, p_term, new_integral)`` — the clamped output
-            power, the proportional contribution, and the
-            (possibly back-calculated) new integral value.
-        """
-        p_term = gains.kp * error
-        new_integral = integral + gains.ki * error * dt
-
-        output = p_term + new_integral
-
-        if output > self.output_max:
-            new_integral = self.output_max - p_term
-            output = self.output_max
-        elif output < self.output_min:
-            new_integral = self.output_min - p_term
-            output = self.output_min
-
-        return output, p_term, new_integral
 
 
 # ═══════════════════════════════════════════════════════════
@@ -678,10 +283,9 @@ class PIController:
 class ControlLogic:
     """Device/HA-agnostic control logic.  Fully testable without mocks.
 
-    Owns the PI controller instance, the ``ControllerState``, and all
-    decision logic (emergency protection, mode switching, guards,
-    surplus clamping).  Receives a ``Measurement`` each cycle and
-    returns a ``ControlOutput``.
+    Uses direct calculation with muting and drift accumulation instead
+    of PI control.  Receives a ``Measurement`` each evaluation and
+    returns a ``ControlOutput`` or ``None`` (muted / no action needed).
 
     The optional *log* callback is used for human-readable status
     messages.  If omitted, messages are silently discarded.
@@ -690,73 +294,44 @@ class ControlLogic:
     def __init__(self, cfg: Config, log: Callable[[str], None] | None = None) -> None:
         self.cfg = cfg
         self.state = ControllerState()
-        self.gains = PIGainSet(
-            discharge_up=PIGains(cfg.kp_discharge_up, cfg.ki_discharge_up),
-            discharge_down=PIGains(cfg.kp_discharge_down, cfg.ki_discharge_down),
-            charge_up=PIGains(cfg.kp_charge_up, cfg.ki_charge_up),
-            charge_down=PIGains(cfg.kp_charge_down, cfg.ki_charge_down),
-        )
-        self.pi = PIController(
-            output_min=-cfg.max_charge_w,
-            output_max=cfg.max_discharge_w,
-        )
-        self.ff = FeedForward(
-            cfg.ff_sources,
-            deadband_w=cfg.ff_deadband_w,
-            enabled=cfg.ff_enabled,
-            filter_tau_s=cfg.ff_filter_tau_s,
-            interval_s=cfg.interval_s,
-        )
-        self._last_p = 0.0
-        self._last_i = 0.0
-        self._last_ff = 0.0
-        self._last_in_deadband: bool = False
-        self._last_kp: float = 0.0
-        self._last_ki: float = 0.0
-        self._db_acc: float = 0.0
-        self._prev_now: float | None = None
         self._surplus_ema: float | None = None
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
-        """Seed PI from current battery power to avoid step on startup."""
+        """Seed last_sent from current battery power to avoid step on startup."""
         current_w = battery_power_w if battery_power_w is not None else 0.0
-        self.state.last_computed_w = current_w
-        self.state.integral = current_w
+        self.state.last_sent_w = current_w
         if current_w < 0:
             self.state.mode = OperatingMode.CHARGING
         self._log(f"Seeded from battery_power: {current_w:.0f}W")
 
-    def state_snapshot(self) -> dict[str, object]:
+    def state_snapshot(self) -> dict[str, Any]:
         """Return a dict of state fields suitable for JSON persistence."""
         return {
-            "integral": self.state.integral,
-            "last_computed_w": self.state.last_computed_w,
+            "last_sent_w": self.state.last_sent_w,
             "mode": self.state.mode.name,
-            "db_acc": self._db_acc,
+            "drift_acc": self.state.drift_acc,
             "surplus_ema": self._surplus_ema,
         }
 
-    def restore_from_snapshot(self, data: dict[str, object]) -> bool:
+    def restore_from_snapshot(self, data: dict[str, Any]) -> bool:
         """Restore internal state from a snapshot dict.
 
         Returns True on success, False if the data is invalid or
         incomplete.  On failure the state is left unchanged.
         """
         try:
-            integral = float(data["integral"])
-            last_computed_w = float(data["last_computed_w"])
+            last_sent_w = float(data["last_sent_w"])
             mode = OperatingMode[data["mode"]]
-            db_acc = float(data.get("db_acc", 0.0))
+            drift_acc = float(data.get("drift_acc", 0.0))
             surplus_ema = data.get("surplus_ema")
             if surplus_ema is not None:
                 surplus_ema = float(surplus_ema)
         except (KeyError, ValueError, TypeError):
             return False
-        self.state.integral = integral
-        self.state.last_computed_w = last_computed_w
+        self.state.last_sent_w = last_sent_w
         self.state.mode = mode
-        self._db_acc = db_acc
+        self.state.drift_acc = drift_acc
         self._surplus_ema = surplus_ema
         return True
 
@@ -770,12 +345,14 @@ class ControlLogic:
         """
         return -m.battery_power_w - m.grid_power_w
 
-    def compute(self, m: Measurement, now: float | None = None) -> ControlOutput:
-        """Run one full control cycle and update internal state.
+    def compute(self, m: Measurement, now: float | None = None) -> ControlOutput | None:
+        """Evaluate and possibly emit a new setpoint.
+
+        Returns ``None`` if muted or no action needed.
 
         Pipeline::
 
-            emergency check → mode update → PI + FF → guards → clamp
+            muting check -> emergency -> mode update -> direct calc -> guards -> clamp
 
         Args:
             m: Current sensor snapshot.
@@ -783,80 +360,86 @@ class ControlLogic:
                 ``time.monotonic()`` when omitted.
 
         Returns:
-            A ``ControlOutput`` with the desired power, PID/FF terms,
-            and the decision reason.
+            A ``ControlOutput`` with the desired power and reason,
+            or ``None`` if muted / below hysteresis.
         """
         if now is None:
             now = time.monotonic()
 
-        # Measure real elapsed time for interval-independent PI/FF math.
-        if self._prev_now is not None:
-            dt = max(0.0, min(now - self._prev_now, self.cfg.interval_s * 3))
-        else:
-            dt = self.cfg.interval_s  # first tick: assume nominal
-        self._prev_now = now
-
-        self._last_in_deadband = False
-        self._last_kp = 0.0
-        self._last_ki = 0.0
-
         surplus = self.estimate_surplus(m)
-        self._update_surplus_ema(surplus, dt)
+        self._update_surplus_ema(surplus)
 
-        emergency = self._check_emergency(m)
+        # -- Muting: wait for device to react --------------
+        if now - self.state.last_command_t < self.state.current_muting_s:
+            return None
+
+        # -- Emergency: always overrides -------------------
+        emergency = self._check_emergency(m, now)
         if emergency is not None:
-            self.state.last_computed_w = emergency.desired_power_w
-            self.ff.update_previous(m.ff_readings, dt)
             return emergency
 
+        # -- Surplus & mode --------------------------------
         self._update_operating_mode(surplus, now)
         target = self.target_for_mode()
 
+        # -- Direct calculation ----------------------------
         error = m.grid_power_w - target
-        pi_out, p_term, new_integral = self._run_pi(error, dt)
-        self._last_p = p_term
+        correction = self.cfg.ki * error
+        new_limit = self.state.last_sent_w + correction
 
-        ff = self.ff.compute(m.ff_readings, dt)
-        self._last_ff = ff
+        # -- Large change: immediate correction ------------
+        if abs(correction) > self.cfg.hysteresis_w:
+            guarded = self._apply_guards(new_limit, m)
+            if guarded is not None:
+                self.state.drift_acc = 0.0
+                return guarded
 
-        combined = pi_out + ff
+            clamped = self._clamp(new_limit, surplus)
 
-        guarded = self._apply_guards(combined, m)
-        if guarded is not None:
-            if guarded.freeze_integral:
-                # Transient guard (e.g. momentary surplus dip) — keep
-                # integral so PI resumes smoothly when guard clears.
-                pass
-            else:
-                # Structural guard (SOC too low, charge/discharge disabled)
-                # — integral is meaningless while output is blocked.
-                self.state.integral = 0.0
-                self._last_i = 0.0
-            self.state.last_computed_w = guarded.desired_power_w
-            self.ff.update_previous(m.ff_readings, dt)
-            return guarded
+            old_sent = self.state.last_sent_w
+            if not self.cfg.dry_run:
+                self.state.last_sent_w = clamped
+                self.state.last_command_t = now
+                self.state.current_muting_s = self.cfg.muting_s
+            self.state.drift_acc = 0.0
 
-        self.state.integral = new_integral
-        self._last_i = new_integral
+            direction = "Charge" if clamped < 0 else "Discharge"
+            delta = clamped - old_sent
+            reason = f"{direction} (direct, Δ={delta:+.0f}W)"
+            return ControlOutput(desired_power_w=clamped, reason=reason)
 
-        clamped = self._clamp(combined, surplus)
+        # -- Small change: drift accumulator ---------------
+        if not self.cfg.dry_run:
+            self.state.drift_acc += correction
 
-        suffix = " (relay locked)" if m.relay_locked else ""
-        reason = f"{'Charge' if clamped < 0 else 'Discharge'} ({self.state.mode.name}){suffix}"
-        output = ControlOutput.from_raw(
-            clamped, self._last_p, self._last_i,
-            self._last_ff, reason,
-        )
-        self.state.last_computed_w = output.desired_power_w
-        self.ff.update_previous(m.ff_readings, dt)
-        return output
+        if abs(self.state.drift_acc) > self.cfg.hysteresis_w:
+            drift_limit = self.state.last_sent_w + self.state.drift_acc
 
-    def _check_emergency(self, m: Measurement) -> ControlOutput | None:
+            guarded = self._apply_guards(drift_limit, m)
+            if guarded is not None:
+                self.state.drift_acc = 0.0
+                return guarded
+
+            clamped = self._clamp(drift_limit, surplus)
+
+            acc = self.state.drift_acc
+            if not self.cfg.dry_run:
+                self.state.last_sent_w = clamped
+                self.state.last_command_t = now
+                self.state.current_muting_s = self.cfg.muting_s
+            self.state.drift_acc = 0.0
+
+            reason = f"Drift correction ({acc:+.0f}W accumulated)"
+            return ControlOutput(desired_power_w=clamped, reason=reason)
+
+        # -- Nothing to do ---------------------------------
+        return None
+
+    def _check_emergency(self, m: Measurement, now: float) -> ControlOutput | None:
         """Detect excessive grid feed-in and force a reduced setpoint.
 
         If instantaneous feed-in exceeds ``max_feed_in_w``, the output
-        is slashed by the excess plus a safety margin.  The integral
-        is back-calculated so that the PI resumes smoothly.
+        is slashed by the excess plus a safety margin.  Bypasses muting.
 
         Returns:
             An ``EMERGENCY`` ``ControlOutput`` if triggered, else ``None``.
@@ -866,62 +449,23 @@ class ControlLogic:
             return None
 
         excess = feed_in - self.cfg.max_feed_in_w
-        forced = max(0.0, self.state.last_computed_w - excess - EMERGENCY_SAFETY_MARGIN_W)
-        # Back-calculate integral so PI resumes smoothly (p_term = 0)
-        self.state.integral = forced
-        return ControlOutput.from_raw(forced, 0.0, forced, 0.0, "EMERGENCY")
-
-    def _run_pi(
-        self, error: float, dt: float,
-    ) -> tuple[float, float, float]:
-        """Compute PI output without committing state.
-
-        If the error is within the deadband, the PI is frozen and
-        the last computed output is held.  A secondary accumulator
-        tracks ``error × dt`` while frozen; when its magnitude reaches
-        ``deadband_leak_ws`` the deadband is bypassed for one tick so
-        the integral can correct a persistent steady-state offset.
-
-        Returns:
-            ``(output, p_term, new_integral)`` — caller decides
-            whether to commit ``new_integral`` to ``self.state``.
-        """
-        if abs(error) <= self.cfg.deadband_w:
-            self._last_in_deadband = True
-            leak = self.cfg.deadband_leak_ws
-            if leak > 0:
-                self._db_acc += error * dt
-                if abs(self._db_acc) < leak:
-                    return self.state.last_computed_w, 0.0, self.state.integral
-                self._db_acc = 0.0
-                self._last_in_deadband = False  # leak fired — allow PI this tick
-            else:
-                return self.state.last_computed_w, 0.0, self.state.integral
-        else:
-            self._db_acc = 0.0
-
-        gains = self.gains.select(self.state.mode, error)
-        self._last_kp = gains.kp
-        self._last_ki = gains.ki
-        pi_output, p_term, new_integral = self.pi.update(
-            error=error,
-            integral=self.state.integral,
-            dt=dt,
-            gains=gains,
-        )
-        return pi_output, p_term, new_integral
+        forced = max(0.0, self.state.last_sent_w - excess - EMERGENCY_SAFETY_MARGIN_W)
+        self.state.last_sent_w = forced
+        self.state.last_command_t = now
+        self.state.current_muting_s = self.cfg.muting_s
+        self.state.drift_acc = 0.0
+        return ControlOutput(desired_power_w=forced, reason="EMERGENCY")
 
     def _update_operating_mode(self, surplus: float, now: float) -> None:
         """Schmitt trigger with charge-confirmation delay.
 
-        DISCHARGING → CHARGING:
+        DISCHARGING -> CHARGING:
             Requires surplus to stay above ``+hysteresis`` for at least
             ``charge_confirm_s`` consecutive seconds.
-        CHARGING → DISCHARGING:
+        CHARGING -> DISCHARGING:
             Instant when surplus drops below ``-hysteresis``.
 
-        On every mode transition the integral accumulator is reset to
-        zero so the PI starts fresh in the new regime.
+        On every mode transition the drift accumulator is reset.
         """
         h = self.cfg.mode_hysteresis_w
         old_mode = self.state.mode
@@ -948,19 +492,9 @@ class ControlLogic:
 
         if self.state.mode != old_mode:
             self.state.charge_pending_since = None
-            self._db_acc = 0.0
-            old_integral = self.state.integral
-            if self.state.mode == OperatingMode.CHARGING:
-                # Seed the integral to the expected steady-state value so we
-                # don't waste minutes winding up from zero.  The surplus has
-                # been stable for charge_confirm_s seconds, so -surplus is a
-                # reliable estimate of the charge rate we'll need.
-                self.state.integral = max(-surplus, -self.cfg.max_charge_w)
-            else:
-                self.state.integral = 0.0
+            self.state.drift_acc = 0.0
             self._log(
-                f"Mode {old_mode.name} → {self.state.mode.name} "
-                f"(integral: {old_integral:.0f} → {self.state.integral:.0f})"
+                f"Mode {old_mode.name} -> {self.state.mode.name}"
             )
 
     def target_for_mode(self) -> float:
@@ -977,24 +511,18 @@ class ControlLogic:
     def _apply_guards(
         self, raw_limit: float, m: Measurement,
     ) -> ControlOutput | None:
-        """Check safety conditions that override PI output.
+        """Check safety conditions that override the computed output.
 
-        Guards are evaluated *before* the integral is committed, so the
-        PI state freezes while any guard blocks the output.
+        Guards are evaluated before sending.  If a guard fires, the
+        command is suppressed and the drift accumulator is reset.
 
         Returns:
             An idle ``ControlOutput`` if a guard fires, else ``None``.
         """
         if raw_limit > 0 and not m.discharge_enabled:
-            return ControlOutput.idle(
-                self._last_p, self._last_i,
-                self._last_ff, "Discharge disabled",
-            )
+            return ControlOutput.idle("Discharge disabled")
         if raw_limit < 0 and not m.charge_enabled:
-            return ControlOutput.idle(
-                self._last_p, self._last_i,
-                self._last_ff, "Charge disabled",
-            )
+            return ControlOutput.idle("Charge disabled")
 
         effective_min_soc = self.cfg.min_soc_pct
         if m.dynamic_min_soc_pct is not None:
@@ -1003,32 +531,25 @@ class ControlLogic:
                 min(m.dynamic_min_soc_pct, self.cfg.max_soc_pct),
             )
         if raw_limit > 0 and m.soc_pct <= effective_min_soc:
-            return ControlOutput.idle(
-                self._last_p, self._last_i,
-                self._last_ff, "SOC too low",
-            )
+            return ControlOutput.idle("SOC too low")
 
         if raw_limit < 0:
             if m.soc_pct >= self.cfg.max_soc_pct:
-                return ControlOutput.idle(
-                    self._last_p, self._last_i,
-                    self._last_ff, "SOC full",
-                    freeze_integral=True,
-                )
+                return ControlOutput.idle("SOC full")
 
         return None
 
-    def _update_surplus_ema(self, surplus: float, dt: float) -> None:
+    def _update_surplus_ema(self, surplus: float) -> None:
         """Advance the surplus EMA filter.
 
-        Uses the device response time (~10 s) as the filter time constant
-        so the surplus clamp tracks the true available surplus rather than
-        chasing measurement noise from lagging battery power.
+        Uses a fixed 10s time constant matching device response latency.
         """
-        tau = 10.0  # seconds — matches device response latency
+        tau = 10.0
         if self._surplus_ema is None:
             self._surplus_ema = surplus
         else:
+            # Use muting_s as approximate dt between updates
+            dt = self.cfg.muting_s if self.cfg.muting_s > 0 else 5.0
             alpha = dt / (tau + dt)
             self._surplus_ema = alpha * surplus + (1.0 - alpha) * self._surplus_ema
 
@@ -1038,8 +559,7 @@ class ControlLogic:
         * Discharge is capped at ``max_discharge_w``.
         * Charge is capped at both ``max_charge_w`` and the filtered
           surplus EMA (whichever is smaller), preventing the battery
-          from pulling power from the grid.  The EMA prevents the
-          clamp from oscillating when battery power lags the command.
+          from pulling power from the grid.
 
         Returns:
             Clamped power value (W).
@@ -1070,6 +590,7 @@ class ZeroFeedInController(_HASS_BASE):
 
     Responsibilities:
 
+    * React to grid sensor changes (event-driven).
     * Read HA sensor entities and assemble a ``Measurement``.
     * Delegate computation to ``ControlLogic``.
     * Publish results back to HA as ``sensor.zfi_*`` entities.
@@ -1082,6 +603,7 @@ class ZeroFeedInController(_HASS_BASE):
     logic: ControlLogic
 
     def initialize(self) -> None:
+        """Initialize the controller — called by AppDaemon on startup."""
         self.cfg = Config.from_args(self.args)
         self.logic = ControlLogic(self.cfg, log=self.log)
 
@@ -1098,38 +620,38 @@ class ZeroFeedInController(_HASS_BASE):
         bp = self._read_float(self.cfg.battery_power_sensor)
         self.logic.seed(bp)
 
-        # State persistence: restore from file, then seed overrides if needed
+        # State persistence
         _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
         os.makedirs(_run_dir, exist_ok=True)
         self._state_file: str = self.args.get(
             "state_file",
             os.path.join(_run_dir, "zfi_controller_state.json"),
         )
-        self._state_save_interval: int = 12  # save every 12 ticks (~60s at 5s interval)
-        self._tick_count: int = 0
         if self._restore_state():
             self.log(
                 f"Restored state from {self._state_file}: "
                 f"mode={self.logic.state.mode.name} "
-                f"integral={self.logic.state.integral:.1f}W "
-                f"last_computed={self.logic.state.last_computed_w:.1f}W"
+                f"last_sent={self.logic.state.last_sent_w:.1f}W"
             )
         else:
             self.log("No saved state found, using battery_power seed")
 
-        self.run_every(self._on_tick, "now", self.cfg.interval_s)
+        # Event-driven: react to grid sensor changes
+        self.listen_state(
+            self._on_grid_change,
+            self.cfg.grid_sensor,
+        )
+
+        # Periodic safety check (in case sensor stops updating)
+        self.run_every(self._safety_tick, "now+30", 30)
 
         self.log(
             f"Started | mode={self.logic.state.mode.name} "
             f"discharge_target={self.cfg.discharge_target_w}W "
             f"charge_target={self.cfg.charge_target_w}W "
-            f"hysteresis={self.cfg.mode_hysteresis_w}W "
-            f"Gains | dis_up=({self.cfg.kp_discharge_up:.2f},{self.cfg.ki_discharge_up:.3f}) "
-            f"dis_dn=({self.cfg.kp_discharge_down:.2f},{self.cfg.ki_discharge_down:.3f}) "
-            f"chg_up=({self.cfg.kp_charge_up:.2f},{self.cfg.ki_charge_up:.3f}) "
-            f"chg_dn=({self.cfg.kp_charge_down:.2f},{self.cfg.ki_charge_down:.3f}) "
-            f"ff_sources={len(self.cfg.ff_sources)} "
-            f"ff_enabled={self.cfg.ff_enabled} "
+            f"ki={self.cfg.ki} "
+            f"hysteresis={self.cfg.hysteresis_w}W "
+            f"muting={self.cfg.muting_s}s "
             f"dry_run={self.cfg.dry_run}"
         )
 
@@ -1139,7 +661,7 @@ class ZeroFeedInController(_HASS_BASE):
         """Called by AppDaemon on shutdown — save state for next startup."""
         self._save_state()
 
-    # ─── State persistence ────────────────────────────────
+    # --- State persistence --------------------------------
 
     def _save_state(self) -> None:
         """Atomically write controller state to JSON file."""
@@ -1174,37 +696,61 @@ class ZeroFeedInController(_HASS_BASE):
             entities["charge_switch"] = self.cfg.charge_switch
         if self.cfg.discharge_switch:
             entities["discharge_switch"] = self.cfg.discharge_switch
-        if self.cfg.relay_locked_sensor:
-            entities["relay_locked"] = self.cfg.relay_locked_sensor
-        for entity in self.logic.ff.entities:
-            entities[f"ff:{entity}"] = entity
         for label, entity_id in entities.items():
             raw = self.get_state(entity_id)
             if raw in UNAVAILABLE_STATES:
-                self.log(f"  ✗ {label}: {entity_id} → {raw!r}", level="WARNING")
+                self.log(f"  WARN {label}: {entity_id} -> {raw!r}", level="WARNING")
             else:
-                self.log(f"  ✓ {label}: {entity_id} → {raw}")
+                self.log(f"  OK {label}: {entity_id} -> {raw}")
 
-    # ─── Tick ─────────────────────────────────────────────
+    # --- Event-driven callbacks ----------------------------
 
-    def _on_tick(self, _kwargs: dict) -> None:
-        """Called every ``interval_s`` seconds by AppDaemon's scheduler."""
-        m = self._read_measurement()
+    def _on_grid_change(self, entity: str, attribute: str, old: str, new: str, kwargs: dict) -> None:
+        """Called by AppDaemon when the grid sensor state changes."""
+        if new in UNAVAILABLE_STATES:
+            return
+
+        try:
+            grid_w = float(new)
+        except (ValueError, TypeError):
+            return
+
+        m = self._read_measurement(grid_w)
         if m is None:
             return
 
         output = self.logic.compute(m)
+        if output is None:
+            return  # muted or no action
+
         surplus = ControlLogic.estimate_surplus(m)
         self._log_output(output, m, surplus)
         self._publish_ha_sensors(output, m, surplus)
         self._publish_heartbeat()
         self._log_csv(output, m, surplus)
+        self._save_state()
 
-        self._tick_count += 1
-        if self._tick_count % self._state_save_interval == 0:
-            self._save_state()
+    def _safety_tick(self, _kwargs: dict) -> None:
+        """Periodic check: if grid sensor hasn't updated in 60s, go safe."""
+        last = self.get_state(self.cfg.grid_sensor, attribute="last_updated")
+        if last is None:
+            return
+        try:
+            from dateutil.parser import parse
+            age = (datetime.now(timezone.utc) - parse(last)).total_seconds()
+        except (ImportError, ValueError):
+            return
+        if age > 60:
+            self.log("Grid sensor stale (>60s), setting safe state", level="WARNING")
+            self._publish_safe_state()
 
-    # ─── Sensor reading ──────────────────────────────────
+    def _publish_safe_state(self) -> None:
+        """Publish a zero-power safe state when the sensor is stale."""
+        output = ControlOutput(desired_power_w=0.0, reason="Safe (sensor stale)")
+        m_dummy = Measurement(grid_power_w=0.0, soc_pct=50.0, battery_power_w=0.0)
+        self._publish_ha_sensors(output, m_dummy, 0.0)
+
+    # --- Sensor reading ------------------------------------
 
     def _read_float(self, entity: str) -> float | None:
         """Read an HA entity's state as a float, returning None on failure."""
@@ -1212,24 +758,22 @@ class ZeroFeedInController(_HASS_BASE):
         if raw in UNAVAILABLE_STATES:
             return None
         try:
-            return float(raw)
+            return float(raw)  # type: ignore[arg-type]
         except (ValueError, TypeError):
-            self.log(f"  {entity} → {raw!r} (not a number)", level="WARNING")
+            self.log(f"  {entity} -> {raw!r} (not a number)", level="WARNING")
             return None
 
-    def _read_measurement(self) -> Measurement | None:
+    def _read_measurement(self, grid_w: float) -> Measurement | None:
         """Assemble a ``Measurement`` from HA sensor states.
 
+        The grid power is passed in directly from the event callback.
         Returns ``None`` (and logs a warning) when any required sensor
-        is unavailable, causing the tick to be skipped.
+        is unavailable.
         """
-        grid = self._read_float(self.cfg.grid_sensor)
         soc = self._read_float(self.cfg.soc_sensor)
         bp = self._read_float(self.cfg.battery_power_sensor)
 
         unavailable = []
-        if grid is None:
-            unavailable.append(f"grid ({self.cfg.grid_sensor})")
         if soc is None:
             unavailable.append(f"soc ({self.cfg.soc_sensor})")
         if bp is None:
@@ -1237,38 +781,24 @@ class ZeroFeedInController(_HASS_BASE):
 
         if unavailable:
             self.log(
-                f"Sensor unavailable: {', '.join(unavailable)}, skipping cycle",
+                f"Sensor unavailable: {', '.join(unavailable)}, skipping",
                 level="WARNING",
             )
             return None
 
-        # Signed sensor: +discharge/-charge (no transformation needed)
-        battery_power = bp
-
-        # Read feed-forward sensor readings
-        ff_readings: dict[str, float | None] = {}
-        for entity in self.logic.ff.entities:
-            ff_readings[entity] = self._read_float(entity)
+        assert soc is not None  # guaranteed by check above
+        assert bp is not None
 
         return Measurement(
-            grid_power_w=grid,
+            grid_power_w=grid_w,
             soc_pct=soc,
-            battery_power_w=battery_power,
-            ff_readings=ff_readings,
+            battery_power_w=bp,
             discharge_enabled=self._is_switch_on(self.cfg.discharge_switch),
             charge_enabled=self._is_switch_on(self.cfg.charge_switch),
-            relay_locked=self._is_relay_locked(),
             dynamic_min_soc_pct=self._read_float(self.cfg.dynamic_min_soc_entity)
             if self.cfg.dynamic_min_soc_entity
             else None,
         )
-
-    def _is_relay_locked(self) -> bool:
-        """Return True if the driver's relay SM is clamping output."""
-        entity = self.cfg.relay_locked_sensor
-        if entity is None:
-            return False
-        return self.get_state(entity) == "true"
 
     def _is_switch_on(self, entity: str | None) -> bool:
         """Return True if the switch entity is on, or if no entity is configured."""
@@ -1276,12 +806,12 @@ class ZeroFeedInController(_HASS_BASE):
             return True
         return self.get_state(entity) == "on"
 
-    # ─── Output ──────────────────────────────────────────
+    # --- Output --------------------------------------------
 
     def _log_output(
-        self, output: ControlOutput, m: Measurement, surplus: float
+        self, output: ControlOutput, m: Measurement, surplus: float,
     ) -> None:
-        """Emit a single-line summary of the control cycle to the AppDaemon log."""
+        """Emit a single-line summary to the AppDaemon log."""
         mode = "DRY" if self.cfg.dry_run else "LIVE"
         power = output.desired_power_w
         if power >= 0:
@@ -1295,8 +825,7 @@ class ZeroFeedInController(_HASS_BASE):
             f"soc={m.soc_pct:.0f}% "
             f"mode={self.logic.state.mode.name} "
             f"{power_str} | "
-            f"P={output.p_term:.0f} I={output.i_term:.0f} "
-            f"FF={output.ff_term:.0f} | "
+            f"drift={self.logic.state.drift_acc:.0f} | "
             f"{output.reason}"
         )
 
@@ -1307,6 +836,11 @@ class ZeroFeedInController(_HASS_BASE):
         if self._csv is None:
             return
         target = self.logic.target_for_mode()
+        now = time.monotonic()
+        muting_remaining = max(
+            0.0,
+            self.logic.state.current_muting_s - (now - self.logic.state.last_command_t),
+        )
         self._csv.log_row({
             "grid_w": round(m.grid_power_w),
             "soc_pct": round(m.soc_pct, 1),
@@ -1314,21 +848,14 @@ class ZeroFeedInController(_HASS_BASE):
             "surplus_w": round(surplus),
             "mode": self.logic.state.mode.name,
             "desired_power_w": round(output.desired_power_w),
-            "p_term": round(output.p_term),
-            "i_term": round(output.i_term),
-            "ff_term": round(output.ff_term),
-            "integral": round(self.logic.state.integral),
-            "target_w": round(target),
             "error_w": round(m.grid_power_w - target),
-            "in_deadband": int(self.logic._last_in_deadband),
-            "relay_locked": int(m.relay_locked),
-            "charge_pending": int(self.logic.state.charge_pending_since is not None),
-            "kp_used": self.logic._last_kp,
-            "ki_used": self.logic._last_ki,
+            "target_w": round(target),
+            "drift_acc": round(self.logic.state.drift_acc),
+            "muting": round(muting_remaining, 1),
             "reason": output.reason,
         })
 
-    # ─── HA sensor publishing ────────────────────────────
+    # --- HA sensor publishing ------------------------------
 
     def _set_sensor(
         self,
@@ -1340,8 +867,7 @@ class ZeroFeedInController(_HASS_BASE):
         """Create or update a ``sensor.zfi_<name>`` entity in HA.
 
         Includes a ``last_published`` ISO timestamp in the attributes so
-        that HA always sees a state change and advances ``last_updated``
-        (HA 2024.4+ skips the update when state+attrs are identical).
+        that HA always sees a state change and advances ``last_updated``.
         """
         entity_id = f"{self.cfg.sensor_prefix}_{name}"
         attrs = {"friendly_name": f"ZFI {name.replace('_', ' ').title()}"}
@@ -1413,7 +939,7 @@ class ZeroFeedInController(_HASS_BASE):
         if not self.cfg.debug:
             return
 
-        # ── Debug-only sensors below ─────────────────────
+        # -- Debug-only sensors below ----------------------
 
         # Physical estimates
         self._set_sensor("surplus", round(surplus), "W", "mdi:solar-power")
@@ -1424,34 +950,26 @@ class ZeroFeedInController(_HASS_BASE):
             "mdi:battery-charging",
         )
 
-        # PI internals
-        self._set_sensor("p_term", round(output.p_term), "W", "mdi:alpha-p-box")
-        self._set_sensor("i_term", round(output.i_term), "W", "mdi:alpha-i-box")
-        self._set_sensor(
-            "ff", round(output.ff_term), "W", "mdi:flash",
-        )
-        pv = next((d for d in self.logic.ff.last_debug if d.name == "pv"), None)
-        if pv is not None:
-            self._set_sensor(
-                "ff_pv_raw",
-                round(pv.raw_w) if pv.raw_w is not None else "unavailable",
-                "W", "mdi:solar-power-variant",
-            )
-            self._set_sensor(
-                "ff_pv_ema",
-                round(pv.ema_w) if pv.ema_w is not None else "unavailable",
-                "W", "mdi:chart-bell-curve",
-            )
-            self._set_sensor("ff_pv_contrib", round(pv.contrib_w), "W", "mdi:flash-outline")
-        others = sum(d.contrib_w for d in self.logic.ff.last_debug if d.name != "pv")
-        self._set_sensor("ff_others_contrib", round(others), "W", "mdi:flash-outline")
-        self._set_sensor(
-            "integral", round(self.logic.state.integral), "W", "mdi:sigma"
-        )
+        # Controller internals
         target_w = self.logic.target_for_mode()
         self._set_sensor("target", round(target_w), "W", "mdi:target")
         self._set_sensor(
-            "error", round(m.grid_power_w - target_w), "W", "mdi:delta"
+            "error", round(m.grid_power_w - target_w), "W", "mdi:delta",
+        )
+        self._set_sensor(
+            "drift_acc", round(self.logic.state.drift_acc), "W", "mdi:sigma",
+        )
+
+        now = time.monotonic()
+        muting_remaining = max(
+            0.0,
+            self.logic.state.current_muting_s - (now - self.logic.state.last_command_t),
+        )
+        self._set_sensor(
+            "muting", 1 if muting_remaining > 0 else 0, icon="mdi:timer-sand",
+        )
+        self._set_sensor(
+            "muting_remaining", round(muting_remaining, 1), "s", "mdi:timer-sand",
         )
         self._set_sensor("reason", output.reason, icon="mdi:information-outline")
 
