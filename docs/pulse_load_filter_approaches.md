@@ -309,3 +309,79 @@ Tested against controller CSV data which includes both `grid_w` and
 `(timestamp, grid_w, battery_power_w)`, runs sign-flip detector, outputs
 per-sample table with: time, grid, battery, flip count, active flag, notes.
 Supports `--compact` mode (only state-change and flip events).
+
+---
+
+## Baseline Estimation — Investigation Notes
+
+### The Problem
+
+The sign-flip detector (Approach B) produces an `active` flag but no baseline
+value. If we want to output a stable power value for the controller, we need to
+estimate the house's true baseline load (i.e. grid power *without* the pulsing
+appliance).
+
+### Approaches Evaluated
+
+#### (max + min) / 2 of grid over a window
+
+**Idea:** During symmetric oscillation, the midpoint equals the baseline.
+
+**Result:** Works for single-element oven cycling on April 24 (mid ≈ 30–54 W,
+true ≈ 30 W). Completely fails on April 21 when two oven elements create
+asymmetric oscillation (mid ranges 253–2407 W). **Rejected.**
+
+#### min(grid + battery) at export moments
+
+**Idea:** At the export moment (oven OFF, battery high), `grid + battery ≈
+house_load + inverter_loss`. The minimum such sum approximates the baseline.
+
+**Result:**
+- April 24: sum ≈ 107–130 W (true ≈ 30 W) → offset ~100 W
+- April 21: sum ≈ 197–213 W (true ≈ 10 W) → offset ~200 W
+
+Consistent overestimate due to inverter losses in the battery sensor.
+Offset is not constant across days (100 vs 200 W). **Usable with calibration.**
+
+#### Pre-disturbance EMA with step-back (selected approach)
+
+**Idea:** Keep a slow EMA of grid power while the detector is inactive. Store a
+long ring buffer (~10 min). At activation, walk backward through the buffer to
+find the grid value *before* the initial load step (oven turn-on), which may
+have occurred minutes before cycling started.
+
+**Data evidence:**
+- April 24: Grid was ~30 W at 15:29:24, oven ON at 15:29:59, steady ~2600 W
+  for ~90 s, then cycling from 15:35. Sign-flip activation at 15:36:28.
+  EMA from 15:29 = ~30 W ✓.
+- April 21: Grid was ~10 W at 16:38:44, oven ON at 16:38:49, steady ~1540 W
+  for 2 min, second element ON at 16:40:39 for another 2 min, cycling from
+  16:42:44. Sign-flip activation at 16:45:14. EMA at activation is ~3000 W
+  (contaminated). But ring buffer walk-back to 16:38:44 gives ~10 W ✓.
+  Requires ~7 min of history.
+
+**Step detection for walk-back:** The initial load turn-on produces a large
+positive step in grid power (Δ > 1000 W in one sample). Walk backward through
+the ring buffer until we find this step edge, then use the EMA from just before
+it.
+
+### Combined Baseline Strategy (to be implemented)
+
+1. **Primary:** Pre-disturbance EMA via ring buffer walk-back past the initial
+   ON step. Ring buffer length ~10 min (600 s).
+
+2. **Refinement:** Once cycling produces export samples, compute `min(grid +
+   battery)` over last 60 s. Compare with pre-disturbance EMA to estimate the
+   inverter loss offset. This offset can be used to sanity-check the EMA or to
+   refine the baseline during long active periods.
+
+3. **Fallback:** If the ring buffer is too short to reach pre-disturbance (e.g.
+   filter module just started and oven was already cycling), use `min(grid +
+   battery) - estimated_offset`. Default offset TBD from data (~100–200 W).
+
+### Status
+
+Detection (sign-flip): **validated, ready for implementation.**
+Baseline estimation: **design complete, not yet simulated.** Next step is to
+add baseline computation to the sign-flip simulation and validate against
+April 21 and April 24 data.
