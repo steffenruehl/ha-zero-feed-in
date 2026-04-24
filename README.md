@@ -48,7 +48,7 @@ Five apps with clear separation of concerns:
 - **Relay lockout** — driver tracks own intent, not MQTT entity (10-15 s device lag)
 - **Device state seeding** — no unnecessary commands on startup
 - **Direction switches** — enable/disable charge or discharge from HA UI
-- **Layered safety**: SOC limits, grid-charge protection, surplus clamp, emergency curtailment
+- **Layered safety**: SOC limits, grid-charge protection, surplus clamp
 
 ## Installation
 

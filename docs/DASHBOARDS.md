@@ -104,7 +104,7 @@ Example: if your prefix is `sensor.battery_*`, change `sensor.zfi_desired_power`
 - **Check**: Is the error oscillating around zero? Lower `hysteresis` if the drift never triggers
 
 **If you see**: Sudden jump to ±800W desired power
-- **Root cause**: Emergency clamping (feed-in detected > max_feed_in)
+- **Root cause**: Large grid power excursion while muted
 - **Check**: Did grid power exceed safe limits? Is SOC at max?
 
 ### When to Use

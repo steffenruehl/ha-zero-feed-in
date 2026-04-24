@@ -34,7 +34,6 @@ def make_config(**overrides) -> Config:
         "hysteresis": "hysteresis_w",
         "max_output": "max_discharge_w",
         "max_charge": "max_charge_w",
-        "max_feed_in": "max_feed_in_w",
         "min_soc": "min_soc_pct",
         "max_soc": "max_soc_pct",
         "mode_hysteresis": "mode_hysteresis_w",
@@ -269,48 +268,6 @@ class TestDriftAccumulator:
 
 
 # ═══════════════════════════════════════════════════════════
-#  Emergency
-# ═══════════════════════════════════════════════════════════
-
-
-class TestEmergency:
-    """Test emergency feed-in protection."""
-
-    def test_excessive_feed_in_triggers_emergency(self) -> None:
-        """Grid feed-in above max_feed_in_w triggers EMERGENCY."""
-        logic, now = make_logic(max_feed_in=600)
-        logic.state.last_sent_w = 500.0
-        # grid=-700W -> feed_in=700 > 600 -> excess=100
-        # forced = max(0, 500 - 100 - 50) = 350
-        m = make_measurement(grid_power_w=-700.0)
-        out = logic.compute(m, now=now)
-        assert out is not None
-        assert out.reason == "EMERGENCY"
-        assert out.desired_power_w == pytest.approx(350.0)
-
-    def test_emergency_includes_safety_margin(self) -> None:
-        """Emergency output includes 50W safety margin."""
-        logic, now = make_logic(max_feed_in=600)
-        logic.state.last_sent_w = 200.0
-        # grid=-800W -> feed_in=800 > 600 -> excess=200
-        # forced = max(0, 200 - 200 - 50) = 0
-        m = make_measurement(grid_power_w=-800.0)
-        out = logic.compute(m, now=now)
-        assert out is not None
-        assert out.desired_power_w == 0.0
-
-    def test_no_emergency_below_threshold(self) -> None:
-        """No emergency when feed-in is below max_feed_in_w."""
-        logic, now = make_logic(max_feed_in=600)
-        # grid=-500W -> feed_in=500 < 600
-        m = make_measurement(grid_power_w=-500.0, battery_power_w=500.0)
-        out = logic.compute(m, now=now)
-        # Should not be EMERGENCY
-        if out is not None:
-            assert out.reason != "EMERGENCY"
-
-
-# ═══════════════════════════════════════════════════════════
 #  Mode Switching (Schmitt Trigger)
 # ═══════════════════════════════════════════════════════════
 
@@ -457,23 +414,17 @@ class TestGuards:
 class TestSurplusClamp:
     """Test charge is capped at available surplus."""
 
-    def test_charge_capped_at_surplus_ema(self) -> None:
-        """Charge power cannot exceed EMA-filtered surplus."""
+    def test_charge_capped_at_surplus(self) -> None:
+        """Charge power cannot exceed measured surplus."""
         logic, now = make_logic(muting=0.0, max_charge=2400)
-        # First call to seed the surplus EMA
-        # battery=-100, grid=-100 -> surplus = 100+100 = 200
-        m = make_measurement(grid_power_w=-100.0, battery_power_w=-100.0)
-        logic.compute(m, now=now)
-
-        # Now try to charge more than surplus
         logic.state.last_sent_w = 0.0
         logic.state.last_command_t = now - 10
-        # grid=-500, battery=-100 -> surplus=600, error=-500-30=-530
-        # raw = 0 + (-530) = -530, but surplus EMA is still catching up
-        m2 = make_measurement(grid_power_w=-500.0, battery_power_w=-100.0)
-        out = logic.compute(m2, now=now + 10)
+        # grid=-200, battery=-100 -> surplus=300, error=-200-30=-230
+        # raw = 0 + (-230) = -230, capped at -surplus = -300 -> keeps -230
+        m = make_measurement(grid_power_w=-200.0, battery_power_w=-100.0)
+        out = logic.compute(m, now=now)
         assert out is not None
-        assert out.desired_power_w >= -600  # not more than surplus
+        assert out.desired_power_w == pytest.approx(-230.0)
 
     def test_discharge_capped_at_max_output(self) -> None:
         """Discharge is capped at max_discharge_w."""

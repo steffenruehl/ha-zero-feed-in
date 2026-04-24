@@ -29,13 +29,13 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
        ▼                                     │
 ┌──────────────────────────┐        ┌────────┴────────┐
 │  Home Assistant          │  MQTT  │  SolarFlow      │
-│  ┌────────────────────┐  │◂─────▸│  2400 AC+       │
+│  ┌────────────────────┐  │◂─────▸│  2400 AC+        │
 │  │  AppDaemon         │  │       │                  │
 │  │  ┌──────────────┐  │  │       │  setOutputLimit  │
-│  │  │  Controller   │──┤──┤──────▸│  setInputLimit   │
+│  │  │  Controller  │  ┤──┤──────▸│  setInputLimit   │
 │  │  │              │  │  │       │  acMode          │
 │  │  └──────┬───────┘  │  │       └──────────────────┘
-│  │         │desired_W  │  │
+│  │         │desired_W │  │
 │  │  ┌──────▼───────┐  │  │
 │  │  │  Driver      │──┘  │
 │  │  │  (Zendure)   │     │
@@ -237,15 +237,11 @@ During lockout, power is **clamped** to the current direction's minimum active p
 
 ## Protection Mechanisms
 
-### 1. Emergency (Feed-in > `max_feed_in`)
-
-Direct curtailment: output reduced by (excess + 50 W margin). Drift accumulator reset.
-
-### 2. Direction Lockout (adaptive, direction-aware)
+### 1. Direction Lockout (adaptive, direction-aware)
 
 ... gates transitions behind an energy integrator (`AdaptiveLockout`): each tick accumulates `|power| × dt` until the threshold (`full_power_w × base_lockout_s`) is reached. High power → short lockout; low power → long lockout. Each non-current state tracks its own accumulator independently — switching between two non-current targets does not reset the other's progress. A 300 s safety timeout prevents infinite lockout. During lockout: power clamped to the current direction's minimum active power (`min_active_power_w`), keeping the device responsive.
 
-### 3. SOC Protection
+### 2. SOC Protection
 
 | Condition | Effect |
 | --- | --- |
@@ -351,7 +347,7 @@ docs/
 ### Controller (`src/zero_feed_in_controller.py`)
 
 ```
-Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX, EMERGENCY_SAFETY_MARGIN_W,
+Constants:  UNAVAILABLE_STATES, DEFAULT_SENSOR_PREFIX,
             CONTROLLER_CSV_COLUMNS
 
 Enums:      OperatingMode (CHARGING, DISCHARGING)
@@ -360,12 +356,12 @@ Dataclasses:
   Config          — typed config from apps.yaml (ki, hysteresis, muting, targets, limits)
   Measurement     — grid_power_w, soc_pct, battery_power_w, switch states, dynamic_min_soc_pct
   ControlOutput   — desired_power_w, reason
-  ControllerState — last_sent_w, last_command_t, current_muting_s, drift_acc, mode, charge_pending_since
+  ControllerState — last_sent_w, last_command_t, drift_acc, mode, charge_pending_since
 
 ControlLogic:     — pure-computation control logic (no HA dependency)
   seed()                        — initialise from battery_power_sensor
-  compute()                     — muting → emergency → mode → direct calc → guards → clamp
-  state_snapshot()              — return dict of last_sent/mode/drift_acc/surplus_ema
+  compute()                     — muting → mode → direct calc → guards → clamp
+  state_snapshot()              — return dict of last_sent/mode/drift_acc
   restore_from_snapshot()       — restore state from dict (returns bool)
 
 ZeroFeedInController(hass.Hass): — thin HA adapter
@@ -462,11 +458,7 @@ flowchart TD
     MUT -- Yes --> Z2([Skip: wait for device])
     MUT -- No --> D["Estimate surplus<br>= -battery_power_w - grid"]
 
-    D --> E{Feed-in > max_feed_in?}
-    E -- Yes --> F["EMERGENCY<br>Curtail, reset drift"]
-    F --> PUB
-
-    E -- No --> G[Update operating mode<br>Schmitt trigger on surplus]
+    D --> G[Update operating mode<br>Schmitt trigger on surplus]
     G --> H[Select target<br>CHARGING→0W / DISCHARGING→30W]
     H --> I["error = grid - target<br>correction = ki × error"]
 
@@ -966,17 +958,7 @@ mode: stays DISCHARGING, correction reduces output
 → desired_power drops toward 100W
 ```
 
-### 5. Emergency — feed-in exceeds 800W
-
-```
-grid = -1100W (1100W flowing to grid)
-feed_in = 1100 > 800 → EMERGENCY
-excess = 1100 - 800 = 300
-forced = current_output - 300 - 50 (safety margin)
-drift accumulator reset
-```
-
-### 6. Battery full — surplus goes to grid
+### 5. Battery full — surplus goes to grid
 
 ```
 SOC=85%, surplus=500W, mode=CHARGING

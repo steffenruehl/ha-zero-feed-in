@@ -77,9 +77,6 @@ zero_feed_in_controller:
   min_soc: 10                  # hard floor SOC (%), dynamic_min_soc can only raise this
   max_soc: 100                 # hard ceiling SOC (%)
 
-  # Protection
-  max_feed_in: 800             # emergency brake: cap output if feed-in exceeds (W)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  2. Zendure SolarFlow Driver

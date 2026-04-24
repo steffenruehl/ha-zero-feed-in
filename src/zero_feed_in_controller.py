@@ -41,9 +41,6 @@ UNAVAILABLE_STATES = {None, "unknown", "unavailable"}
 DEFAULT_SENSOR_PREFIX = "sensor.zfi"
 """Prefix for HA entities published by this controller."""
 
-EMERGENCY_SAFETY_MARGIN_W = 50
-"""Extra margin subtracted from the forced output during an emergency clamp (W)."""
-
 CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
@@ -79,11 +76,10 @@ class OperatingMode(Enum):
 class Config:
     """Typed, validated configuration loaded from ``apps.yaml``.
 
-    Covers three domains:
+    Covers two domains:
 
     * **Sensor entity IDs** — grid power, SOC, battery power.
     * **Controller tuning** — ki, hysteresis, muting, targets, limits.
-    * **Protection** — max feed-in.
 
     Constructed via the ``from_args`` classmethod which maps the
     free-form ``args`` dict from AppDaemon into typed fields with
@@ -132,9 +128,6 @@ class Config:
     # Mode switching (Schmitt trigger)
     mode_hysteresis_w: float = 50.0
     charge_confirm_s: float = 15.0
-
-    # Protection
-    max_feed_in_w: float = 800.0
 
     # Debug
     dry_run: bool = True
@@ -186,7 +179,6 @@ class Config:
             charge_confirm_s=float(
                 args.get("charge_confirm", cls.charge_confirm_s)
             ),
-            max_feed_in_w=float(args.get("max_feed_in", cls.max_feed_in_w)),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
@@ -241,7 +233,7 @@ class ControlOutput:
     desired_power_w: float
     """Signed desired power (W).  +discharge / -charge."""
     reason: str
-    """Human-readable decision reason (e.g. 'EMERGENCY', 'SOC too low')."""
+    """Human-readable decision reason (e.g. 'SOC too low', 'Drift correction')."""
 
     @staticmethod
     def idle(reason: str) -> ControlOutput:
@@ -264,8 +256,6 @@ class ControllerState:
     """What was last sent to the device. Base for next calculation."""
     last_command_t: float = 0.0
     """Monotonic timestamp of last command. Muting reference."""
-    current_muting_s: float = 0.0
-    """Duration of the current muting window (s)."""
     drift_acc: float = 0.0
     """Accumulated small errors for drift correction (W)."""
     mode: OperatingMode = OperatingMode.DISCHARGING
@@ -293,7 +283,6 @@ class ControlLogic:
     def __init__(self, cfg: Config, log: Callable[[str], None] | None = None) -> None:
         self.cfg = cfg
         self.state = ControllerState()
-        self._surplus_ema: float | None = None
         self._log = log or (lambda msg: None)
 
     def seed(self, battery_power_w: float | None) -> None:
@@ -310,7 +299,6 @@ class ControlLogic:
             "last_sent_w": self.state.last_sent_w,
             "mode": self.state.mode.name,
             "drift_acc": self.state.drift_acc,
-            "surplus_ema": self._surplus_ema,
         }
 
     def restore_from_snapshot(self, data: dict[str, Any]) -> bool:
@@ -323,15 +311,11 @@ class ControlLogic:
             last_sent_w = float(data["last_sent_w"])
             mode = OperatingMode[data["mode"]]
             drift_acc = float(data.get("drift_acc", 0.0))
-            surplus_ema = data.get("surplus_ema")
-            if surplus_ema is not None:
-                surplus_ema = float(surplus_ema)
         except (KeyError, ValueError, TypeError):
             return False
         self.state.last_sent_w = last_sent_w
         self.state.mode = mode
         self.state.drift_acc = drift_acc
-        self._surplus_ema = surplus_ema
         return True
 
     @staticmethod
@@ -351,7 +335,7 @@ class ControlLogic:
 
         Pipeline::
 
-            muting check -> emergency -> mode update -> direct calc -> guards -> clamp
+            muting check -> mode update -> direct calc -> guards -> clamp
 
         Args:
             m: Current sensor snapshot.
@@ -366,16 +350,10 @@ class ControlLogic:
             now = time.monotonic()
 
         surplus = self.estimate_surplus(m)
-        self._update_surplus_ema(surplus)
 
         # -- Muting: wait for device to react --------------
-        if now - self.state.last_command_t < self.state.current_muting_s:
+        if now - self.state.last_command_t < self.cfg.muting_s:
             return None
-
-        # -- Emergency: always overrides -------------------
-        emergency = self._check_emergency(m, now)
-        if emergency is not None:
-            return emergency
 
         # -- Surplus & mode --------------------------------
         self._update_operating_mode(surplus, now)
@@ -399,7 +377,6 @@ class ControlLogic:
             if not self.cfg.dry_run:
                 self.state.last_sent_w = clamped
                 self.state.last_command_t = now
-                self.state.current_muting_s = self.cfg.muting_s
             self.state.drift_acc = 0.0
 
             direction = "Charge" if clamped < 0 else "Discharge"
@@ -425,7 +402,6 @@ class ControlLogic:
             if not self.cfg.dry_run:
                 self.state.last_sent_w = clamped
                 self.state.last_command_t = now
-                self.state.current_muting_s = self.cfg.muting_s
             self.state.drift_acc = 0.0
 
             reason = f"Drift correction ({acc:+.0f}W accumulated)"
@@ -433,27 +409,6 @@ class ControlLogic:
 
         # -- Nothing to do ---------------------------------
         return None
-
-    def _check_emergency(self, m: Measurement, now: float) -> ControlOutput | None:
-        """Detect excessive grid feed-in and force a reduced setpoint.
-
-        If instantaneous feed-in exceeds ``max_feed_in_w``, the output
-        is slashed by the excess plus a safety margin.  Bypasses muting.
-
-        Returns:
-            An ``EMERGENCY`` ``ControlOutput`` if triggered, else ``None``.
-        """
-        feed_in = max(0.0, -m.grid_power_w)
-        if feed_in <= self.cfg.max_feed_in_w:
-            return None
-
-        excess = feed_in - self.cfg.max_feed_in_w
-        forced = max(0.0, self.state.last_sent_w - excess - EMERGENCY_SAFETY_MARGIN_W)
-        self.state.last_sent_w = forced
-        self.state.last_command_t = now
-        self.state.current_muting_s = self.cfg.muting_s
-        self.state.drift_acc = 0.0
-        return ControlOutput(desired_power_w=forced, reason="EMERGENCY")
 
     def _update_operating_mode(self, surplus: float, now: float) -> None:
         """Schmitt trigger with charge-confirmation delay.
@@ -538,26 +493,12 @@ class ControlLogic:
 
         return None
 
-    def _update_surplus_ema(self, surplus: float) -> None:
-        """Advance the surplus EMA filter.
-
-        Uses a fixed 10s time constant matching device response latency.
-        """
-        tau = 10.0
-        if self._surplus_ema is None:
-            self._surplus_ema = surplus
-        else:
-            # Use muting_s as approximate dt between updates
-            dt = self.cfg.muting_s if self.cfg.muting_s > 0 else 5.0
-            alpha = dt / (tau + dt)
-            self._surplus_ema = alpha * surplus + (1.0 - alpha) * self._surplus_ema
-
     def _clamp(self, raw: float, surplus: float) -> float:
         """Enforce hard power limits and surplus cap.
 
         * Discharge is capped at ``max_discharge_w``.
-        * Charge is capped at both ``max_charge_w`` and the filtered
-          surplus EMA (whichever is smaller), preventing the battery
+        * Charge is capped at both ``max_charge_w`` and the measured
+          surplus (whichever is smaller), preventing the battery
           from pulling power from the grid.
 
         Returns:
@@ -566,8 +507,7 @@ class ControlLogic:
         if raw > 0:
             return min(raw, self.cfg.max_discharge_w)
         elif raw < 0:
-            filtered = self._surplus_ema if self._surplus_ema is not None else surplus
-            max_safe_charge = max(0.0, filtered)
+            max_safe_charge = max(0.0, surplus)
             return max(raw, -self.cfg.max_charge_w, -max_safe_charge)
         return 0.0
 
@@ -838,7 +778,7 @@ class ZeroFeedInController(_HASS_BASE):
         now = time.monotonic()
         muting_remaining = max(
             0.0,
-            self.logic.state.current_muting_s - (now - self.logic.state.last_command_t),
+            self.cfg.muting_s - (now - self.logic.state.last_command_t),
         )
         self._csv.log_row({
             "grid_w": round(m.grid_power_w),
@@ -962,7 +902,7 @@ class ZeroFeedInController(_HASS_BASE):
         now = time.monotonic()
         muting_remaining = max(
             0.0,
-            self.logic.state.current_muting_s - (now - self.logic.state.last_command_t),
+            self.cfg.muting_s - (now - self.logic.state.last_command_t),
         )
         self._set_sensor(
             "muting", 1 if muting_remaining > 0 else 0, icon="mdi:timer-sand",
