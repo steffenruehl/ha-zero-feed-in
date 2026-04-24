@@ -1,8 +1,9 @@
-"""relay_switch_counter.py – Counts relay activation events.
+"""relay_switch_counter.py – Counts relay state machine transitions.
 
-A relay switch is counted each time the desired-power sensor transitions
-from below ``min_active_w`` to at or above it (in either direction).
-The count is persisted to a JSON file so it survives AppDaemon restarts.
+Watches ``sensor.zfi_relay_sm_state`` (published by the driver) and
+increments a counter each time the state changes (e.g. charge → idle,
+idle → discharge).  The count is persisted to a JSON file so it
+survives AppDaemon restarts.
 """
 
 import json
@@ -11,14 +12,21 @@ from datetime import datetime, timezone
 
 import appdaemon.plugins.hass.hassapi as hass
 
+UNAVAILABLE_STATES = {None, "unknown", "unavailable", ""}
+"""HA entity states that should be ignored."""
+
 
 class RelaySwitchCounter(hass.Hass):
+    """Count relay state machine transitions."""
+
     def initialize(self) -> None:
-        self._desired_entity: str = self.args.get(
-            "desired_power_sensor", "sensor.zfi_desired_power"
+        """Set up the counter and start listening for SM state changes."""
+        self._relay_sm_entity: str = self.args.get(
+            "relay_sm_state_sensor", "sensor.zfi_relay_sm_state"
         )
-        self._min_active_w: float = float(self.args.get("min_active_w", 25))
-        _run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
+        _run_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run"
+        )
         os.makedirs(_run_dir, exist_ok=True)
         self._counter_file: str = self.args.get(
             "counter_file",
@@ -27,66 +35,40 @@ class RelaySwitchCounter(hass.Hass):
         self._sensor_prefix: str = self.args.get("sensor_prefix", "sensor.zfi")
 
         self._count, self._last_switch_ts = self._load()
-        init_state = self.get_state(self._desired_entity)
-        self._last_active = self._is_active(init_state)
-        self._last_sign = self._sign(init_state)
+        init_state = self.get_state(self._relay_sm_entity)
+        self._last_state: str | None = (
+            init_state if init_state not in UNAVAILABLE_STATES else None
+        )
 
-        self.listen_state(self._on_desired_power, self._desired_entity)
+        self.listen_state(self._on_relay_sm_change, self._relay_sm_entity)
         self._publish()
 
         self.log(
             f"RelaySwitchCounter ready | count={self._count} "
-            f"entity={self._desired_entity} "
-            f"min_active_w={self._min_active_w} "
+            f"entity={self._relay_sm_entity} "
+            f"current={self._last_state} "
             f"file={self._counter_file}"
         )
 
     # ── state listener ───────────────────────────────────────────────────────
 
-    def _on_desired_power(
+    def _on_relay_sm_change(
         self, entity: str, attribute: str, old: str, new: str, kwargs: dict
     ) -> None:
-        active = self._is_active(new)
-        sign = self._sign(new)
+        """Increment counter on every relay SM state transition."""
+        if new in UNAVAILABLE_STATES:
+            return
+        if new == self._last_state:
+            return
 
-        switched = False
-        if active and not self._last_active:
-            # idle → active
-            switched = True
-        elif active and self._last_active and sign != self._last_sign:
-            # direction change while active (e.g. discharge → charge)
-            switched = True
+        self._last_state = new
+        self._count += 1
+        self._last_switch_ts = datetime.now(timezone.utc).isoformat()
+        self._save()
+        self._publish()
+        self.log(f"Relay switch #{self._count} ({old} → {new})")
 
-        if switched:
-            self._count += 1
-            self._last_switch_ts = datetime.now(timezone.utc).isoformat()
-            self._save()
-            self._publish()
-            self.log(f"Relay switch #{self._count} at {self._last_switch_ts}")
-
-        self._last_active = active
-        if sign != 0:
-            self._last_sign = sign
-
-    # ── helpers ──────────────────────────────────────────────────────────────
-
-    def _is_active(self, state: str | None) -> bool:
-        try:
-            return abs(float(state)) >= self._min_active_w
-        except (TypeError, ValueError):
-            return False
-
-    def _sign(self, state: str | None) -> int:
-        """Return +1, -1, or 0 for the sign of the desired power."""
-        try:
-            v = float(state)
-            if v > 0:
-                return 1
-            elif v < 0:
-                return -1
-            return 0
-        except (TypeError, ValueError):
-            return 0
+    # ── HA publishing ────────────────────────────────────────────────────────
 
     def _publish(self) -> None:
         self.set_state(
