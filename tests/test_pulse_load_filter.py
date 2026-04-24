@@ -56,6 +56,7 @@ class TestFilterConfig:
         cfg = FilterConfig.from_args(args)
         assert cfg.grid_sensor == "sensor.grid"
         assert cfg.flip_thresh_w == 500.0
+        assert cfg.filtered_power_entity == "sensor.zfi_plf_filtered_grid_power"
         assert cfg.dry_run is True
 
     def test_from_args_overrides(self) -> None:
@@ -64,11 +65,13 @@ class TestFilterConfig:
             "grid_power_sensor": "sensor.grid",
             "flip_thresh_w": 400,
             "drift_ki": 0.5,
+            "filtered_power_entity": "sensor.custom_output",
             "dry_run": False,
         }
         cfg = FilterConfig.from_args(args)
         assert cfg.flip_thresh_w == 400.0
         assert cfg.drift_ki == 0.5
+        assert cfg.filtered_power_entity == "sensor.custom_output"
         assert cfg.dry_run is False
 
 

@@ -17,12 +17,12 @@ Output convention:
   - When inactive: passes raw grid value through transparently.
   - When active: outputs the estimated baseline.
 
-Published entities (``sensor.zfi_plf_*``):
-  - ``filtered_grid_power`` — the output value (raw or baseline)
-  - ``active``              — 1 when filter is engaged, 0 otherwise
-  - ``measuring``           — 1 during measurement pause, 0 otherwise
-  - ``baseline``            — current baseline estimate (W)
-  - ``flip_count``          — sign flips in the activation window
+Published entities:
+  - ``filtered_power_entity`` — the main output (configurable entity ID)
+  - ``{sensor_prefix}_active``    — 1 when filter is engaged, 0 otherwise
+  - ``{sensor_prefix}_measuring`` — 1 during measurement pause, 0 otherwise
+  - ``{sensor_prefix}_baseline``  — current baseline estimate (W)
+  - ``{sensor_prefix}_flip_count`` — sign flips in the activation window
 """
 
 from __future__ import annotations
@@ -51,8 +51,11 @@ except ImportError:
 UNAVAILABLE_STATES = {None, "unknown", "unavailable"}
 """HA entity states indicating a sensor is offline."""
 
+DEFAULT_FILTERED_POWER_ENTITY = "sensor.zfi_plf_filtered_grid_power"
+"""Default entity ID for the filtered grid power output."""
+
 DEFAULT_SENSOR_PREFIX = "sensor.zfi_plf"
-"""Prefix for HA entities published by this filter."""
+"""Prefix for HA status/debug entities published by this filter."""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -96,8 +99,10 @@ class FilterConfig:
     """Observation window for I-controller correction (s)."""
 
     # Output
+    filtered_power_entity: str = DEFAULT_FILTERED_POWER_ENTITY
+    """Entity ID for the filtered grid power output (W)."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
-    """Prefix for published HA entities."""
+    """Prefix for status/debug HA entities (active, measuring, baseline)."""
     dry_run: bool = True
     """When True, publish sensors but don't override desired power."""
     debug: bool = False
@@ -125,6 +130,9 @@ class FilterConfig:
             ),
             drift_ki=float(args.get("drift_ki", cls.drift_ki)),
             drift_cycle_s=float(args.get("drift_cycle_s", cls.drift_cycle_s)),
+            filtered_power_entity=args.get(
+                "filtered_power_entity", cls.filtered_power_entity
+            ),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
@@ -445,7 +453,11 @@ class PulseLoadFilter(_HASS_BASE):
         filtered = self.logic.update(grid_w, now)
 
         # Publish filtered output
-        self._set_sensor("filtered_grid_power", round(filtered, 1), unit="W")
+        self._set_entity(
+            self.cfg.filtered_power_entity,
+            round(filtered, 1),
+            unit="W",
+        )
 
         # Publish state sensors
         self._set_sensor("active", int(self.logic.active))
@@ -469,17 +481,15 @@ class PulseLoadFilter(_HASS_BASE):
         # output during measurement.  Overwriting desired_power from here
         # would race with the controller.  For now, dry_run only.
 
-    def _set_sensor(
+    def _set_entity(
         self,
-        name: str,
+        entity_id: str,
         value: object,
         unit: str | None = None,
     ) -> None:
-        """Create or update a ``sensor.zfi_plf_<name>`` entity in HA."""
-        entity_id = f"{self.cfg.sensor_prefix}_{name}"
-        attrs: dict[str, Any] = {
-            "friendly_name": f"ZFI PLF {name.replace('_', ' ').title()}",
-        }
+        """Create or update a HA entity by full entity ID."""
+        friendly = entity_id.split(".", 1)[-1].replace("_", " ").title()
+        attrs: dict[str, Any] = {"friendly_name": friendly}
         if unit:
             attrs["unit_of_measurement"] = unit
             attrs["state_class"] = "measurement"
@@ -493,3 +503,14 @@ class PulseLoadFilter(_HASS_BASE):
                 exc,
                 level="WARNING",
             )
+
+    def _set_sensor(
+        self,
+        name: str,
+        value: object,
+        unit: str | None = None,
+    ) -> None:
+        """Create or update a ``sensor.zfi_plf_<name>`` entity in HA."""
+        self._set_entity(
+            f"{self.cfg.sensor_prefix}_{name}", value, unit=unit
+        )

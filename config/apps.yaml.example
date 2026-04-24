@@ -226,6 +226,9 @@ solarflow_mqtt_watchdog:
 #  Start with dry_run: true to observe behaviour on dashboards before
 #  connecting to the controller.
 #
+#  Integration: set the controller's grid_power_sensor to the PLF's
+#  filtered_power_entity to close the loop.
+#
 pulse_load_filter:
   module: pulse_load_filter
   class: PulseLoadFilter
@@ -255,4 +258,7 @@ pulse_load_filter:
   # drift_cycle_s: 60          # observation window (s)
 
   # Output entities
+  # Main output — controller reads this instead of raw grid sensor
+  filtered_power_entity: sensor.zfi_plf_filtered_grid_power
+  # Status/debug sensors use this prefix
   sensor_prefix: sensor.zfi_plf
