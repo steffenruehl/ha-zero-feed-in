@@ -96,7 +96,7 @@ Pre-built debug dashboards included in `config/`:
 | Dashboard | Purpose |
 | --- | --- |
 | [`lovelace_zfi_operations.yaml`](config/lovelace_zfi_operations.yaml) | Main control loop: grid power, surplus, battery, desired power, device state |
-| [`lovelace_zfi_pi_debug.yaml`](config/lovelace_zfi_pi_debug.yaml) | Controller internals: error, muting, drift, mode transitions (requires `debug: true`) |
+| [`lovelace_zfi_controller_debug.yaml`](config/lovelace_zfi_controller_debug.yaml) | Controller internals: error, muting, drift, mode transitions (requires `debug: true`) |
 | [`lovelace_zfi_relay_sm_debug.yaml`](config/lovelace_zfi_relay_sm_debug.yaml) | Relay state machine: transitions, lockout progress, energy accumulation (requires `debug: true`) |
 
 **Setup**: In Home Assistant, go to **Dashboards** → **Create new** → **Edit in YAML** → paste the entire contents of a dashboard file.

@@ -5,7 +5,7 @@
 Two AppDaemon apps for a Zendure SolarFlow 2400 AC+ implementing bidirectional zero feed-in control on Home Assistant. Read these files at the start of every conversation:
 
 - `docs/development_context.md` — architecture decisions, hardware setup, key concepts, code organization
-- `docs/zero_feed_in_docs.md` — full documentation: PI controller, driver, protection mechanisms, tuning guide, flowcharts
+- `docs/zero_feed_in_docs.md` — full documentation: controller, driver, protection mechanisms, tuning guide, flowcharts
 
 ## File Structure
 

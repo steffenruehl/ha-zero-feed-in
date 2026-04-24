@@ -2,7 +2,6 @@
 Zero Feed-In Controller – Event-Based Direct Calculation
 
 Bidirectional controller that keeps the grid meter at ~0 W.
-Uses direct calculation with muting instead of PI control.
 Publishes a signed desired-power value to a HA sensor entity.
 A separate device driver reads that sensor and translates it
 into hardware-specific commands.
@@ -118,7 +117,7 @@ class Config:
     charge_target_w: float = 0.0
     """Grid power target when charging (W). Zero = absorb all surplus."""
     ki: float = 1.0
-    """Integral gain applied to error. 1.0 = full correction in one step."""
+    """Gain applied to error. 1.0 = full correction in one step."""
     hysteresis_w: float = 15.0
     """Suppress commands when |change| <= this (W). Also drift threshold."""
     muting_s: float = 8.0
@@ -283,8 +282,8 @@ class ControllerState:
 class ControlLogic:
     """Device/HA-agnostic control logic.  Fully testable without mocks.
 
-    Uses direct calculation with muting and drift accumulation instead
-    of PI control.  Receives a ``Measurement`` each evaluation and
+    Uses direct calculation with muting and drift accumulation.
+    Receives a ``Measurement`` each evaluation and
     returns a ``ControlOutput`` or ``None`` (muted / no action needed).
 
     The optional *log* callback is used for human-readable status

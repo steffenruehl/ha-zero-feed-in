@@ -33,7 +33,7 @@ Two AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter a
 │  │  AppDaemon         │  │       │                  │
 │  │  ┌──────────────┐  │  │       │  setOutputLimit  │
 │  │  │  Controller   │──┤──┤──────▸│  setInputLimit   │
-│  │  │  (PI)        │  │  │       │  acMode          │
+│  │  │              │  │  │       │  acMode          │
 │  │  └──────┬───────┘  │  │       └──────────────────┘
 │  │         │desired_W  │  │
 │  │  ┌──────▼───────┐  │  │
@@ -146,7 +146,7 @@ stale.  Resetting ensures the controller starts fresh when the guard clears.
 
 ### Core Algorithm
 
-The controller uses direct calculation instead of PI control:
+The controller uses direct calculation:
 
 ```
 error = grid_power - target
@@ -295,7 +295,7 @@ Three layers:
 ### Why sensors are read-only, actuators write-only
 
 - Number entities show *commanded* value, not actual output
-- PI uses its own state (`last_sent_w`), surplus uses `battery_power_sensor`
+- Controller uses its own state (`last_sent_w`), surplus uses `battery_power_sensor`
 - Only external sensors needed by controller: `grid_power`, `soc`, `battery_power`
 
 ### AC Mode Management in Driver
@@ -314,7 +314,7 @@ Three layers:
 4. **"Never charge from grid" is a guard, not a mode.** Surplus ≤ 0 → charge blocked.
 5. **Relay protection lives in the driver.** The controller can freely request any power level. The driver's state machine decides when and how to execute it.
 6. **Forecast is conservative, not optimizing.** One threshold (1.5 kWh) switches between two min_soc values (10% / 30%). No complex optimization.
-7. **Muting replaces complex anti-windup.** Instead of integral anti-windup, the controller simply ignores sensor updates while the device is responding. Simpler and more robust.
+7. **Muting prevents chasing stale readings.** The controller ignores sensor updates while the device is responding. Simpler and more robust than complex compensators.
 
 ---
 
@@ -1007,7 +1007,7 @@ controller wants to charge → guard: SOC ≥ max → idle
 
 ## Related Projects & References
 
-- **alkly.de Blueprint**: commercial HA blueprint for SolarFlow 2400 Pro zero feed-in. Inspiration for this project. Uses Jinja2 templates, not PI control.
+- **alkly.de Blueprint**: commercial HA blueprint for SolarFlow 2400 Pro zero feed-in. Inspiration for this project. Uses Jinja2 templates.
 - **solarflow-control** (GitHub: reinhard-brandstaedter): Python tool for DC-coupled SolarFlow hubs + OpenDTU. More mature, but targets Hub 2000/AIO with Hoymiles WR, not AC-coupled storage.
-- **ioBroker zendure-solarflow adapter**: full-featured adapter with `setDeviceAutomationInOutLimit`, cloud relay, and PI controller script. The PI script for 2400 AC by forum user "schimi" was a reference for the PI approach.
+- **ioBroker zendure-solarflow adapter**: full-featured adapter with `setDeviceAutomationInOutLimit`, cloud relay, and controller scripts. The 2400 AC script by forum user "schimi" was a reference.
 - **z-master42/solarflow**: HA MQTT YAML config for SolarFlow entities. Useful reference for MQTT topic structure.

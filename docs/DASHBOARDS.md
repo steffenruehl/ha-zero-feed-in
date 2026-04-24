@@ -48,7 +48,7 @@ Example: if your prefix is `sensor.battery_*`, change `sensor.zfi_desired_power`
 ### Example Scenarios
 
 **Scenario 1**: Grid power is +200W, desired power shows +150W
-- Good: PI is working, attempting to reduce grid draw
+- Good: Controller is working, attempting to reduce grid draw
 - Next step: Check if device commands are being sent
 
 **Scenario 2**: Surplus shows -300W but desired power shows +100W
@@ -63,7 +63,7 @@ Example: if your prefix is `sensor.battery_*`, change `sensor.zfi_desired_power`
 
 ## 2. Controller Debug Dashboard
 
-**File**: `config/lovelace_zfi_pi_debug.yaml`
+**File**: `config/lovelace_zfi_controller_debug.yaml`
 
 **Requirements**: `debug: true` in `apps.yaml` → Controller section
 
