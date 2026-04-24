@@ -14,8 +14,7 @@ src/                          # Application source code
   zero_feed_in_controller.py  # Device-agnostic direct calculation controller + ControlLogic
   zendure_solarflow_driver.py # Zendure SolarFlow driver with relay state machine
   solarflow_mqtt_watchdog.py  # MQTT reconnect watchdog (HTTP API trigger)
-  zfi_watchdog.yaml           # ESPHome package: independent ESP watchdog
-  heizung.yaml                # ESPHome main config (includes zfi_watchdog.yaml)
+  zfi_watchdog.esphome        # ESPHome package: independent ESP watchdog (.esphome to avoid AppDaemon scan)
 config/
   apps.yaml                   # AppDaemon configuration (uses !secret references)
   secrets.yaml                # Device credentials — git-ignored, not committed
