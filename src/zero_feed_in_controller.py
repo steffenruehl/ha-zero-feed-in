@@ -45,7 +45,7 @@ CONTROLLER_CSV_COLUMNS = [
     "grid_w", "soc_pct", "battery_power_w",
     "surplus_w", "mode", "desired_power_w",
     "error_w", "target_w",
-    "drift_acc", "muting",
+    "last_sent_w",
     "reason",
 ]
 """Column names for controller CSV log (excluding timestamp)."""
@@ -784,8 +784,7 @@ class ZeroFeedInController(_HASS_BASE):
             "desired_power_w": round(output.desired_power_w),
             "error_w": round(m.grid_power_w - target),
             "target_w": round(target),
-            "drift_acc": round(self.logic.state.drift_acc),
-            "muting": 0,
+            "last_sent_w": round(self.logic.state.last_sent_w),
             "reason": output.reason,
         })
 
