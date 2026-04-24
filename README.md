@@ -10,31 +10,41 @@ Keeps the grid meter at ~0 W by charging and discharging the battery based on so
 
 ## Architecture
 
-Five apps with clear separation of concerns:
+Seven apps with clear separation of concerns:
 
 ```
-┌──────────────────────────────┐        ┌──────────────────┐
-│  Controller (device-agnostic)│        │  SolarFlow       │
-│  ┌────────────────────────┐  │  MQTT  │  2400 AC+        │
-│  │ Direct calculation    │  │◂─────▸│                  │
-│  │ Mode switching         │  │       │  outputLimit     │
-│  │ Surplus estimation     │──┤       │  inputLimit      │
-│  └──────────┬─────────────┘  │       │  acMode          │
-│             │                │       └──────────────────┘
-│    sensor.zfi_desired_power  │
-│             │                │
-│  ┌──────────▼─────────────┐  │
-│  │ Driver (Zendure)       │──┘
-│  │ AC mode management     │
-│  │ Power rounding/gating  │
-│  └────────────────────────┘
-└──────────────────────────────┘
+  grid_power_sensor                              ┌──────────────────┐
+        │                                        │  SolarFlow       │
+        ├──────────────────────────┐              │  2400 AC+        │
+        │                          │              │                  │
+  ┌─────▼──────────────┐   ┌───────▼───────────┐  │  outputLimit     │
+  │ Pulse-Load         │   │ Pulse-Load        │  │  inputLimit      │
+  │ Detector           │──▸│ Filter            │  │  acMode          │
+  │ (sign-flip detect) │   │ (baseline estim.) │  └────────▲─────────┘
+  └────────────────────┘   └───────┬───────────┘           │ MQTT
+                     filtered_grid_power                   │
+                                   │                       │
+                    ┌──────────────▼────────────┐          │
+                    │  Controller               │          │
+                    │  Direct calculation        │          │
+                    │  Mode switching             │          │
+                    │  Surplus estimation         │          │
+                    └──────────────┬────────────┘          │
+                      zfi_desired_power                    │
+                                   │                       │
+                    ┌──────────────▼────────────┐          │
+                    │  Driver (Zendure)         │──────────┘
+                    │  AC mode management        │
+                    │  Power rounding / gating   │
+                    └───────────────────────────┘
 ```
 
 | App | File | Responsibility |
 | --- | --- | --- |
 | Controller | `src/zero_feed_in_controller.py` | Direct calculation control, mode switching, surplus estimation, safety guards |
 | Driver | `src/zendure_solarflow_driver.py` | AC mode, relay lockout, 5 W rounding, redundant-send suppression |
+| PL Detector | `src/pulse_load_detector.py` | Detects periodic pulse loads via sign-flip algorithm |
+| PL Filter | `src/pulse_load_filter.py` | Estimates baseline house load during pulse-load events |
 | Forecast | `src/pv_forecast_manager.py` | Adjusts dynamic min SOC based on PV forecast |
 | Counter | `src/relay_switch_counter.py` | Tracks daily relay switch count |
 | Watchdog | `src/solarflow_mqtt_watchdog.py` | Reconnects SolarFlow to MQTT broker after broker restarts |
@@ -49,6 +59,7 @@ Five apps with clear separation of concerns:
 - **Device state seeding** — no unnecessary commands on startup
 - **Direction switches** — enable/disable charge or discharge from HA UI
 - **Layered safety**: SOC limits, grid-charge protection, surplus clamp
+- **Pulse-load detection** — sign-flip algorithm detects oven duty-cycling; baseline filter prevents battery oscillation
 
 ## Installation
 
@@ -85,9 +96,7 @@ Set dry_run: false
 Start with max_output: 200 and increase over days
 ```
 
-For detailed configuration, tuning, and troubleshooting, see the docs.
-
-## Configuration
+For detailed configuration, tuning, and troubleshooting, see [docs/architecture.md](docs/architecture.md).
 
 ## Lovelace Dashboards
 
