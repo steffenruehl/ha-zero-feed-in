@@ -658,16 +658,19 @@ class ZeroFeedInController(_HASS_BASE):
         if m is None:
             return
 
-        output = self.logic.compute(m)
-        if output is None:
-            return  # muted or no action
-
         surplus = ControlLogic.estimate_surplus(m)
-        self._log_output(output, m, surplus)
-        self._publish_ha_sensors(output, m, surplus)
-        self._publish_heartbeat()
-        self._log_csv(output, m, surplus)
-        self._save_state()
+        output = self.logic.compute(m)
+
+        if output is not None:
+            self._log_output(output, m, surplus)
+            self._publish_ha_sensors(output, m, surplus)
+            self._publish_heartbeat()
+            self._log_csv(output, m, surplus)
+            self._save_state()
+
+        # Always update debug sensors so dashboards show live state
+        if self.cfg.debug:
+            self._publish_debug_sensors(m, surplus)
 
     def _safety_tick(self, _kwargs: dict) -> None:
         """Periodic check: if grid sensor hasn't updated in 60s, go safe."""
@@ -872,8 +875,30 @@ class ZeroFeedInController(_HASS_BASE):
         if not self.cfg.debug:
             return
 
-        # -- Debug-only sensors below ----------------------
+        # -- Debug-only sensors (command-scoped) -----------
+        self._set_sensor("reason", output.reason, icon="mdi:information-outline")
 
+        # Dynamic min SOC (shows effective value after clamping)
+        if m.dynamic_min_soc_pct is not None:
+            effective = max(
+                self.cfg.min_soc_pct,
+                min(m.dynamic_min_soc_pct, self.cfg.max_soc_pct),
+            )
+        else:
+            effective = self.cfg.min_soc_pct
+        self._set_sensor(
+            "effective_min_soc", round(effective), "%", "mdi:battery-low",
+        )
+
+    def _publish_debug_sensors(
+        self, m: Measurement, surplus: float,
+    ) -> None:
+        """Publish live debug sensors on every grid callback.
+
+        Called on every grid sensor update (not just when a command fires)
+        so that dashboards show real-time muting countdown, drift
+        accumulation, and surplus estimates.
+        """
         # Physical estimates
         self._set_sensor("surplus", round(surplus), "W", "mdi:solar-power")
         self._set_sensor(
@@ -893,22 +918,15 @@ class ZeroFeedInController(_HASS_BASE):
             "drift_acc", round(self.logic.state.drift_acc), "W", "mdi:sigma",
         )
 
-        self._set_sensor(
-            "muting", 0, icon="mdi:timer-sand",
+        now = time.monotonic()
+        muting_remaining = max(
+            0.0,
+            self.logic.state.current_muting_s
+            - (now - self.logic.state.last_command_t),
         )
         self._set_sensor(
-            "muting_remaining", 0, "s", "mdi:timer-sand",
+            "muting", 1 if muting_remaining > 0 else 0, icon="mdi:timer-sand",
         )
-        self._set_sensor("reason", output.reason, icon="mdi:information-outline")
-
-        # Dynamic min SOC (shows effective value after clamping)
-        if m.dynamic_min_soc_pct is not None:
-            effective = max(
-                self.cfg.min_soc_pct,
-                min(m.dynamic_min_soc_pct, self.cfg.max_soc_pct),
-            )
-        else:
-            effective = self.cfg.min_soc_pct
         self._set_sensor(
-            "effective_min_soc", round(effective), "%", "mdi:battery-low",
+            "muting_remaining", round(muting_remaining, 1), "s", "mdi:timer-sand",
         )
