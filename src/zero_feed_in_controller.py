@@ -921,7 +921,7 @@ class ZeroFeedInController(_HASS_BASE):
         now = time.monotonic()
         muting_remaining = max(
             0.0,
-            self.logic.state.current_muting_s
+            self.logic.cfg.muting_s
             - (now - self.logic.state.last_command_t),
         )
         self._set_sensor(
