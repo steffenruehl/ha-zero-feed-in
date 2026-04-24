@@ -899,6 +899,14 @@ class ZeroFeedInController(_HASS_BASE):
         so that dashboards show real-time muting countdown, drift
         accumulation, and surplus estimates.
         """
+        # Measurement inputs (keep in sync with _publish_ha_sensors)
+        self._set_sensor(
+            "grid_power",
+            round(m.grid_power_w),
+            "W",
+            "mdi:transmission-tower",
+        )
+
         # Physical estimates
         self._set_sensor("surplus", round(surplus), "W", "mdi:solar-power")
         self._set_sensor(
