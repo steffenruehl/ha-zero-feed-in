@@ -96,8 +96,6 @@ class FilterConfig:
     """Observation window for I-controller correction (s)."""
 
     # Output
-    desired_power_entity: str = "sensor.zfi_desired_power"
-    """Entity the filter writes to pause/resume the battery."""
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
     """Prefix for published HA entities."""
     dry_run: bool = True
@@ -127,9 +125,6 @@ class FilterConfig:
             ),
             drift_ki=float(args.get("drift_ki", cls.drift_ki)),
             drift_cycle_s=float(args.get("drift_cycle_s", cls.drift_cycle_s)),
-            desired_power_entity=args.get(
-                "desired_power_entity", cls.desired_power_entity
-            ),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
             debug=bool(args.get("debug", cls.debug)),
@@ -216,7 +211,7 @@ class SignFlipDetector:
             if self._last_large_t > 0 and quiet_duration > cfg.deactivate_quiet_s:
                 self.active = False
                 self._flip_times.clear()
-                self._last_flip_check_t = 0.0
+                self._last_flip_check_t = -cfg.flip_window_s - 1.0
 
         return self.active
 
@@ -461,33 +456,18 @@ class PulseLoadFilter(_HASS_BASE):
         if self.cfg.debug:
             self._set_sensor("flip_count", self.logic.flip_count)
 
-        # Battery pause control (measurement phase)
-        if not self.cfg.dry_run:
-            if self.logic.measuring and not was_measuring:
-                self.log("Measurement pause started — pausing battery")
-                self._pause_battery()
-            elif not self.logic.measuring and was_measuring:
-                self.log(
-                    "Measurement complete — baseline=%.1f W",
-                    self.logic.baseline,
-                )
-
-    def _pause_battery(self) -> None:
-        """Request the controller to output zero power during measurement.
-
-        Sets the desired power entity to 0 so the battery stops
-        discharging while we measure the true baseline.
-        """
-        self.set_state(
-            self.cfg.desired_power_entity,
-            state="0",
-            attributes={
-                "friendly_name": "ZFI Desired Power",
-                "unit_of_measurement": "W",
-                "pulse_load_filter_override": True,
-            },
-            replace=True,
-        )
+        # Log state transitions
+        if self.logic.measuring and not was_measuring:
+            self.log("Measurement pause started")
+        elif not self.logic.measuring and was_measuring:
+            self.log(
+                "Measurement complete — baseline=%.1f W",
+                self.logic.baseline,
+            )
+        # TODO: battery pause mechanism for non-dry-run mode.
+        # The controller should read sensor.zfi_plf_active and zero its
+        # output during measurement.  Overwriting desired_power from here
+        # would race with the controller.  For now, dry_run only.
 
     def _set_sensor(
         self,
