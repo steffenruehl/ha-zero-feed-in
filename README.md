@@ -98,24 +98,21 @@ Pre-built debug dashboards included in `config/`:
 | [`lovelace_zfi_operations.yaml`](config/lovelace_zfi_operations.yaml) | Main control loop: grid power, surplus, battery, desired power, device state |
 | [`lovelace_zfi_controller_debug.yaml`](config/lovelace_zfi_controller_debug.yaml) | Controller internals: error, muting, drift, mode transitions (requires `debug: true`) |
 | [`lovelace_zfi_relay_sm_debug.yaml`](config/lovelace_zfi_relay_sm_debug.yaml) | Relay state machine: transitions, lockout progress, energy accumulation (requires `debug: true`) |
+| [`lovelace_zfi_pulse_load_debug.yaml`](config/lovelace_zfi_pulse_load_debug.yaml) | Pulse-load detection and filtering: raw vs filtered grid, detector state, baseline (requires `debug: true`) |
 
 **Setup**: In Home Assistant, go to **Dashboards** → **Create new** → **Edit in YAML** → paste the entire contents of a dashboard file.
 
-See [docs/zero_feed_in_docs.md#lovelace-dashboards](docs/zero_feed_in_docs.md#lovelace-dashboards) for detailed descriptions and setup.
+See [docs/DASHBOARDS.md](docs/DASHBOARDS.md) for detailed descriptions and setup.
 
 ## Documentation
 
-- **[docs/zero_feed_in_docs.md](docs/zero_feed_in_docs.md)** — Complete technical documentation:
-  - System architecture and design decisions
-  - Controller and driver concepts
-  - Direct calculation controller tuning (ki, hysteresis, muting)
-  - Protection mechanisms (SOC, grid-charge, relay switching)
-  - Configuration reference and published sensors
-  - Flowcharts, example scenarios, and troubleshooting guide
-
-- **[docs/DASHBOARDS.md](docs/DASHBOARDS.md)** — Lovelace dashboard setup:
-  - Pre-built dashboards for monitoring and debugging
-  - Dashboard installation and entity ID customization
+- **[docs/architecture.md](docs/architecture.md)** — System architecture, design decisions, data flow, installation
+- **[docs/controller.md](docs/controller.md)** — Controller logic, surplus estimation, direct calculation, muting, flowcharts
+- **[docs/driver.md](docs/driver.md)** — Driver, AC mode, relay lockout, power limits, flowchart
+- **[docs/pulse_load_detector.md](docs/pulse_load_detector.md)** — Pulse-load detection (sign-flip algorithm)
+- **[docs/pulse_load_filter.md](docs/pulse_load_filter.md)** — Pulse-load mitigation (baseline estimation, measurement pause)
+- **[docs/pv_forecast_manager.md](docs/pv_forecast_manager.md)** — PV forecast and time-of-day rules
+- **[docs/DASHBOARDS.md](docs/DASHBOARDS.md)** — Lovelace dashboard setup and customization
 
 ## Hardware
 

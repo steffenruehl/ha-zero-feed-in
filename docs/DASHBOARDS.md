@@ -188,13 +188,47 @@ The accumulator uses `max(|power|, 25W)`, so very low power levels take much lon
 
 ---
 
+## 4. Pulse-Load Debug Dashboard
+
+**File**: `config/lovelace_zfi_pulse_load_debug.yaml`
+
+**Requirements**: `debug: true` in `apps.yaml` → Pulse-Load Detector and Filter sections
+
+**Purpose**: Monitor detection and mitigation of periodic pulse loads (oven duty-cycling). Shows whether the detector correctly identifies pulse loads and whether the filter produces a stable baseline.
+
+### What It Shows
+
+- **Raw vs Filtered Grid**: Side-by-side history of raw grid power and filtered output
+- **Detector State**: Active flag and flip count over time
+- **Filter Baseline**: Baseline estimate and measurement pause progress
+- **Current Values**: Live entity card with all detector and filter sensors
+
+### Key Signals Explained
+
+| Signal | Meaning |
+|--------|---------|
+| **PLD Active** | 1 = pulse load detected (≥2 sign flips), 0 = normal |
+| **Flip Count** | Sign flips in the 120 s activation window |
+| **Filtered Grid Power** | Raw when inactive, baseline when active |
+| **Baseline** | Estimated house load (from measurement pause, then drift-corrected) |
+| **Measuring** | 1 = battery paused, measuring min(grid) for 60 s |
+
+### When to Use
+
+- **Oven sessions**: "Does the detector activate when the oven starts duty-cycling?"
+- **Baseline accuracy**: "Is the measured baseline close to the actual house load?"
+- **False positives**: "Does the detector activate when it shouldn't?"
+- **Drift validation**: "Does the baseline track house load changes over time?"
+
+---
+
 ## FAQ
 
 **Q: Do all dashboards require `debug: true`?**
 
 A: No.
 - **Operations** dashboard: works always
-- **Controller Debug** and **Relay SM** dashboards: require `debug: true`
+- **Controller Debug**, **Relay SM**, and **Pulse-Load** dashboards: require `debug: true`
 
 **Q: Can I have multiple dashboards active at once?**
 
@@ -231,15 +265,16 @@ A: The Watchdog (ESP8266 independent safe-state) publishes to MQTT, not HA senso
 
 ## Dashboard Comparison
 
-| Feature | Operations | Controller Debug | Relay SM |
-|---------|-----------|-----------------|----------|
-| **Requires debug** | No | Yes | Yes |
-| **Time graphs** | Yes | Yes | Yes |
-| **Live entity cards** | No | Yes | Yes |
-| **Controller tuning info** | Basic | Detailed | No |
-| **Relay troubleshooting** | Basic | No | Detailed |
-| **Forecast info** | Yes | No | No |
-| **Self-contained** | Yes | Yes | Yes |
+| Feature | Operations | Controller Debug | Relay SM | Pulse-Load |
+|---------|-----------|-----------------|----------|------------|
+| **Requires debug** | No | Yes | Yes | Yes |
+| **Time graphs** | Yes | Yes | Yes | Yes |
+| **Live entity cards** | No | Yes | Yes | Yes |
+| **Controller tuning info** | Basic | Detailed | No | No |
+| **Relay troubleshooting** | Basic | No | Detailed | No |
+| **Pulse-load detection** | No | No | No | Detailed |
+| **Forecast info** | Yes | No | No | No |
+| **Self-contained** | Yes | Yes | Yes | Yes |
 
 ---
 

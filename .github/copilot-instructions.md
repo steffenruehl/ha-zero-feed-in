@@ -2,10 +2,14 @@
 
 ## Project Overview
 
-Two AppDaemon apps for a Zendure SolarFlow 2400 AC+ implementing bidirectional zero feed-in control on Home Assistant. Read these files at the start of every conversation:
+AppDaemon apps for a Zendure SolarFlow 2400 AC+ implementing bidirectional zero feed-in control on Home Assistant. Read these files at the start of every conversation:
 
-- `docs/development_context.md` — architecture decisions, hardware setup, key concepts, code organization
-- `docs/zero_feed_in_docs.md` — full documentation: controller, driver, protection mechanisms, tuning guide, flowcharts
+- `docs/architecture.md` — system architecture, design decisions, data flow, installation, file structure
+- `docs/controller.md` — controller logic, surplus estimation, direct calculation, muting, flowcharts
+- `docs/driver.md` — driver, AC mode, relay lockout, power limits, flowchart
+- `docs/pulse_load_detector.md` — pulse-load detection (sign-flip algorithm)
+- `docs/pulse_load_filter.md` — pulse-load mitigation (baseline estimation, measurement pause)
+- `docs/pv_forecast_manager.md` — PV forecast and time-of-day rules
 
 ## File Structure
 
@@ -13,17 +17,25 @@ Two AppDaemon apps for a Zendure SolarFlow 2400 AC+ implementing bidirectional z
 src/                          # Application source code
   zero_feed_in_controller.py  # Device-agnostic direct calculation controller + ControlLogic
   zendure_solarflow_driver.py # Zendure SolarFlow driver with relay state machine
+  pulse_load_detector.py      # Pulse-load detection (sign-flip algorithm)
+  pulse_load_filter.py        # Pulse-load mitigation (baseline estimation)
+  pv_forecast_manager.py      # PV forecast and time-of-day rules
+  csv_logger.py               # CSV logging utility
   solarflow_mqtt_watchdog.py  # MQTT reconnect watchdog (HTTP API trigger)
   zfi_watchdog.esphome        # ESPHome package: independent ESP watchdog (.esphome to avoid AppDaemon scan)
 config/
   apps.yaml                   # AppDaemon configuration (uses !secret references)
   secrets.yaml                # Device credentials — git-ignored, not committed
   secrets.yaml.example        # Template for secrets.yaml
-tests/
-  test_zero_feed_in_controller.py  # Unit tests for ControlLogic
+tests/                        # Unit tests (one per module)
 docs/
-  development_context.md      # Architecture decisions and design rationale
-  zero_feed_in_docs.md        # Full technical documentation
+  architecture.md             # System architecture and design decisions
+  controller.md               # Controller documentation
+  driver.md                   # Driver documentation
+  pulse_load_detector.md      # Pulse-load detector documentation
+  pulse_load_filter.md        # Pulse-load filter documentation
+  pv_forecast_manager.md      # PV forecast documentation
+  DASHBOARDS.md               # Lovelace dashboard guide
 ```
 
 ## Code Conventions
@@ -48,7 +60,7 @@ When modifying existing code, add missing docstrings and type annotations to any
 
 ## Documentation Rule
 
-**Keep docs up to date.** Whenever a code change affects behavior, architecture, configuration, or published sensors, update `docs/development_context.md` and/or `docs/zero_feed_in_docs.md` in the same commit. Do not defer documentation to a follow-up step.
+**Keep docs up to date.** Whenever a code change affects behavior, architecture, configuration, or published sensors, update the relevant doc in `docs/` in the same commit. Do not defer documentation to a follow-up step.
 
 ## Device Constraints
 

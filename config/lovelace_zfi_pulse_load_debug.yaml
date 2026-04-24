@@ -1,0 +1,71 @@
+# Zero Feed-In — Pulse-Load Debug Dashboard
+#
+# Detection and mitigation of periodic pulse loads (oven duty-cycling).
+# Shows detector state, filter baseline, and measurement pause progress.
+#
+# Add as a new view in your Lovelace dashboard (raw YAML mode).
+# REQUIRES: debug: true in pulse_load_detector and pulse_load_filter
+
+title: ZFI Pulse-Load Debug
+icon: mdi:sine-wave
+cards:
+  # ─────────────────────────────────────────────────────────
+  #  Row 1: Grid power — raw vs filtered
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Grid Power (raw vs filtered)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Raw Grid Power
+      - entity: sensor.zfi_plf_filtered_grid_power
+        name: Filtered Grid Power
+      - entity: sensor.zfi_desired_power
+        name: Desired Power
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 2: Detector state
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Detector
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Active
+      - entity: sensor.zfi_pld_flip_count
+        name: Flip Count
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 3: Filter baseline tracking
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Filter Baseline & Measurement
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_plf_baseline
+        name: Baseline (W)
+      - entity: sensor.zfi_plf_measuring
+        name: Measuring
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 4: Current state (entities card)
+  # ─────────────────────────────────────────────────────────
+  - type: entities
+    title: Pulse-Load Status
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Detector Active
+      - entity: sensor.zfi_pld_flip_count
+        name: Flip Count
+      - type: divider
+      - entity: sensor.zfi_plf_filtered_grid_power
+        name: Filtered Grid Power (W)
+      - entity: sensor.zfi_plf_baseline
+        name: Baseline (W)
+      - entity: sensor.zfi_plf_measuring
+        name: Measuring
+      - type: divider
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Raw Grid Power (W)
+      - entity: sensor.zfi_desired_power
+        name: Desired Power (W)
