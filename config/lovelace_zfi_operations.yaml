@@ -11,7 +11,7 @@
 #   2. Solar surplus estimate
 #   3. Battery SOC and actual power
 #   4. Operating mode (charging / discharging)
-#   5. Desired power (PI output)
+#   5. Desired power (controller output)
 #   6. Device state (relay, limits, AC mode)
 
 title: ZFI Operations
