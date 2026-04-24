@@ -166,3 +166,146 @@ Data source: `sensor.smart_meter_sum_active_instantaneous_power` from
 `tools/simulate_filter.py` — reads CSV `(timestamp, grid_w)`, runs filter,
 outputs per-sample table with: time, raw, filtered, HP, energy, active flag,
 method. Supports `--compact` mode (only state-change samples).
+
+---
+
+## Approach B — Sign-Flip Detector (detection only)
+
+### Philosophy
+
+Approach A detects the **cause** (oscillating load signal). Approach B detects
+the **symptom** (the controller's response is futile — energy discharged by the
+battery goes to the grid instead of the house).
+
+When the controller chases a pulse load:
+1. Oven ON → grid imports +1300 W → controller ramps battery
+2. Oven OFF → house load drops, battery still outputting → grid exports −1300 W
+3. The battery energy went straight to the grid — a futile round-trip
+
+The tell-tale signature visible in the grid signal: rapid flips between large
+positive (import) and large negative (export) values. If grid power never goes
+negative, there is no loss — the house consumed everything.
+
+### Algorithm
+
+#### Sign-Flip Definition
+
+A **sign flip** is detected when, within a `FLIP_WINDOW_S` window (20 s),
+there exists:
+- A sample with `grid > +FLIP_THRESH_W` (+500 W)
+- AND a sample with `grid < -FLIP_THRESH_W` (−500 W)
+
+This typically corresponds to two consecutive samples (one positive leg, one
+negative leg) occurring 12–16 s apart during oven duty-cycling.
+
+#### Activation
+
+≥ `ACTIVATE_COUNT` (2) sign flips within a `ACTIVATE_WINDOW_S` (120 s) sliding
+window → **activate**.
+
+In practice: the first oven duty cycle produces flip #1, the second produces
+flip #2. Activation after ~2 duty cycles ≈ 120 s of cycling.
+
+#### Deactivation
+
+No sign flips for `DEACTIVATE_S` (120 s) → **deactivate**.
+
+#### Parameters
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `FLIP_THRESH_W` | 500 W | Minimum grid magnitude for each flip leg |
+| `FLIP_WINDOW_S` | 20 s | Max time between positive and negative legs |
+| `ACTIVATE_COUNT` | 2 | Sign flips needed to activate |
+| `ACTIVATE_WINDOW_S` | 120 s | Sliding window for counting flips |
+| `DEACTIVATE_S` | 120 s | No-flip duration to deactivate |
+
+### What This Approach Does NOT Do
+
+**No baseline calculation.** This is detection only — output is a boolean
+`active` flag. Baseline determination is a separate concern to be combined
+with this detector.
+
+### Simulation Results
+
+Tested against controller CSV data which includes both `grid_w` and
+`battery_power_w` at 5 s resolution, with the controller actively running.
+
+#### April 24, 2026 (oven, washing machine, dryer, coffee machine)
+
+| Time (UTC) | Event | Flips | Active Duration | Notes |
+|------------|-------|-------|-----------------|-------|
+| 06:37 | Unknown pre-dawn | 2 | 2 min | Brief, harmless |
+| 07:14–07:24 | Morning transient | 2 | 2 min | Brief |
+| 09:30–09:33 | Dryer bursts | 1 each | — | **Not activated** — flips too spread |
+| 10:51–10:58 | Chaotic load | 2 | 2 min | Brief |
+| 13:43–13:47 | Coffee machine | 4 | 3 min | Correct |
+| **15:35–15:48** | **Oven cycling** | 3 | **13 min** | Correct |
+| **15:49–16:04** | **Oven cycling** | 3 | **15 min** | Re-activated after gap |
+| **16:04–16:13** | **Oven cycling** | 2 | **9 min** | Re-activated after gap |
+
+#### April 21, 2026 (oven session at 16:38–17:14)
+
+| Time (UTC) | Event | Flips | Active Duration | Notes |
+|------------|-------|-------|-----------------|-------|
+| 08:27–08:31 | Washing machine overshoot | 4 | 3 min | Correct |
+| 10:34–10:38 | Load transient | 5 | 4 min | Correct |
+| 13:37–13:40 | Coffee machine | 3 | 2 min | Correct |
+| **16:44–17:14** | **Oven session** | 5+/window | **~30 min** | Brief 4 s deactivation gap at 16:53 |
+
+### Key Findings
+
+1. **Oven detection — correct.** Both days correctly detect the oven duty-
+   cycling phase. The initial oven ON-phase (steady ~2600 W ramp) is correctly
+   **ignored** — no sign flips during the step response, so the controller
+   handles it normally. Activation only triggers once cycling begins.
+
+2. **No false activation on oven initial ON.** This was Approach A's main
+   weakness — the frozen baseline was contaminated when the calm detector
+   falsely deactivated during the steady ON phase. Approach B avoids this
+   entirely because a step load without cycling produces no sign flips.
+
+3. **Dryer bursts correctly ignored.** The 09:23–09:34 intermittent dryer
+   bursts on April 24 never accumulate 2 flips within 120 s (bursts are ~3 min
+   apart). Approach A falsely activated 4 times on this event.
+
+4. **Deactivation gaps during oven cycling.** On April 24, the detector
+   deactivates briefly at 15:48 and 16:04 when the oven has a slightly longer
+   pause between duty cycles. The cycling signal naturally spans multiple
+   activate/deactivate windows rather than one continuous active period. This is
+   acceptable — during the gap, the controller briefly resumes normal operation,
+   and re-activation occurs within 1–2 duty cycles.
+
+5. **Only needs the grid sensor.** Although the battery output data was useful
+   for understanding the problem, the detector itself only reads grid power.
+   No additional sensor subscription required.
+
+### Comparison with Approach A
+
+| Aspect | Approach A (HP IIR) | Approach B (Sign-Flip) |
+|--------|--------------------|-----------------------|
+| Detects | Load oscillation (cause) | Futile response (symptom) |
+| Sensors | Grid only | Grid only |
+| Initial oven ON | False deactivation → 140 W error for 10 min (fixed with HP guard) | Correctly ignored — no sign flips |
+| Dryer bursts | 4 false activations | Correctly ignored |
+| Oven cycling | Continuous active | Brief deactivation gaps |
+| Baseline | Built-in (frozen EMA) | **Not included** — separate concern |
+| Complexity | Higher (HP IIR + energy + calm + HP guard + lookback) | Lower (window scan + counter) |
+| Activation delay | ~1 sample (immediate on energy threshold) | ~2 duty cycles (~120 s) |
+| Parameters | 10 | 5 |
+
+### Known Limitations
+
+- **Activation delay of ~2 duty cycles** (~120 s). The first two cycles of
+  futile response are not caught. Approach A activates within one sample.
+- **Deactivation gaps** during long oven sessions when inter-pulse spacing
+  varies. Controller briefly resumes chasing before re-activation.
+- **Detection only** — no baseline output. Must be combined with a separate
+  baseline mechanism.
+
+#### Simulation Script
+
+`tools/simulate_signflip.py` — reads controller CSV
+`(timestamp, grid_w, battery_power_w)`, runs sign-flip detector, outputs
+per-sample table with: time, grid, battery, flip count, active flag, notes.
+Supports `--compact` mode (only state-change and flip events).
