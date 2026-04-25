@@ -364,6 +364,11 @@ class ControlLogic:
         correction = self.cfg.ki * error
         new_limit = self.state.last_sent_w + correction
 
+        # Mode-direction consistency: prevent stale last_sent_w
+        # from producing commands opposing the operating mode.
+        if self.state.mode == OperatingMode.CHARGING and new_limit > 0:
+            new_limit = 0.0
+
         # -- Large change: immediate correction ------------
         if abs(correction) > self.cfg.hysteresis_w:
             guarded = self._apply_guards(new_limit, m)
@@ -390,6 +395,10 @@ class ControlLogic:
 
         if abs(self.state.drift_acc) > self.cfg.hysteresis_w:
             drift_limit = self.state.last_sent_w + self.state.drift_acc
+
+            # Mode-direction consistency (drift path).
+            if self.state.mode == OperatingMode.CHARGING and drift_limit > 0:
+                drift_limit = 0.0
 
             guarded = self._apply_guards(drift_limit, m)
             if guarded is not None:
@@ -447,6 +456,7 @@ class ControlLogic:
         if self.state.mode != old_mode:
             self.state.charge_pending_since = None
             self.state.drift_acc = 0.0
+            self.state.last_sent_w = 0.0
             self._log(
                 f"Mode {old_mode.name} -> {self.state.mode.name}"
             )

@@ -405,6 +405,34 @@ class TestGuards:
         # Effective min SOC should be max(10, 5) = 10, and soc=8 <= 10
         assert "SOC too low" in out.reason
 
+    def test_low_soc_does_not_block_charging(self) -> None:
+        """Low SOC must never prevent charging — only discharging.
+
+        Regression: when last_sent_w was a large positive value (from
+        prior discharging) and mode switched to CHARGING, the computed
+        new_limit could stay positive despite surplus, triggering the
+        'SOC too low' guard and blocking charging indefinitely.
+        """
+        logic, now = make_logic(min_soc=12, muting=0.0, mode_hysteresis=50.0)
+        # Simulate stale state: mode=CHARGING but last_sent_w still
+        # holds the old discharge value (e.g. restored from persistence).
+        logic.state.mode = OperatingMode.CHARGING
+        logic.state.last_sent_w = 1600.0
+        logic.state.last_command_t = now - 20
+
+        # Surplus scenario: grid=-580W, battery idle, soc=11% (below min_soc)
+        m = make_measurement(
+            grid_power_w=-580.0,
+            battery_power_w=0.0,
+            soc_pct=11.0,
+        )
+        out = logic.compute(m, now=now)
+        assert out is not None
+        # Must NOT say "SOC too low" — charging should always be allowed
+        assert "SOC too low" not in out.reason
+        # Output must be zero or negative (charge direction)
+        assert out.desired_power_w <= 0.0
+
 
 # ═══════════════════════════════════════════════════════════
 #  Surplus Clamp
