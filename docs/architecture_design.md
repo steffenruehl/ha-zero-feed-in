@@ -4,7 +4,7 @@
 
 Draft architecture proposal based on `architecture_requirements.md`.
 Each decision is documented as an ADR (Architecture Decision Record)
-with context, alternatives, rationale, and consequences. 15 ADRs total.
+with context, alternatives, rationale, and consequences. 16 ADRs total.
 
 ---
 
@@ -18,6 +18,7 @@ The architecture must:
 - Separate concerns by time scale (real-time vs. planning, US-4)
 - Enable post-mortem analysis from logs alone (US-7)
 - Cleanly separate open-source core from optional premium services (US-6)
+- Enable "what-if" simulations against historic data to evaluate hardware changes (US-9)
 
 ## Non-Goals
 
@@ -47,7 +48,7 @@ clear isolation boundaries.
 ┌──────────────────────────────┴─────────────────────────────────────┐
 │  TIER 2 — SERVER (optional)                                        │
 │                                                                    │
-│  Optimizer  Auto-Tuner  Forecasts  Recorder  Web Server            │
+│  Optimizer  Auto-Tuner  Forecasts  Recorder  Simulator  Web Server  │
 │      └──────────┴───────────┴──────────┴──────────┘                │
 │                          MQTT Bus (Tier 2)                         │
 └──────────────────────────────┬─────────────────────────────────────┘
@@ -1993,6 +1994,128 @@ agreeing to.
 
 ---
 
+## ADR-16: Amortization Simulation via Historic Data Replay
+
+### Context
+
+US-9 (what-if analysis): A user wants to evaluate whether adding
+a new component (e.g., a second battery, larger inverter, additional
+PV string) is economically justified. This requires:
+- REQ-33: Historic load/PV/grid data stored in Tier 2
+- REQ-34: A simulation engine that replays history with modified
+  system parameters and reports energy/cost deltas
+
+The system may already be recording via the Recorder (ADR-8), but
+for installations that connect to Tier 2 after running stand-alone
+for a while, there must be a way to **backfill** historic data from
+Home Assistant's built-in recorder into Tier 2.
+
+### Decision
+
+**1. Historic data ingest (HA → Tier 2)**
+
+A **HistorySync** service (Tier 2) provides a one-shot, user-triggered
+import of Home Assistant history into the Recorder's time-series store.
+
+- Triggered explicitly via Tier 3 UI or CLI (`POST /api/history-sync`)
+- Never runs automatically — avoids surprise bandwidth/load
+- Reads HA long-term statistics API (`/api/history/period/...`)
+- Writes to the Recorder's time-series store, tagged as `source: ha_import`
+- Idempotent: re-running the same time range overwrites, does not duplicate
+- Import scope: user selects entities and date range
+
+```
+User → Tier 3 UI → POST /api/history-sync
+                        ↓
+                  HistorySync service
+                        ↓
+              HA WebSocket/REST API (read history)
+                        ↓
+              Recorder time-series store (write)
+```
+
+**2. Amortization Simulator (Tier 2)**
+
+A **Simulator** service replays historic data through a parameterized
+plant model to answer "what if" questions:
+
+- Input: historic load/PV profile (from Recorder), modified system
+  config (e.g., battery capacity ×2, additional PV)
+- Engine: closed-loop simulation using the same control logic as
+  Tier 1, with a configurable plant model
+- Output: energy balance delta (kWh saved from grid, kWh less
+  feed-in), cost delta (at given tariff), payback estimate
+
+The Simulator is stateless — it reads historic data from the Recorder,
+runs the simulation, and returns results. No persistent state beyond
+what's already in the Recorder.
+
+```
+User → Tier 3 UI → POST /api/simulate
+                        ↓
+                  Simulator service
+                    ├── reads historic profiles from Recorder
+                    ├── runs closed-loop sim with modified params
+                    └── returns energy/cost delta
+```
+
+**3. Data requirements**
+
+The Recorder must store at minimum:
+- Grid power (import/export) at ≤ 5-minute resolution
+- PV production
+- Battery power and SOC
+- Consumer load (derived: load = grid + battery - PV export)
+
+These are already recorded by the Tier 1 Logger (ADR-8). The
+HistorySync backfills the same schema from HA history.
+
+### Alternatives Considered
+
+**Automatic HA sync on Tier 2 connection**: Simpler UX, but
+violates the user's explicit-trigger requirement. Could cause
+unexpected network load or HA overload on large histories.
+
+**Simulation in Tier 3 (browser)**: Avoids server load. But:
+large datasets (months of 5s data) exceed browser memory. The
+plant model and control logic would need a JS port. Not portable
+to headless CLI use.
+
+**Dedicated data warehouse separate from Recorder**: Overkill —
+the Recorder already has the time-series store, retention policies,
+and tenant isolation. Adding a parallel store doubles complexity.
+
+### Rationale
+
+- **Explicit trigger** respects the user's control over their data
+  and network usage
+- **Reusing the Recorder** avoids a separate persistence layer
+- **Stateless Simulator** is easy to scale, test, and replace
+- **Same control logic** in simulation as in production ensures
+  fidelity (simulation output matches what the system would actually
+  do with the modified hardware)
+- Historic backfill is a one-time bootstrapping step; once Tier 2
+  is connected, the normal Recorder path takes over
+
+### Consequences
+
+**Enables:**
+- Users can make data-driven hardware purchasing decisions
+- Supports evaluating any hardware change: battery size, PV
+  capacity, inverter limits, tariff changes
+- Historic data is available for other Tier 2 services (AutoTuner,
+  Optimizer) even if Tier 2 was connected late
+- CLI and UI access to simulation (not UI-only)
+
+**Constrains:**
+- HistorySync depends on HA's history API availability and retention
+  (HA default: 10 days; long-term statistics: indefinite but hourly)
+- Simulation fidelity is bounded by plant model accuracy
+- Large history imports may take minutes — needs progress reporting
+- Recorder retention policies (ADR-15) apply to imported data too
+
+---
+
 # Component Catalog
 
 Reference table of component types and the topics they publish/subscribe.
@@ -2085,6 +2208,18 @@ Reference table of component types and the topics they publish/subscribe.
 - **Publishes**: `zfi/2/parameters/proposed`
 - **Schedule**: Daily at 03:00
 
+### Simulator (Tier 2)
+- **Reads**: Recorder backend (historic load/PV/battery profiles)
+- **Input**: Modified system config (via REST API)
+- **Output**: Energy/cost delta report (via REST API)
+- **Stateless**: No persistent state, pure computation
+
+### HistorySync (Tier 2)
+- **Reads**: HA history API (long-term statistics, entity history)
+- **Writes**: Recorder time-series store
+- **Triggered**: Explicitly via REST API (`POST /api/history-sync`)
+- **Never automatic**: User must initiate
+
 ### Bridge (Tier 1 ↔ Tier 2)
 - **Subscribes**: Topic patterns from Tier 1
 - **Publishes**: To Tier 2 broker
@@ -2133,8 +2268,10 @@ Reference table of component types and the topics they publish/subscribe.
 | REQ-30 | Graceful degradation | ADR-10 |
 | REQ-31 | Component independence | ADR-1 (bus only coupling), ADR-10 |
 | REQ-32 | Incremental tier deployment | ADR-7 (independent tiers) |
+| REQ-33 | Historic data available in Tier 2 | ADR-8 (Recorder), ADR-16 (HistorySync backfill) |
+| REQ-34 | What-if simulation against historic data | ADR-16 (Simulator service) |
 
-All 32 requirements addressed.
+All 34 requirements addressed.
 
 ---
 

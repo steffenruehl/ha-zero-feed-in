@@ -11,9 +11,8 @@ end shows when their development can begin in parallel with Tier 1.
 
 ## Guiding Principles
 
-1. **Existing code first.** The current `zero_feed_in_controller.py`
-   and `zendure_solarflow_driver.py` represent working logic. They
-   are the starting point, not throwaways.
+1. **Existing code first.** The seven AppDaemon apps in `src/` represent
+   working logic. They are the starting point, not throwaways.
 
 2. **Each phase ships.** No phase requires the next to be useful.
    Stopping after any phase leaves a working system — possibly with
@@ -27,28 +26,71 @@ end shows when their development can begin in parallel with Tier 1.
    only one component uses it. This makes adding components
    later trivial — no big-bang migration.
 
+5. **Existing test coverage is preserved.** `tests/` already exercises
+   pure-Python logic for every module via plain pytest. Migration must
+   keep that suite green at every step.
+
 ## Existing Assets
 
-What already exists and must not be rewritten:
+The current `src/` contains seven AppDaemon apps plus shared
+utilities. Each has a clear destination in the new architecture:
 
-| Asset | Location | Disposition |
-|---|---|---|
-| `ControlLogic` class | `zero_feed_in_controller.py` | Keep verbatim, move to `engine/logic/controller.py` |
-| `RelayStateMachine` | `zendure_solarflow_driver.py` | Keep verbatim, move to `engine/logic/relay_sm.py` |
-| Schmitt trigger, charge-confirm | inline in ControlLogic | Stays in ControlLogic |
-| Surplus estimation | inline | Stays in ControlLogic |
-| Step response measurements | `timings` file | Translate to test fixtures |
+| Module | Lines | Pure-logic class | New-arch component type |
+|---|---|---|---|
+| `zero_feed_in_controller.py` | 950 | `ControlLogic`, `Measurement`, `ControlOutput`, `ControllerState`, `OperatingMode`, `Config` | **Controller** (`NormalController`) |
+| `zendure_solarflow_driver.py` | 989 | `RelayStateMachine`, `AdaptiveLockout`, `RelayState`, `RelayDirection`, `DriverState`, `Config` | **Driver** (`ZendureBatteryDriver`) |
+| `pv_forecast_manager.py` | 278 | `PvForecastConfig`, `MinSocRule` | **Service** (`PvForecastService`) — publishes dynamic min-SOC |
+| `pulse_load_detector.py` | 265 | `DetectorConfig`, sign-flip core | **Detector** (`PulseLoadDetector`) |
+| `pulse_load_filter.py` | 421 | `FilterConfig`, baseline + I-controller core | **Service** (sensor pre-processor — publishes filtered grid) |
+| `solarflow_mqtt_watchdog.py` | 332 | health monitoring, HTTP reconnect, heartbeat checks | **Service** (`HealthWatchdog`) |
+| `relay_switch_counter.py` | 98 | counter logic | **Service** (metrics, optional) |
+| `csv_logger.py` | 93 | `CsvLogger` (daily-rotating CSV) | Utility — used by Recorder shim until ADR-8 Recorder lands |
 
-What does NOT yet exist:
+The pure-logic classes already have **zero AppDaemon imports** —
+they take dataclasses in and return dataclasses out. That clean
+seam is what makes lift-and-shift cheap.
+
+### Behaviors that already exist (and must be preserved)
+
+These were not in the original plan but are present in the code today.
+Phase 1 must carry them forward:
+
+| Capability | Where it lives today |
+|---|---|
+| Controller state persistence (JSON in `run/`) | `ControlLogic.state_snapshot` / `restore_from_snapshot` |
+| Driver SM state persistence | `RelayStateMachine.state_snapshot` / `restore_from_snapshot` |
+| MQTT heartbeat publishing (controller + driver) | `_publish_heartbeat` in both apps |
+| Controller-stale safe-state | `ZendureSolarFlowDriver._is_controller_stale` |
+| smartMode RAM-only writes (flash-wear mitigation) | `ZendureSolarFlowDriver._ensure_smart_mode` |
+| Dynamic min-SOC override (forecast → controller) | `Measurement.dynamic_min_soc_pct` + clamping in `_apply_guards` |
+| Per-app CSV logging (controller + driver) | `csv_logger.CsvLogger` |
+| Detection/mitigation already split | `pulse_load_detector` publishes `sensor.zfi_pld_active`; `pulse_load_filter` subscribes |
+| Mode Schmitt trigger + charge-confirmation delay | `ControlLogic._update_operating_mode` |
+| Adaptive energy-integrator relay lockout | `AdaptiveLockout` + `RelayStateMachine` |
+
+### Already aligned with the architecture
+
+Two architectural decisions in `architecture_design.md` are already
+honoured by the current code, not by accident but by recent refactors:
+
+- **"Detection and mitigation are separate"** (Architecture key
+  principle 8): `pulse_load_detector` and `pulse_load_filter` are
+  distinct apps, communicating through an HA sensor entity. In the
+  new architecture this becomes detector-publishes-situation +
+  filter-subscribes-situation; the structural shape is unchanged.
+- **"Controller knows nothing about hardware"**: `ControlLogic` has
+  no Zendure-specific code. The driver is the only Zendure-aware app.
+
+### What does NOT yet exist
 
 - HA Add-on packaging (Dockerfile, config.yaml, s6-overlay)
 - Embedded Mosquitto configuration and credentials management
-- HA WebSocket and REST API clients (engine-side)
+- HA WebSocket and REST API clients (engine-side, replacing AppDaemon)
 - Thin Custom Integration (entity registration via MQTT)
 - MQTT bus client wrapper (Tier 1 internal bus)
-- Component base classes (Driver, Detector, Controller, Supervisor, Multiplexer)
+- Component base classes (Driver, Detector, Controller, Supervisor, Multiplexer, Service)
 - Graph Builder
-- Structured logging infrastructure
+- Structured logging via bus + Recorder
 - Lifecycle protocol implementation
 
 ---
@@ -57,20 +99,24 @@ What does NOT yet exist:
 
 ```
 Phase 1: Bus Foundation + Lift-and-Shift     (Weeks 1-4)
-   Today's logic, in an HA Add-on with embedded Mosquitto,
+   All 7 apps, ported into an HA Add-on with embedded Mosquitto,
    plus thin Custom Integration for HA UI
-   → Value: Working zero-feed-in, testable, observable, no AppDaemon
+   → Value: Working zero-feed-in (with PV forecast, pulse-load
+            detection/mitigation, watchdog), no AppDaemon
 
 Phase 2: Component Type Discipline           (Weeks 5-6)
    Refactor lift-and-shift into proper component types
    → Value: Clean architecture, ready to extend
 
 Phase 3: Multiplexer + Second Controller     (Weeks 7-8)
-   Stove controller as proof of concept
+   PulseLoadController as the second controller (proven need:
+   filter today is a workaround that lives outside the controller)
    → Value: Mode switching, validates extensibility
 
 Phase 4: Detectors + Supervisor              (Weeks 9-10)
-   Decouple "is the stove on" from controllers
+   PulseLoadDetector becomes a real Detector; Supervisor
+   maps detector to controller (replacing the indirect HA-sensor
+   wiring used today)
    → Value: Adding detectors becomes one-liner
 
 Phase 5: Driver Generalization               (Weeks 11-13)
@@ -95,7 +141,8 @@ delivers, and what becomes possible afterward.
 
 **Duration**: 3-4 weeks (Add-on packaging adds initial overhead)
 **Prerequisite**: Existing AppDaemon code working as today
-**Goal**: Today's working system, running on tomorrow's architecture
+**Goal**: Today's working system — all seven apps — running on
+tomorrow's architecture
 
 ### What gets built
 
@@ -123,19 +170,32 @@ zfi-addon/                          # The Add-on (Docker container)
     │   ├── messages.py             # Pydantic schemas v1
     │   └── topics.py
     ├── logic/                      # PURE PYTHON — no HA, no MQTT imports
-    │   ├── controller.py           # ControlLogic — verbatim from existing
-    │   ├── relay_sm.py             # RelayStateMachine — verbatim
-    │   └── types.py                # Measurement, ControlOutput, Config
+    │   ├── controller.py           # ControlLogic — verbatim
+    │   ├── relay_sm.py             # RelayStateMachine + AdaptiveLockout
+    │   ├── pulse_detector.py       # sign-flip core — verbatim
+    │   ├── pulse_filter.py         # baseline + I-controller — verbatim
+    │   ├── forecast.py             # PV forecast → dynamic min SOC
+    │   └── types.py                # Measurement, ControlOutput, Config types
     ├── runtime/                    # bus-aware wrappers around logic
     │   ├── controller_runtime.py
-    │   └── driver_runtime.py
+    │   ├── detector_runtime.py
+    │   ├── filter_runtime.py
+    │   └── forecast_runtime.py
     ├── drivers/                    # Phase 1 drivers (Zendure-specific)
     │   ├── ha_grid_meter.py        # reads HA via WebSocket → bus
     │   ├── ha_battery.py           # reads HA via WebSocket → bus
-    │   └── ha_actuator.py          # bus → HA REST service calls
-    └── ha_client/                  # WebSocket + REST clients for HA API
-        ├── websocket.py
-        └── rest.py
+    │   └── zendure_actuator.py     # bus → HA REST service calls
+    │                               # + smartMode + AC mode + redundant-send
+    ├── services/                   # non-real-time helpers
+    │   ├── solarflow_health.py     # MQTT-reconnect HTTP + heartbeat watchdog
+    │   ├── relay_counter.py        # transitions counter (metrics)
+    │   ├── csv_recorder.py         # daily-rotating CSV (uses csv_logger)
+    │   └── state_store.py          # JSON snapshots in /data/state/
+    ├── ha_client/                  # WebSocket + REST clients for HA API
+    │   ├── websocket.py
+    │   └── rest.py
+    └── persistence/
+        └── state_files.py          # atomic write helpers
 
 
 custom_components/zero_feed_in/    # The thin Custom Integration in HA
@@ -168,8 +228,8 @@ Verify the empty Add-on installs and starts in HA Supervisor.
 Add Mosquitto to the container:
 - Listens on `0.0.0.0:1884` (so the Custom Integration on the host
   can reach it via the container port mapping)
-- Initial ACL: permissive within zfi namespace, can be tightened
-  (Phase 2+) once components stabilize
+- Initial ACL: permissive within zfi namespace; tightened in Phase 2+
+  once components stabilize
 - Persistent password file in `/data/mosquitto/passwords` (Add-on data
   volume — survives restarts)
 - Generates default credentials on first run, writes them to
@@ -194,7 +254,9 @@ Tested standalone (no HA needed).
 
 **Step 1.4 — Define v1 message schemas**
 
-Pydantic models for the topics needed in Phase 1:
+Pydantic models for the topics needed in Phase 1. The v1 set is wider
+than the original plan because Phase 1 must carry today's full feature
+set:
 
 ```python
 # bus/messages.py
@@ -203,6 +265,7 @@ class GridPower(BaseModel):
     timestamp: datetime
     source: str
     power_w: float
+    filtered: bool = False  # set True by the pulse-load filter
 
 class BatteryState(BaseModel):
     schema_version: str = "1.0"
@@ -218,6 +281,26 @@ class DesiredPower(BaseModel):
     power_w: float
     reason: str
 
+class Situation(BaseModel):
+    schema_version: str = "1.0"
+    timestamp: datetime
+    source: str
+    kind: str           # e.g. "pulse_load"
+    active: bool
+    detail: dict        # e.g. {"flip_count": 4}
+
+class DynamicMinSoc(BaseModel):
+    schema_version: str = "1.0"
+    timestamp: datetime
+    source: str
+    min_soc_pct: float
+    reason: str         # e.g. "low forecast (1.2 kWh)"
+
+class Heartbeat(BaseModel):
+    schema_version: str = "1.0"
+    timestamp: datetime
+    source: str         # "controller" | "driver"
+
 class LogRecord(BaseModel):
     schema_version: str = "1.0"
     timestamp: datetime
@@ -227,21 +310,48 @@ class LogRecord(BaseModel):
     data: dict
 ```
 
-Only what Phase 1 needs. More schemas added per phase.
+Topics published in Phase 1:
+
+```
+zfi/1/sensors/grid/power               (raw — from grid meter driver)
+zfi/1/sensors/grid/power_filtered      (from pulse-load filter, when active)
+zfi/1/sensors/battery/main/state       (single battery in Phase 1)
+zfi/1/control/desired_power            (controller → actuator, no MUX yet)
+zfi/1/situations/pulse_load            (pulse-load detector)
+zfi/1/config/dynamic_min_soc           (forecast service, retained)
+zfi/1/heartbeat/controller             (retained, for ESP fallback)
+zfi/1/heartbeat/driver                 (retained, for ESP fallback)
+zfi/1/log/<component>                  (each component)
+```
+
+The retained heartbeat topics replace today's MQTT publishing on
+external broker topics.
 
 **Step 1.5 — Move logic verbatim**
 
-Take `ControlLogic` and `RelayStateMachine` from the current AppDaemon
-code and place them in `engine/logic/`. **No changes to the algorithms.**
+Move the pure-logic classes from each app into `engine/logic/`,
+**unchanged**:
+
+- `ControlLogic`, `Measurement`, `ControlOutput`, `ControllerState`,
+  `OperatingMode`, `Config` ← from `zero_feed_in_controller.py`
+- `RelayStateMachine`, `AdaptiveLockout`, `RelayState`,
+  `RelayDirection` ← from `zendure_solarflow_driver.py`
+- Sign-flip detection core ← from `pulse_load_detector.py`
+- Baseline + I-controller core ← from `pulse_load_filter.py`
+- Forecast rule evaluation ← from `pv_forecast_manager.py`
 
 The `logic/` package has zero HA imports, zero MQTT imports. It works
-with `Measurement` in, `ControlOutput` out — same as today.
+with dataclasses in, dataclasses out — same as today.
 
-Verify with pytest tests (write them now if none exist).
+The existing `tests/` suite (eight files, one per source module) is
+ported as-is and must stay green. These tests already exercise the
+pure-logic classes without AppDaemon mocks.
 
 **Step 1.6 — HA WebSocket and REST clients**
 
-The engine talks to HA via HA's authenticated APIs:
+The engine talks to HA via HA's authenticated APIs (replacing
+AppDaemon's `listen_state` / `get_state` / `set_state` /
+`call_service`):
 
 ```python
 # engine/ha_client/websocket.py
@@ -250,6 +360,7 @@ class HAWebSocketClient:
 
     async def connect(self, base_url: str, token: str): ...
     async def subscribe_entities(self, entity_ids: list[str], handler): ...
+    async def get_state(self, entity_id: str): ...
 
 # engine/ha_client/rest.py
 class HARESTClient:
@@ -259,18 +370,16 @@ class HARESTClient:
     async def get_state(self, entity_id): ...
 ```
 
-Authentication uses a long-lived access token, configured in the
-Add-on options (or auto-provisioned via HA Supervisor's internal
-proxy — `http://supervisor/core/api`).
+Authentication uses the Supervisor token via
+`http://supervisor/core/api` (auto-provided to the Add-on). Long-lived
+token is the fallback for development outside Supervisor.
 
 **Step 1.7 — Drivers (Phase 1: HA-based)**
-
-Drivers that read HA sensors via WebSocket, publish to the bus:
 
 ```python
 # engine/drivers/ha_grid_meter.py
 class HAGridMeterDriver:
-    def __init__(self, ha_ws: HAWebSocketClient, entity_id: str, bus: BusClient):
+    def __init__(self, ha_ws, entity_id, bus):
         ...
 
     async def start(self):
@@ -291,35 +400,55 @@ class HAGridMeterDriver:
         )
 ```
 
-Same pattern for battery driver (reads SOC + battery_power) and
-actuator driver (subscribes to `zfi/1/control/desired_power`,
-translates to HA service calls).
+Same pattern for the battery driver (reads SOC + battery_power) and
+the Zendure actuator driver (subscribes to
+`zfi/1/control/desired_power`, translates to HA service calls). The
+Zendure actuator carries forward today's specifics:
+
+- Relay state machine (`RelayStateMachine`)
+- AC mode dedup with retry-on-stale (`AC_MODE_RETRY_S`)
+- Output/input limit redundant-send suppression
+- 5 W rounding step
+- smartMode RAM-only writes (re-applied each watchdog tick)
+- Controller-stale safe-state (sender of `zfi/1/control/desired_power`
+  goes silent → driver zeros limits)
 
 **Step 1.8 — Controller runtime**
 
-Wraps `ControlLogic` for the bus:
+Wraps `ControlLogic` for the bus. Controller subscribes to *either*
+the raw or the filtered grid-power topic, depending on whether the
+filter is configured (matches today's behaviour where users point
+the controller's `grid_power_sensor` at the filter's output entity):
 
 ```python
 # engine/runtime/controller_runtime.py
 class ControllerRuntime:
-    def __init__(self, logic: ControlLogic, bus: BusClient):
-        ...
-
     async def start(self):
-        await self.bus.subscribe("zfi/1/sensors/grid/power", self._on_grid)
-        await self.bus.subscribe("zfi/1/sensors/battery/main/state", self._on_battery)
+        grid_topic = (
+            "zfi/1/sensors/grid/power_filtered"
+            if self.use_filtered_grid
+            else "zfi/1/sensors/grid/power"
+        )
+        await self.bus.subscribe(grid_topic, self._on_grid)
+        await self.bus.subscribe(
+            "zfi/1/sensors/battery/main/state", self._on_battery
+        )
+        await self.bus.subscribe(
+            "zfi/1/config/dynamic_min_soc", self._on_dyn_min_soc
+        )
 
     async def _on_grid(self, msg):
         self._latest_grid = msg
         await self._maybe_compute()
 
     async def _maybe_compute(self):
-        if not self._latest_grid or not self._latest_battery:
+        if not (self._latest_grid and self._latest_battery):
             return
         m = Measurement(
             grid_power_w=self._latest_grid.power_w,
             soc_pct=self._latest_battery.soc_pct,
             battery_power_w=self._latest_battery.power_w,
+            dynamic_min_soc_pct=self._latest_dyn_min_soc,
         )
         output = self.logic.compute(m)
         if output is not None:
@@ -327,12 +456,33 @@ class ControllerRuntime:
                 "zfi/1/control/desired_power",
                 DesiredPower(...),
             )
+            await self._save_state()
+        await self._heartbeat()
 ```
 
 The runtime is the only place that touches both the bus and the
-pure logic.
+pure logic. Heartbeat publishing and JSON state snapshots
+(carried over from today) live here too.
 
-**Step 1.9 — Engine entry point**
+**Step 1.9 — Detector / filter / forecast runtimes**
+
+Each of the three other event-driven modules gets a thin runtime:
+
+- `DetectorRuntime` (pulse-load): subscribes to the raw grid topic,
+  publishes `zfi/1/situations/pulse_load`.
+- `FilterRuntime` (pulse-load): subscribes to raw grid + situation,
+  publishes `zfi/1/sensors/grid/power_filtered`. (In Phase 1 the
+  controller picks raw vs. filtered statically; Phase 4 makes this
+  a routing decision.)
+- `ForecastRuntime` (PV): no bus inputs, scheduled at configured
+  times of day (unchanged from today). Reads HA forecast entities
+  via the WebSocket client, publishes `zfi/1/config/dynamic_min_soc`
+  (retained).
+
+Each carries forward its existing pure-logic core with no algorithm
+changes.
+
+**Step 1.10 — Engine entry point**
 
 `main.py` reads Add-on config, instantiates everything, starts the
 bus loop:
@@ -341,37 +491,46 @@ bus loop:
 # engine/main.py
 async def main():
     config = load_addon_options()  # /data/options.json (HA-managed)
-    
+
     bus = BusClient(broker="localhost", port=1884, credentials=...)
     await bus.connect()
-    
+
     ha_ws = HAWebSocketClient()
     await ha_ws.connect(
         base_url="http://supervisor/core",
         token=os.environ["SUPERVISOR_TOKEN"],
     )
     ha_rest = HARESTClient(...)
-    
+
     # Pure logic
-    cfg = Config.from_dict(config)
+    cfg = Config.from_dict(config["controller"])
     control_logic = ControlLogic(cfg)
-    
-    # Drivers (Phase 1: HA-based)
-    grid = HAGridMeterDriver(ha_ws, config["grid_sensor"], bus)
-    battery = HABatteryDriver(ha_ws, config["battery_sensors"], bus)
-    actuator = HAActuatorDriver(ha_rest, config["actuators"], bus)
-    
-    # Controller runtime
+
+    # Drivers
+    grid     = HAGridMeterDriver(ha_ws, config["grid_sensor"], bus)
+    battery  = HABatteryDriver(ha_ws, config["battery_sensors"], bus)
+    actuator = ZendureActuatorDriver(ha_ws, ha_rest, config["zendure"], bus)
+
+    # Runtime wrappers around pure logic
     controller = ControllerRuntime(control_logic, bus)
-    
-    # Start everything
-    for c in [grid, battery, actuator, controller]:
+    detector   = DetectorRuntime(config["pulse_load_detector"], bus)
+    filt       = FilterRuntime(config["pulse_load_filter"], bus)
+    forecast   = ForecastRuntime(config["pv_forecast"], ha_ws, bus)
+
+    # Services
+    health     = SolarFlowHealthService(config["watchdog"], ha_ws, ha_rest, bus)
+    counter    = RelayCounterService(bus)
+    recorder   = CsvRecorderService(config.get("log_dir"), bus)
+
+    for c in [grid, battery, actuator,
+              controller, detector, filt, forecast,
+              health, counter, recorder]:
         await c.start()
-    
+
     await asyncio.Event().wait()  # run forever
 ```
 
-**Step 1.10 — Thin Custom Integration**
+**Step 1.11 — Thin Custom Integration**
 
 In `custom_components/zero_feed_in/`, register HA entities that
 subscribe to bus topics on the embedded Mosquitto:
@@ -394,38 +553,75 @@ class ZFIGridPowerSensor(SensorEntity):
         self.async_write_ha_state()
 ```
 
-The integration reads broker credentials from `/share/zfi/credentials.json`
-(written by the Add-on on first start). No Config Flow.
+The integration reads broker credentials from
+`/share/zfi/credentials.json` (written by the Add-on on first start).
+No Config Flow.
 
-Entities to expose in Phase 1:
+Entities to expose in Phase 1 (mirroring what today's apps publish
+to `sensor.zfi_*`):
+
 - `sensor.zfi_grid_power`
+- `sensor.zfi_grid_power_filtered`
 - `sensor.zfi_battery_soc`
 - `sensor.zfi_desired_power`
 - `sensor.zfi_mode`
+- `sensor.zfi_pld_active` (pulse-load active flag)
+- `sensor.zfi_dynamic_min_soc`
+- `sensor.zfi_relay_sm_state`
+- `sensor.zfi_relay_switches`
 - `number.zfi_min_soc`
+- `switch.zfi_charge_enabled`, `switch.zfi_discharge_enabled`
 
-**Step 1.11 — Structured logging via bus**
+**Step 1.12 — State persistence shim**
+
+Today both the controller and driver atomically write their
+serialized state to JSON files in `run/` (via
+`state_snapshot` / `restore_from_snapshot`). Move this to a single
+`StateStore` service writing under `/data/state/` (Add-on persistent
+volume):
+
+```
+/data/state/controller.json
+/data/state/relay_sm.json
+/data/state/relay_counter.json
+```
+
+Phase 1 keeps the same simple atomic-write pattern and per-component
+schemas. ADR-8's Recorder is the longer-term home for this; for now
+state stays a small file per component.
+
+**Step 1.13 — Structured logging via bus**
 
 Every component publishes `LogRecord` to `zfi/1/log/<component>`.
-A simple subscriber in the engine writes to a rotating file in
-`/data/logs/`. (Recorder service comes in Phase 4.)
+A `CsvRecorderService` subscribes to the log topics and CSV-related
+sensor topics, reusing today's `CsvLogger` to write
+`/data/logs/zfi_*_YYYY-MM-DD.csv`. The full ADR-8 Recorder service
+(time-series store, query API, replay) comes in a later phase or in
+Tier 2.
 
 ### What works after Phase 1
 
 - zfi runs as an HA Add-on, installable via HA Supervisor UI
 - Configuration via standard HA Add-on options form
-- Zero feed-in operates exactly as today
-- All sensor values, commands, and decisions flow through the bus
+- All seven of today's behaviours operate exactly as they do now:
+  zero feed-in, PV-forecast min SOC, pulse-load detection +
+  mitigation, MQTT watchdog with heartbeat checks, relay counter,
+  daily CSV logs
+- All sensor values, situations, commands, and decisions flow
+  through the bus
 - An MQTT client (mqtt-explorer connecting to localhost:1884) shows
   the live system in real time
-- Logic is testable without HA (pure `ControlLogic` tests)
+- Pure logic is testable without HA — the existing pytest suite is
+  preserved and green
 - Engine restarts don't require HA restart
 - HA reload doesn't restart the engine
 
 ### What does NOT work yet (out of scope)
 
-- Multiple controllers (Phase 3)
-- Detectors (Phase 4)
+- Multiple controllers / mode switching (Phase 3)
+- Detector → controller routing via Supervisor (Phase 4) — Phase 1
+  detection still works exactly as today, by influencing the filter
+  rather than by switching controller
 - Driver abstraction is informal — HA-based drivers are concrete
   classes, not yet a unified pattern (Phase 5)
 - Config-driven assembly (Phase 6) — `main.py` wires statically
@@ -433,11 +629,18 @@ A simple subscriber in the engine writes to a rotating file in
 
 ### Migration risk
 
-Medium. The logic is unchanged, but Add-on packaging is new
-infrastructure work. The Custom Integration registering entities
-from MQTT is a known HA pattern (used by Zigbee2MQTT) but new
-to this project. Failure modes are addressable with graceful
-degradation (ADR-10).
+Medium-high. The pure logic is unchanged, but the surface area of
+behaviours to preserve is wider than the original plan suggested
+(controller stale-check, smartMode, dynamic_min_soc, heartbeat,
+state persistence, CSV logging — all in scope on day one).
+Mitigations:
+
+1. Lift the pure-logic modules first; keep the existing pytest suite
+   green throughout the move.
+2. Run the new Add-on in `dry_run: true` in parallel with the
+   existing AppDaemon deployment for at least one week.
+3. Compare published bus values against today's `sensor.zfi_*`
+   entities to confirm parity before flipping to live.
 
 ### Architecture questions raised
 
@@ -454,6 +657,20 @@ degradation (ADR-10).
 - **Q-P1-C**: `main.py` instantiates everything statically. Phase 6
   introduces the Graph Builder which replaces this. Until then,
   "graph builder" is a hardcoded function — accept this.
+
+- **Q-P1-D**: Should the controller-stale safe-state (today driven by
+  the driver checking `last_reported`/`last_updated` of
+  `sensor.zfi_desired_power`) keep that semantics, or move to a
+  bus-native heartbeat? Phase 1: keep both — driver subscribes to
+  `zfi/1/control/desired_power` *and* tracks message age, plus
+  the controller publishes `zfi/1/heartbeat/controller`. Pick one
+  authoritative mechanism in Phase 2.
+
+- **Q-P1-E**: Where does the SolarFlow MQTT watchdog live? It runs
+  the device's HTTP reconnect API — it is not a "driver" in the
+  ADR-2 sense, nor a controller. Treat it as a `Service` from day
+  one (ADR-2 Service catch-all) so we don't have to reclassify in
+  Phase 2.
 
 ---
 
@@ -525,10 +742,15 @@ Each existing piece of Phase 1 is reclassified:
 | Phase 1 module | Phase 2 type |
 |---|---|
 | `runtime/controller_runtime.py` | `controllers/normal.py` (subclass of `Controller`) |
-| `runtime/driver_runtime.py` | Folded into the actuator driver |
+| `runtime/detector_runtime.py` | `detectors/pulse_load.py` (subclass of `Detector`) — but still feeds the filter, not yet a Supervisor input |
+| `runtime/filter_runtime.py` | `services/grid_filter.py` (subclass of `Service`) — sensor pre-processor |
+| `runtime/forecast_runtime.py` | `services/pv_forecast.py` (subclass of `Service`) |
+| `services/solarflow_health.py` | (already Service, formalize the base class) |
+| `services/relay_counter.py` | (already Service) |
+| `services/csv_recorder.py` | (already Service) |
 | `drivers/ha_grid_meter.py` | `drivers/ha_grid_meter.py` (subclass of `Driver`) |
 | `drivers/ha_battery.py` | `drivers/ha_battery.py` (subclass of `Driver`) |
-| `drivers/ha_actuator.py` | Merged into `ha_battery.py` (battery driver does both read and write) |
+| `drivers/zendure_actuator.py` | Merged into `ha_battery.py` (battery driver does both read and write) |
 
 Per ADR-2's note on hardware abstraction: HA-based and native-MQTT
 drivers are both Drivers. There is no "Bridge" type. The HA-based
@@ -544,6 +766,11 @@ Even before MUX (Phase 3), every component supports:
 
 This is the foundation for Sleep/Wake in Phase 3.
 
+For each component, choose one of `IDLE | DEFAULT | LAST_KNOWN | SAFE`
+based on what makes sense (e.g., the driver loses upstream
+desired_power → SAFE 0 W; the forecast service loses HA forecast
+entities → DEFAULT to the static `min_soc_pct`).
+
 **Step 2.3 — Component registry**
 
 A simple registry mapping name → class:
@@ -551,10 +778,15 @@ A simple registry mapping name → class:
 ```python
 # components/registry.py
 COMPONENT_TYPES = {
-    "drivers.ha_grid_meter": HAGridMeterDriver,
-    "drivers.ha_battery": HABatteryDriver,
-    "controllers.normal": NormalController,
-    # ...
+    "drivers.ha_grid_meter":  HAGridMeterDriver,
+    "drivers.ha_battery":     HABatteryDriver,
+    "controllers.normal":     NormalController,
+    "detectors.pulse_load":   PulseLoadDetector,
+    "services.grid_filter":   PulseLoadFilterService,
+    "services.pv_forecast":   PvForecastService,
+    "services.solarflow_health": SolarFlowHealthService,
+    "services.relay_counter": RelayCounterService,
+    "services.csv_recorder":  CsvRecorderService,
 }
 ```
 
@@ -566,6 +798,13 @@ from config; in Phase 2 the names are hardcoded.
 The actual behavior of the system MUST NOT change in Phase 2. This
 is a pure refactor: reorganize the code into the type discipline,
 verify all existing tests still pass, no new features.
+
+**Step 2.5 — Pick one stale-detection mechanism**
+
+Resolve Q-P1-D: drop the entity-age check in the Zendure actuator
+driver in favour of the bus-native `zfi/1/heartbeat/controller`
+topic. The driver enters SAFE state when no message has arrived
+within `controller_stale_s`. One mechanism, easier to reason about.
 
 ### What works after Phase 2
 
@@ -600,9 +839,17 @@ verify all existing tests still pass, no new features.
 ### What gets built
 
 - `Multiplexer` component (ADR-2 detail, MUX section)
-- `StoveController` as a second controller
+- A second controller (e.g. `PulseLoadController`) that handles
+  pulse-load conditions natively, replacing the indirect
+  filter-rewrites-grid workaround used today
 - Sleep/Wake protocol in `Controller` base
 - Updated topic structure: `zfi/1/control/mux/<n>/desired_power`
+
+The choice of second controller is deliberate: today's
+`pulse_load_filter` is essentially "controller behaves differently
+during pulse-load conditions" implemented as a sensor-rewriting hack.
+A real second controller is a cleaner home for that behaviour and
+gives us a non-toy proof-of-concept of mode switching.
 
 ### Concrete Steps
 
@@ -687,12 +934,19 @@ The existing `NormalController` becomes a subclass that publishes
 to `zfi/1/control/mux/normal/desired_power` instead of
 `zfi/1/control/desired_power`.
 
-**Step 3.3 — StoveController stub**
+**Step 3.3 — PulseLoadController**
 
-Initially, `StoveController` is a copy of `NormalController` with
-different parameters (e.g., higher hysteresis to avoid flapping
-during stove transients). Refining its behavior is an
-implementation detail outside this plan.
+A second controller wrapping a customised `ControlLogic`: starts
+from the same algorithm but uses the baseline-tracking I-controller
+from today's `pulse_load_filter` instead of the direct calculation
+during pulse-load conditions. Initially, this can be a near-copy of
+`NormalController` with different parameters (higher hysteresis,
+longer muting); the baseline-tracking logic moves in once parity is
+verified.
+
+The `pulse_load_filter` Service from Phase 1/2 stays as a fallback
+for now — once the new controller is proven, the filter Service can
+be deleted (Phase 4 item).
 
 **Step 3.4 — Manual switch entity**
 
@@ -700,7 +954,7 @@ For Phase 3, the "supervisor" is a HA `select` entity that the
 user toggles manually:
 
 ```yaml
-select.zfi_active_controller: ["normal", "stove"]
+select.zfi_active_controller: ["normal", "pulse_load"]
 ```
 
 A small adapter in the engine reads this select entity (via the
@@ -717,7 +971,8 @@ Real Supervisor (auto-decision) comes in Phase 4.
 ### What does NOT work yet
 
 - Automatic switching based on situation (Phase 4)
-- Real stove logic in StoveController (implementation detail)
+- The pulse-load filter Service still publishes a parallel filtered
+  topic for safety; it is removed in Phase 4
 
 ### Architecture questions raised
 
@@ -741,10 +996,13 @@ situation-based decisions
 
 ### What gets built
 
-- `StoveDetector` reading kitchen power sensor
+- Promote today's `PulseLoadDetector` to the canonical `Detector`
+  base (already publishes a Situation in Phase 2 — Phase 4 wires it
+  to the Supervisor)
 - `RuleBasedSupervisor` mapping detectors to controllers
-- Detectors registered in coordinator
 - HA select entity becomes read-only display (or override)
+- Decommission `PulseLoadFilterService` once `PulseLoadController` is
+  proven (the controller subsumes its purpose)
 
 ### Concrete Steps
 
@@ -756,31 +1014,11 @@ class Detector(Component):
     async def evaluate(self, ...) -> Situation: ...
 ```
 
-A detector subscribes to its input source (HA sensor or bus topic),
-computes a situation state, publishes to `zfi/1/situations/<n>`.
+The `PulseLoadDetector` already publishes `zfi/1/situations/pulse_load`
+(from Phase 1/2). Phase 4 only formalises the base class — the
+detector body itself is unchanged.
 
-**Step 4.2 — StoveDetector**
-
-```python
-class StoveDetector(Detector):
-    def __init__(self, bus, ha_ws, sensor: str, threshold_w: float):
-        ...
-
-    async def _on_kitchen_power(self, power_w: float):
-        active = power_w > self.threshold_w
-        await self.bus.publish(
-            "zfi/1/situations/stove",
-            Situation(
-                timestamp=...,
-                source=self.name,
-                kind="stove",
-                active=active,
-                detail={"power_w": power_w},
-            ),
-        )
-```
-
-**Step 4.3 — Supervisor with rule cascade**
+**Step 4.2 — Supervisor with rule cascade**
 
 ```python
 class RuleBasedSupervisor(Supervisor):
@@ -809,20 +1047,32 @@ class RuleBasedSupervisor(Supervisor):
                 return
 ```
 
-Rules are simple in Phase 4: "if stove situation active → activate
-stove controller, else normal".
+Rules are simple in Phase 4: "if pulse_load situation active →
+activate pulse_load controller, else normal".
 
-**Step 4.4 — Optional manual override**
+**Step 4.3 — Optional manual override**
 
 The HA select entity from Phase 3 stays, now as an *override*. If
 the user manually selects, the Supervisor respects it (writes to
 its internal state) until the user switches back to "auto".
 
+**Step 4.4 — Retire the filter Service**
+
+Once at least one full week of production data shows the
+`PulseLoadController` matches or beats the
+`PulseLoadFilterService`, delete the Service and the parallel
+filtered-grid topic. The controller is the single home for
+pulse-load behaviour.
+
+If parity isn't reached, defer the deletion — but the architecture
+no longer depends on the filter Service.
+
 ### What works after Phase 4
 
-- System automatically detects stove and switches controller
+- System automatically detects pulse-load and switches controller
 - Adding a detector: one new class + one rule entry
 - Supervisor logic is centralized and inspectable
+- Pulse-load behaviour lives in a real controller, not a sensor hack
 
 ### What does NOT work yet
 
@@ -835,6 +1085,11 @@ its internal state) until the user switches back to "auto".
   Phase 4. Should rules be in user config or developer config?
   Rules tie detectors to controllers — both must exist. User
   config is the right place once Graph Builder is live.
+
+- **Q-P4-B**: How long to run the filter Service in parallel before
+  retiring it? At least a week with the same pulse-load events
+  observed by both paths. Track both `desired_power` outputs side by
+  side via the bus log topics.
 
 ---
 
@@ -900,8 +1155,11 @@ non-HA-mediated drivers:
   user's broker (or the device's local broker)
 - Sends commands via direct MQTT, bypassing HA service calls
 - All Zendure-specific protocol code (AC mode management, output/input
-  limit dedup, etc.) lives here
-- The RelayStateMachine from `logic/relay_sm.py` is used the same way
+  limit dedup, smartMode handling, etc.) lives here. The watchdog's
+  HTTP reconnect API call also moves into this driver as a
+  device-specific recovery hook.
+- The `RelayStateMachine` from `logic/relay_sm.py` is used the same
+  way
 
 This driver coexists with `HABatteryDriver`. The user picks one
 based on their setup (some users have the battery only exposed via
@@ -972,15 +1230,20 @@ code changes
 component_types:
   drivers:
     zendure_2400ac_native: zfi.drivers.zendure_native.ZendureNativeMQTTDriver
-    ha_battery: zfi.drivers.ha.HABatteryDriver
-    ha_grid_meter: zfi.drivers.ha.HAGridMeterDriver
+    ha_battery:            zfi.drivers.ha.HABatteryDriver
+    ha_grid_meter:         zfi.drivers.ha.HAGridMeterDriver
   controllers:
-    normal: zfi.controllers.normal.NormalController
-    stove: zfi.controllers.stove.StoveController
+    normal:                zfi.controllers.normal.NormalController
+    pulse_load:            zfi.controllers.pulse_load.PulseLoadController
   detectors:
-    stove: zfi.detectors.stove.StoveDetector
+    pulse_load:            zfi.detectors.pulse_load.PulseLoadDetector
   supervisors:
-    rule_based: zfi.supervisors.rule_based.RuleBasedSupervisor
+    rule_based:            zfi.supervisors.rule_based.RuleBasedSupervisor
+  services:
+    pv_forecast:           zfi.services.pv_forecast.PvForecastService
+    solarflow_health:      zfi.services.solarflow_health.SolarFlowHealthService
+    relay_counter:         zfi.services.relay_counter.RelayCounterService
+    csv_recorder:          zfi.services.csv_recorder.CsvRecorderService
 ```
 
 **Step 6.2 — User config (Add-on options schema)**
@@ -998,18 +1261,25 @@ options:
     batteries:
       - name: "Living Room"
         type: ha_battery
-        soc_entity: sensor.zendure_1_soc
+        soc_entity:           sensor.zendure_1_soc
         battery_power_entity: sensor.zendure_1_battery_power
-        output_entity: number.zendure_1_outputlimit
+        output_entity:        number.zendure_1_outputlimit
+        input_entity:         number.zendure_1_inputlimit
+        ac_mode_entity:       select.zendure_1_acmode
+        smart_mode_entity:    switch.zendure_1_smartmode
         max_charge: 800
   modes:
     detectors:
-      - type: stove
-        entity: sensor.kitchen_power
-        threshold: 1500
+      - type: pulse_load
+        flip_thresh_w: 500
     controllers:
       - normal
-      - stove
+      - pulse_load
+  forecast:
+    enabled: true
+    forecast_entities:
+      - sensor.energy_production_tomorrow
+    forecast_threshold_kwh: 1.5
 
 schema:
   hardware:
@@ -1022,14 +1292,20 @@ schema:
         soc_entity: str?
         battery_power_entity: str?
         output_entity: str?
+        input_entity: str?
+        ac_mode_entity: str?
+        smart_mode_entity: str?
         max_charge: int(0,5000)
   modes:
     detectors:
-      - type: list(stove|ev|low_battery)
-        entity: str
-        threshold: int(0,10000)
+      - type: list(pulse_load|ev|low_battery)
+        flip_thresh_w: int(0,10000)
     controllers:
-      - list(normal|stove|ev_priority)
+      - list(normal|pulse_load|ev_priority)
+  forecast:
+    enabled: bool
+    forecast_entities: [str]
+    forecast_threshold_kwh: float
 ```
 
 The Supervisor validates against this schema. Saved options are
@@ -1055,6 +1331,7 @@ class GraphBuilder:
         # 3. Detectors
         # 4. Controllers (Multiplexer + N Controllers)
         # 5. Supervisor
+        # 6. Services (forecast, health, counter, recorder, ...)
         return Graph(components)
 ```
 
@@ -1221,7 +1498,8 @@ This is configured by the Graph Builder; controllers don't see it.
 ## What Becomes Possible When (Tier 1 Phase Map)
 
 After Phase 1: HA-only Tier 2 skeleton can start (visualization
-prototyping using bus data).
+prototyping using bus data — including pulse-load situations and
+forecast-driven min SOC, which are already on the bus from day one).
 
 After Phase 2: Tier 2 component patterns can be designed (services
 follow the same lifecycle as Tier 1 components).
@@ -1236,10 +1514,10 @@ configuration and component contracts.
 ## Coarse Timeline (Tier 1 + Brief Tier 2/3 Mention)
 
 ```
-Months 1-2:    Phases 1-2  (foundation, lift-and-shift)
-                 → Working bus-based system
+Months 1-2:    Phases 1-2  (foundation, lift-and-shift of all 7 apps)
+                 → Working bus-based system, full feature parity
 Months 3-4:    Phases 3-4  (multi-controller, supervision)
-                 → System reacts to situations
+                 → System reacts to situations via real controllers
 Months 5-6:    Phases 5-6  (driver abstraction, config-driven)
                  → User-friendly setup, hardware-agnostic
 Month 7+:      Phase 7 when triggered
@@ -1267,10 +1545,13 @@ the architecture document:
 | Q-P1-A | 1 | HA token for Supervisor vs. long-lived | Use Supervisor token via `http://supervisor/core/api` |
 | Q-P1-B | 1 | Custom Integration broker credentials | Read from `/share/zfi/credentials.json` written by Add-on |
 | Q-P1-C | 1 | Static `main.py` wiring | Replaced by GraphBuilder in Phase 6 |
+| Q-P1-D | 1 | Two stale-detection paths in driver | Pick bus-native heartbeat in Phase 2 |
+| Q-P1-E | 1 | Where the SolarFlow MQTT watchdog lives | Service from day one (ADR-2 catch-all) |
 | Q-P2-A | 2 | Component instance naming | `<type>.<instance_id>`, resolved by GraphBuilder |
 | Q-P3-A | 3 | MUX knows controllers how? | Hardcoded list → GraphBuilder |
 | Q-P3-B | 3 | MUX validates active controller | Yes — defensive, add to ADR-2 detail |
 | Q-P4-A | 4 | Rule format location | Hardcoded → user config (Phase 6) |
+| Q-P4-B | 4 | How long to run filter Service in parallel with PulseLoadController | At least one week of comparable events |
 | Q-P5-A | 5 | Capabilities as bus topic | Yes — add to ADR-3 |
 | Q-P6-A | 6 | Add-on schema component discovery | Schema lists allowed types statically |
 | Q-P6-B | 6 | Add-on schema validation timing | All-at-once on save (Supervisor default) |
