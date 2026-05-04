@@ -168,6 +168,94 @@ class TestBaselineEstimator:
         assert est.baseline is None
         assert not est.measuring
 
+    def test_negative_grid_corrects_immediately(self) -> None:
+        """Negative grid (export) triggers immediate full correction."""
+        cfg = make_config(
+            settle_duration_s=0.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+            drift_ki=0.3,
+            drift_cycle_s=60.0,
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+        est.update(150.0, 5.0)  # baseline=150
+        assert est.baseline == 150.0
+
+        # Grid goes negative: battery overshooting by 50W + 30W target
+        est.update(-50.0, 10.0)
+        # Immediate correction: baseline += (-50 - 30) = -80
+        assert est.baseline == pytest.approx(70.0)
+
+    def test_negative_grid_does_not_wait_for_cycle(self) -> None:
+        """Negative correction happens on the same sample, not after drift_cycle_s."""
+        cfg = make_config(
+            settle_duration_s=0.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+            drift_ki=0.3,
+            drift_cycle_s=600.0,  # very long cycle
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+        est.update(200.0, 5.0)  # baseline=200
+        assert est.baseline == 200.0
+
+        # Even with 600s cycle, negative grid corrects immediately
+        est.update(-20.0, 6.0)
+        assert est.baseline == pytest.approx(150.0)  # 200 + (-20-30)
+
+    def test_positive_grid_uses_cycle(self) -> None:
+        """Positive grid corrections only happen at cycle boundaries."""
+        cfg = make_config(
+            settle_duration_s=0.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+            drift_ki=0.3,
+            drift_cycle_s=60.0,
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+        est.update(30.0, 5.0)  # baseline=30
+        assert est.baseline == 30.0
+
+        # Positive grid at 80W — no immediate correction
+        est.update(80.0, 10.0)
+        assert est.baseline == 30.0  # unchanged mid-cycle
+
+        # At cycle end: min=80, error=80-30=50, correction=0.3*50=15
+        est.update(80.0, 65.0)
+        assert est.baseline == pytest.approx(45.0)
+
+    def test_negative_resets_drift_cycle(self) -> None:
+        """After an immediate negative correction, the drift cycle resets."""
+        cfg = make_config(
+            settle_duration_s=0.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+            drift_ki=0.3,
+            drift_cycle_s=10.0,
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+        est.update(150.0, 5.0)  # baseline=150
+
+        # Mid-cycle positive sample
+        est.update(50.0, 8.0)
+
+        # Negative correction at t=9 → resets cycle
+        est.update(-10.0, 9.0)
+        assert est.baseline == pytest.approx(110.0)  # 150 + (-10-30)
+
+        # New cycle starts from t=9; positive samples don't trigger
+        # until t=19
+        est.update(60.0, 15.0)
+        assert est.baseline == pytest.approx(110.0)  # unchanged
+
+        # Cycle completes at t=19: min=60, error=60-30=30, corr=9
+        est.update(60.0, 19.0)
+        assert est.baseline == pytest.approx(119.0)
+
 
 # ═══════════════════════════════════════════════════════════
 #  PulseLoadFilterLogic (integration)

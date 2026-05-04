@@ -219,15 +219,30 @@ class BaselineEstimator:
         if self.baseline is None:
             return None
 
-        # I-controller drift tracking
-        self._drift_cycle_min = min(self._drift_cycle_min, grid_w)
-        elapsed = now - self._drift_cycle_start_t
-        if elapsed >= self._cfg.drift_cycle_s:
-            error = self._drift_cycle_min - self._cfg.drift_target_w
-            self.baseline += self._cfg.drift_ki * error
-            # Reset cycle
+        # Asymmetric drift correction
+        #
+        # Negative grid = export = battery definitely overshooting.
+        # This is unambiguous (oven pulses only cause positive spikes),
+        # so correct immediately with full error.
+        #
+        # Positive grid = import = could be increased house load OR an
+        # oven-ON spike.  Use min(grid) over a full drift cycle to
+        # filter out pulse-load spikes before correcting upward.
+        if grid_w < 0:
+            error = grid_w - self._cfg.drift_target_w
+            self.baseline += error
+            # Reset cycle so we don't double-count this sample
             self._drift_cycle_start_t = now
             self._drift_cycle_min = float("inf")
+        else:
+            self._drift_cycle_min = min(self._drift_cycle_min, grid_w)
+            elapsed = now - self._drift_cycle_start_t
+            if elapsed >= self._cfg.drift_cycle_s:
+                error = self._drift_cycle_min - self._cfg.drift_target_w
+                self.baseline += self._cfg.drift_ki * error
+                # Reset cycle
+                self._drift_cycle_start_t = now
+                self._drift_cycle_min = float("inf")
 
         return self.baseline
 
