@@ -242,8 +242,16 @@ pulse_load_detector:
   # activate_window_s: 120     # sliding window for counting flips (s)
   # deactivate_quiet_s: 120    # no |grid| > threshold for this long → deactivate (s)
 
+  # ── Energy-ratio detection (optional, recommended) ──────
+  # Requires sign flips AND high grid-export/battery-discharge ratio.
+  # Set battery_power_sensor to enable.  Without it, flip-only mode is used.
+  # battery_power_sensor: sensor.YOUR_BATTERY_POWER_SENSOR  # +discharge/-charge
+  # energy_window_s: 120       # sliding window for energy integration (s)
+  # energy_ratio_thresh: 0.3   # grid_export / battery_discharge threshold (0–1)
+
   # Output entities
   sensor_prefix: sensor.zfi_pld
+  # log_dir: /config/logs      # CSV logging for offline analysis (empty = disabled)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

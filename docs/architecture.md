@@ -61,7 +61,9 @@ Supporting modules:
 
 ```
 PL Detector (event-driven):
-  grid_power_sensor ──▸ sign-flip analysis ──▸ sensor.zfi_pld_active
+  grid_power_sensor ──────────┐
+  battery_power_sensor ───────┤──▸ sign-flip + energy-ratio ──▸ sensor.zfi_pld_active
+                              │    analysis
 
 PL Filter (event-driven):
   grid_power_sensor ──────┐

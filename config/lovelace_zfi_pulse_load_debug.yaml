@@ -1,7 +1,15 @@
 # Zero Feed-In — Pulse-Load Debug Dashboard
 #
 # Detection and mitigation of periodic pulse loads (oven duty-cycling).
-# Shows detector state, filter baseline, and measurement pause progress.
+# Shows detector state, filter baseline, measurement pause, and the
+# handover between controller and filter.
+#
+# Handover sequence:
+#   1. Detector activates  → sensor.zfi_pld_active = 1
+#   2. Controller yields   → stops writing desired_power
+#   3. Filter writes 0 W   → measurement pause (battery stops)
+#   4. Filter writes +baseline → discharge at estimated house load
+#   5. Detector deactivates → controller resets and resumes
 #
 # Add as a new view in your Lovelace dashboard (raw YAML mode).
 # REQUIRES: debug: true in pulse_load_detector and pulse_load_filter
@@ -10,62 +18,110 @@ title: ZFI Pulse-Load Debug
 icon: mdi:sine-wave
 cards:
   # ─────────────────────────────────────────────────────────
-  #  Row 1: Grid power — raw vs filtered
-  # ─────────────────────────────────────────────────────────
-  - type: history-graph
-    title: Grid Power (raw vs filtered)
-    hours_to_show: 1
-    entities:
-      - entity: sensor.smart_meter_sum_active_instantaneous_power
-        name: Raw Grid Power
-      - entity: sensor.zfi_plf_filtered_grid_power
-        name: Filtered Grid Power
-      - entity: sensor.zfi_desired_power
-        name: Desired Power
-
-  # ─────────────────────────────────────────────────────────
-  #  Row 2: Detector state
-  # ─────────────────────────────────────────────────────────
-  - type: history-graph
-    title: Detector
-    hours_to_show: 1
-    entities:
-      - entity: sensor.zfi_pld_active
-        name: Active
-      - entity: sensor.zfi_pld_flip_count
-        name: Flip Count
-
-  # ─────────────────────────────────────────────────────────
-  #  Row 3: Filter baseline tracking
-  # ─────────────────────────────────────────────────────────
-  - type: history-graph
-    title: Filter Baseline & Measurement
-    hours_to_show: 1
-    entities:
-      - entity: sensor.zfi_plf_baseline
-        name: Baseline (W)
-      - entity: sensor.zfi_plf_measuring
-        name: Measuring
-
-  # ─────────────────────────────────────────────────────────
-  #  Row 4: Current state (entities card)
+  #  Row 1: Current state (entities card)
   # ─────────────────────────────────────────────────────────
   - type: entities
     title: Pulse-Load Status
     entities:
       - entity: sensor.zfi_pld_active
         name: Detector Active
+        icon: mdi:alert-circle
       - entity: sensor.zfi_pld_flip_count
-        name: Flip Count
+        name: Sign-Flip Count
+        icon: mdi:swap-vertical
+      - entity: sensor.zfi_pld_energy_ratio
+        name: Energy Ratio (export/discharge)
+        icon: mdi:scale-balance
       - type: divider
+      - entity: sensor.zfi_plf_measuring
+        name: Measuring (1 = pause)
+        icon: mdi:timer-sand
+      - entity: sensor.zfi_plf_baseline
+        name: Baseline Estimate (W)
+        icon: mdi:home-lightning-bolt
       - entity: sensor.zfi_plf_filtered_grid_power
         name: Filtered Grid Power (W)
+        icon: mdi:flash
+      - type: divider
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Raw Grid Power (W)
+        icon: mdi:transmission-tower
+      - entity: sensor.zfi_desired_power
+        name: Desired Power (W)
+        icon: mdi:battery-arrow-up-outline
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 2: Grid power — raw vs filtered vs desired
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Grid Power — Raw vs Filtered vs Desired (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Raw Grid (W)
+      - entity: sensor.zfi_plf_filtered_grid_power
+        name: Filtered Grid (W)
+      - entity: sensor.zfi_desired_power
+        name: Desired Power (W)
+
+  - type: history-graph
+    title: Grid Power — Raw vs Filtered vs Desired (6h)
+    hours_to_show: 6
+    entities:
+      - entity: sensor.smart_meter_sum_active_instantaneous_power
+        name: Raw Grid (W)
+      - entity: sensor.zfi_plf_filtered_grid_power
+        name: Filtered Grid (W)
+      - entity: sensor.zfi_desired_power
+        name: Desired Power (W)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 3: Detector state
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Detector — Active, Flips & Energy Ratio (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Active
+      - entity: sensor.zfi_pld_flip_count
+        name: Flip Count
+      - entity: sensor.zfi_pld_energy_ratio
+        name: Energy Ratio
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 4: Filter baseline & measurement
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Filter — Baseline & Measurement (1h)
+    hours_to_show: 1
+    entities:
       - entity: sensor.zfi_plf_baseline
         name: Baseline (W)
       - entity: sensor.zfi_plf_measuring
         name: Measuring
-      - type: divider
-      - entity: sensor.smart_meter_sum_active_instantaneous_power
-        name: Raw Grid Power (W)
-      - entity: sensor.zfi_desired_power
-        name: Desired Power (W)
+
+  # ─────────────────────────────────────────────────────────
+  #  Row 5: Handover timeline
+  # ─────────────────────────────────────────────────────────
+  - type: history-graph
+    title: Handover Timeline (1h)
+    hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Detector active
+      - entity: sensor.zfi_plf_measuring
+        name: Filter measuring
+      - entity: sensor.zfi_muting
+        name: Controller muted
+
+  - type: history-graph
+    title: Handover Timeline (6h)
+    hours_to_show: 6
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Detector active
+      - entity: sensor.zfi_plf_measuring
+        name: Filter measuring
+      - entity: sensor.zfi_muting
+        name: Controller muted
