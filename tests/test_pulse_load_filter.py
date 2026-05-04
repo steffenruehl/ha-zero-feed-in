@@ -41,6 +41,7 @@ class TestFilterConfig:
     def test_defaults(self) -> None:
         """Default values match the design document."""
         cfg = make_config()
+        assert cfg.settle_duration_s == 15.0
         assert cfg.measurement_duration_s == 60.0
         assert cfg.drift_target_w == 30.0
         assert cfg.drift_ki == 0.3
@@ -90,7 +91,7 @@ class TestBaselineEstimator:
 
     def test_measurement_captures_minimum(self) -> None:
         """Measurement pause sets baseline to min(grid) over the window."""
-        cfg = make_config(measurement_duration_s=30.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=30.0)
         est = BaselineEstimator(cfg)
         est.start_measurement(0.0)
         assert est.measuring
@@ -108,6 +109,7 @@ class TestBaselineEstimator:
     def test_drift_corrects_upward(self) -> None:
         """I-controller increases baseline when house load increases."""
         cfg = make_config(
+            settle_duration_s=0.0,
             measurement_duration_s=5.0,
             drift_target_w=30.0,
             drift_ki=0.3,
@@ -133,6 +135,7 @@ class TestBaselineEstimator:
     def test_drift_corrects_downward(self) -> None:
         """I-controller decreases baseline when house load decreases."""
         cfg = make_config(
+            settle_duration_s=0.0,
             measurement_duration_s=5.0,
             drift_target_w=30.0,
             drift_ki=0.3,
@@ -155,7 +158,7 @@ class TestBaselineEstimator:
 
     def test_reset_clears_state(self) -> None:
         """Reset returns estimator to initial state."""
-        cfg = make_config(measurement_duration_s=5.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=5.0)
         est = BaselineEstimator(cfg)
         est.start_measurement(0.0)
         est.update(30.0, 5.0)
@@ -184,7 +187,7 @@ class TestPulseLoadFilterLogic:
 
     def test_activation_starts_measurement(self) -> None:
         """External activation triggers measurement pause, returns 0."""
-        cfg = make_config()
+        cfg = make_config(settle_duration_s=0.0)
         logic = PulseLoadFilterLogic(cfg)
         result = logic.update(600.0, 0.0, active=True)
         assert logic.active
@@ -193,7 +196,7 @@ class TestPulseLoadFilterLogic:
 
     def test_measurement_produces_baseline(self) -> None:
         """After measurement, filter outputs the baseline as desired power."""
-        cfg = make_config(measurement_duration_s=30.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=30.0)
         logic = PulseLoadFilterLogic(cfg)
 
         # Activate
@@ -224,7 +227,7 @@ class TestPulseLoadFilterLogic:
 
     def test_returns_zero_during_measurement(self) -> None:
         """During measurement, filter returns 0.0 (battery paused)."""
-        cfg = make_config(measurement_duration_s=30.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=30.0)
         logic = PulseLoadFilterLogic(cfg)
 
         # Activate
@@ -237,7 +240,7 @@ class TestPulseLoadFilterLogic:
 
     def test_deactivation_resumes_passthrough(self) -> None:
         """After deactivation, filter passes raw value through."""
-        cfg = make_config(measurement_duration_s=10.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=10.0)
         logic = PulseLoadFilterLogic(cfg)
 
         # Activate and complete measurement
@@ -258,7 +261,7 @@ class TestPulseLoadFilterLogic:
 
     def test_reactivation_remeasures(self) -> None:
         """Re-activation after deactivation starts a fresh measurement."""
-        cfg = make_config(measurement_duration_s=10.0)
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=10.0)
         logic = PulseLoadFilterLogic(cfg)
 
         # First activation cycle
@@ -276,3 +279,156 @@ class TestPulseLoadFilterLogic:
         assert logic.measuring
         assert logic.baseline is None
         assert result == 0.0  # battery paused again
+
+
+# ═══════════════════════════════════════════════════════════
+#  Settle Delay
+# ═══════════════════════════════════════════════════════════
+
+
+class TestSettleDelay:
+    """Test that samples during the settle phase are discarded."""
+
+    def test_settle_discards_early_samples(self) -> None:
+        """Samples during the settle phase are not used for baseline."""
+        cfg = make_config(settle_duration_s=15.0, measurement_duration_s=30.0)
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+
+        # During settle (0–15s): battery still running → corrupted readings
+        est.update(-1200.0, 5.0)   # grid negative from battery lag
+        est.update(-800.0, 10.0)   # still ramping down
+
+        # After settle (15–45s): battery truly off → clean readings
+        est.update(150.0, 20.0)    # oven ON
+        est.update(30.0, 25.0)     # oven OFF (baseline)
+        est.update(150.0, 30.0)
+        est.update(30.0, 35.0)
+        est.update(150.0, 40.0)
+        est.update(30.0, 45.0)     # triggers completion (elapsed >= 15+30)
+
+        assert not est.measuring
+        # Baseline should be min of POST-settle samples only (30W)
+        assert est.baseline == 30.0
+
+    def test_settle_corrupted_not_in_baseline(self) -> None:
+        """Negative readings during settle are excluded from min()."""
+        cfg = make_config(settle_duration_s=10.0, measurement_duration_s=20.0)
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+
+        # Settle phase: wildly negative from battery lag
+        est.update(-1500.0, 3.0)
+        est.update(-600.0, 7.0)
+
+        # Measurement phase: real house load
+        est.update(180.0, 12.0)
+        est.update(50.0, 18.0)
+        est.update(180.0, 24.0)
+        est.update(50.0, 30.0)  # triggers completion
+
+        assert est.baseline == 50.0  # not -1500!
+
+    def test_settle_zero_is_backward_compatible(self) -> None:
+        """With settle_duration_s=0, all samples are collected (old behavior)."""
+        cfg = make_config(settle_duration_s=0.0, measurement_duration_s=10.0)
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+
+        est.update(100.0, 3.0)
+        est.update(50.0, 7.0)
+        est.update(80.0, 10.0)  # triggers completion
+
+        assert est.baseline == 50.0
+
+    def test_settle_no_samples_uses_target(self) -> None:
+        """If settle is longer than total pause, fallback to drift_target_w."""
+        cfg = make_config(
+            settle_duration_s=20.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+
+        # All samples are during settle (before 20s)
+        est.update(-500.0, 5.0)
+        est.update(-300.0, 10.0)
+        est.update(-100.0, 15.0)
+        # Trigger at 25s (settle=20 + measurement=5)
+        est.update(100.0, 25.0)
+
+        assert not est.measuring
+        # Only the last sample at t=25 was collected (25 >= 20)
+        assert est.baseline == 100.0
+
+    def test_filter_logic_settle_returns_zero(self) -> None:
+        """During settle phase, filter logic returns 0.0 (battery paused)."""
+        cfg = make_config(settle_duration_s=15.0, measurement_duration_s=30.0)
+        logic = PulseLoadFilterLogic(cfg)
+
+        # Activate
+        result = logic.update(600.0, 0.0, active=True)
+        assert result == 0.0
+
+        # During settle: still returns 0 (no baseline yet)
+        result = logic.update(-1200.0, 5.0, active=True)
+        assert result == 0.0
+        assert logic.measuring
+        assert logic.baseline is None
+
+        result = logic.update(-800.0, 10.0, active=True)
+        assert result == 0.0
+
+    def test_filter_logic_full_cycle_with_settle(self) -> None:
+        """Full cycle: settle → measurement → baseline output → deactivate."""
+        cfg = make_config(settle_duration_s=10.0, measurement_duration_s=20.0)
+        logic = PulseLoadFilterLogic(cfg)
+
+        # 1. Activate at t=0
+        result = logic.update(600.0, 0.0, active=True)
+        assert result == 0.0
+        assert logic.measuring
+
+        # 2. Settle phase (t=0..10): corrupted samples discarded
+        logic.update(-1200.0, 3.0, active=True)
+        logic.update(-500.0, 7.0, active=True)
+        assert logic.measuring
+        assert logic.baseline is None
+
+        # 3. Measurement phase (t=10..30): clean samples collected
+        logic.update(150.0, 12.0, active=True)
+        logic.update(40.0, 18.0, active=True)
+        logic.update(150.0, 24.0, active=True)
+        result = logic.update(40.0, 30.0, active=True)  # completes
+
+        assert not logic.measuring
+        assert logic.baseline == 40.0
+        assert result == pytest.approx(40.0)
+
+        # 4. Filter outputs baseline while active
+        result = logic.update(1300.0, 35.0, active=True)
+        assert result == pytest.approx(40.0, abs=5.0)  # drift may shift slightly
+
+        # 5. Deactivate → passthrough
+        result = logic.update(100.0, 40.0, active=False)
+        assert result == 100.0
+
+    def test_from_args_settle_duration(self) -> None:
+        """settle_duration_s is correctly parsed from args."""
+        args = {
+            "grid_power_sensor": "sensor.grid",
+            "active_entity": "sensor.pld_active",
+            "settle_duration_s": 20,
+        }
+        cfg = FilterConfig.from_args(args)
+        assert cfg.settle_duration_s == 20.0
+
+    def test_from_args_settle_default(self) -> None:
+        """settle_duration_s defaults to 15.0 when not in args."""
+        args = {
+            "grid_power_sensor": "sensor.grid",
+            "active_entity": "sensor.pld_active",
+        }
+        cfg = FilterConfig.from_args(args)
+        assert cfg.settle_duration_s == 15.0

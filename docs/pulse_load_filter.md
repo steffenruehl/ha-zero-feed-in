@@ -6,11 +6,15 @@ Baseline mitigation for periodic pulse loads. Subscribes to the detector's `acti
 
 ## How It Works
 
-### Stage 1: Measurement Pause
+### Stage 1: Settle Delay
 
-On activation (rising edge of `active` entity), the filter pauses the battery for `measurement_duration_s` (default 60 s). During this time, with battery output at 0, `min(grid)` gives the exact house-load baseline — no inverter-loss offset, no estimation.
+On activation (rising edge of `active` entity), the filter issues a battery-pause command (`desired_power = 0`). However, the inverter takes 10–15 seconds to actually ramp down. During this **settle phase** (`settle_duration_s`, default 15 s), all grid samples are discarded — they are corrupted by residual battery output and would produce a wildly incorrect baseline (e.g. −1200 W instead of +150 W).
 
-### Stage 2: I-Controller Drift Tracking
+### Stage 2: Measurement
+
+After the settle delay, the filter collects grid samples for `measurement_duration_s` (default 60 s). With the battery truly silent, `min(grid)` gives the exact house-load baseline — no inverter-loss offset, no estimation. Total pause = settle + measurement = 75 s by default.
+
+### Stage 3: I-Controller Drift Tracking
 
 After the initial measurement, the baseline is corrected every `drift_cycle_s` (default 60 s):
 
@@ -49,8 +53,8 @@ pulse_load_filter:
 **Handover sequence:**
 1. Detector publishes `active = 1`
 2. Controller sees `active = 1` → skips computation
-3. Filter starts measurement pause → writes `desired_power = 0` (battery pauses)
-4. After 60 s, baseline is measured → writes `desired_power = +baseline` (discharge)
+3. Filter starts settle + measurement pause → writes `desired_power = 0` (battery pauses)
+4. After 15 s settle + 60 s measurement, baseline is measured → writes `desired_power = +baseline` (discharge)
 5. Detector publishes `active = 0` → filter stops writing, controller resumes with reset state
 
 ---
@@ -61,7 +65,7 @@ pulse_load_filter:
 | --- | --- | --- | --- |
 | `filtered_power_entity` | number | W | Debug output — raw grid when inactive, desired power when active |
 | `desired_power_entity` | number | W | Driver input — written when active and not dry_run |
-| `sensor.zfi_plf_measuring` | number | — | `1` during measurement pause |
+| `sensor.zfi_plf_measuring` | number | — | `1` during settle + measurement pause |
 | `sensor.zfi_plf_baseline` | number | W | Current baseline estimate |
 
 ---
@@ -76,7 +80,8 @@ pulse_load_filter:
   grid_power_sensor: sensor.YOUR_GRID_POWER_SENSOR    # MANDATORY
   active_entity: sensor.zfi_pld_active                 # MANDATORY
 
-  measurement_duration_s: 60   # battery pause duration (s)
+  settle_duration_s: 15        # wait for inverter ramp-down before collecting (s)
+  measurement_duration_s: 60   # baseline sample collection window after settle (s)
   drift_target_w: 30           # should match controller's discharge target (W)
   drift_ki: 0.3                # correction gain per cycle
   drift_cycle_s: 60            # observation window (s)
@@ -96,7 +101,7 @@ See `apps.yaml.example` section 7 for the full template.
 
 ```
 FilterConfig:           — typed config from apps.yaml
-BaselineEstimator:      — measurement pause + I-controller drift (pure logic)
+BaselineEstimator:      — settle delay + measurement pause + I-controller drift (pure logic)
 PulseLoadFilterLogic:   — stateful filter driven by external active signal
 PulseLoadFilter:        — AppDaemon adapter (listen_state on grid + active entity)
 ```

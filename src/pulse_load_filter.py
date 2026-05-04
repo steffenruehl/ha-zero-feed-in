@@ -6,10 +6,12 @@ Subscribes to a detector's ``active`` entity (e.g. from
 signals a pulse load, this filter outputs a stable baseline instead
 of the oscillating grid signal.
 
-Two stages once activated:
-  1. **Measurement pause** — pause battery for ~60 s, measure
-     ``min(grid)`` → exact baseline with no inverter-loss offset.
-  2. **I-controller drift tracking** — correct baseline every 60 s to
+Three stages once activated:
+  1. **Settle delay** — pause battery and wait ~15 s for the inverter
+     to actually ramp down.  Samples during this phase are discarded.
+  2. **Measurement** — collect grid samples for ~60 s with the battery
+     truly silent, then ``min(grid)`` → exact baseline.
+  3. **I-controller drift tracking** — correct baseline every 60 s to
      track slow house-load changes.
 
 Output convention:
@@ -84,8 +86,16 @@ class FilterConfig:
     """HA entity ID published by the detector (``1`` = active)."""
 
     # Measurement pause
+    settle_duration_s: float = 15.0
+    """Settle delay before collecting baseline samples (s).
+
+    After the battery-pause command is issued, the inverter takes
+    10–15 s to actually ramp down.  Samples during this phase are
+    discarded to avoid corrupting the baseline with residual
+    battery output.
+    """
     measurement_duration_s: float = 60.0
-    """How long to pause battery and measure baseline (s)."""
+    """How long to collect baseline samples after settle (s)."""
 
     # I-controller drift tracking
     drift_target_w: float = 30.0
@@ -117,6 +127,9 @@ class FilterConfig:
         return cls(
             grid_sensor=args["grid_power_sensor"],
             active_entity=args["active_entity"],
+            settle_duration_s=float(
+                args.get("settle_duration_s", cls.settle_duration_s)
+            ),
             measurement_duration_s=float(
                 args.get("measurement_duration_s", cls.measurement_duration_s)
             ),
@@ -145,10 +158,12 @@ class FilterConfig:
 class BaselineEstimator:
     """Estimates the true house-load baseline during pulse-load filtering.
 
-    Two phases:
-    1. **Measurement pause** — battery is paused, ``min(grid)`` over one
+    Three phases:
+    1. **Settle** — battery pause command issued; inverter ramps down
+       over 10–15 s.  Grid samples are discarded.
+    2. **Measurement** — battery is truly silent; ``min(grid)`` over one
        full oven cycle gives the exact baseline.
-    2. **Drift tracking** — an I-controller adjusts the baseline every
+    3. **Drift tracking** — an I-controller adjusts the baseline every
        ``drift_cycle_s`` based on ``min(grid) - target``.
     """
 
@@ -180,6 +195,7 @@ class BaselineEstimator:
     def update(self, grid_w: float, now: float) -> float | None:
         """Process one grid sample, return baseline if available.
 
+        During settle: discards samples while inverter ramps down.
         During measurement: collects samples, completes when duration
         expires.  After measurement: runs I-controller drift correction.
 
@@ -191,9 +207,12 @@ class BaselineEstimator:
             Current baseline estimate, or ``None`` if still measuring.
         """
         if self.measuring:
-            self._measure_samples.append(grid_w)
             elapsed = now - self._measure_start_t
-            if elapsed >= self._cfg.measurement_duration_s:
+            settle = self._cfg.settle_duration_s
+            # Only collect samples after the settle phase
+            if elapsed >= settle:
+                self._measure_samples.append(grid_w)
+            if elapsed >= settle + self._cfg.measurement_duration_s:
                 self._complete_measurement(now)
             return self.baseline
 

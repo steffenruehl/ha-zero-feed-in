@@ -261,9 +261,10 @@ pulse_load_detector:
 #  Reacts to the detector's active signal by measuring a stable baseline
 #  and outputting it instead of the oscillating grid signal.
 #
-#  Two stages:
-#    1. Measurement pause   — pause battery, measure true baseline
-#    2. I-controller        — track slow drift in house load
+#  Three stages:
+#    1. Settle delay       — wait for inverter to ramp down (samples discarded)
+#    2. Measurement pause  — collect samples, measure true baseline
+#    3. I-controller       — track slow drift in house load
 #
 #  When active, the filter writes directly to desired_power_entity,
 #  taking over from the controller.  The controller must have
@@ -288,7 +289,8 @@ pulse_load_filter:
   # ══════ TUNING — safe defaults, adjust if needed ══════════════════════════
 
   # Measurement pause
-  # measurement_duration_s: 60 # battery pause duration for baseline measurement (s)
+  # settle_duration_s: 15    # wait for inverter ramp-down before collecting (s)
+  # measurement_duration_s: 60 # baseline sample collection window after settle (s)
 
   # I-controller drift tracking
   drift_target_w: 30           # should match controller's discharge target (W)
