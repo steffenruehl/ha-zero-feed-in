@@ -65,12 +65,19 @@ class TestFilterConfig:
             "active_entity": "sensor.pld_active",
             "drift_ki": 0.5,
             "filtered_power_entity": "sensor.custom_output",
+            "desired_power_entity": "sensor.custom_desired",
             "dry_run": False,
         }
         cfg = FilterConfig.from_args(args)
         assert cfg.drift_ki == 0.5
         assert cfg.filtered_power_entity == "sensor.custom_output"
+        assert cfg.desired_power_entity == "sensor.custom_desired"
         assert cfg.dry_run is False
+
+    def test_desired_power_entity_default(self) -> None:
+        """desired_power_entity defaults to sensor.zfi_desired_power."""
+        cfg = make_config()
+        assert cfg.desired_power_entity == "sensor.zfi_desired_power"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -176,21 +183,23 @@ class TestPulseLoadFilterLogic:
         assert not logic.active
 
     def test_activation_starts_measurement(self) -> None:
-        """External activation triggers measurement pause."""
+        """External activation triggers measurement pause, returns 0."""
         cfg = make_config()
         logic = PulseLoadFilterLogic(cfg)
-        logic.update(600.0, 0.0, active=True)
+        result = logic.update(600.0, 0.0, active=True)
         assert logic.active
         assert logic.measuring
+        assert result == 0.0  # battery paused immediately
 
     def test_measurement_produces_baseline(self) -> None:
-        """After measurement, filter outputs the baseline."""
+        """After measurement, filter outputs the baseline as desired power."""
         cfg = make_config(measurement_duration_s=30.0)
         logic = PulseLoadFilterLogic(cfg)
 
         # Activate
-        logic.update(600.0, 0.0, active=True)
+        result = logic.update(600.0, 0.0, active=True)
         assert logic.measuring
+        assert result == 0.0  # battery paused
 
         # Feed measurement samples (oven cycling, battery paused)
         t = 0.0
@@ -204,14 +213,27 @@ class TestPulseLoadFilterLogic:
             (30.0, t + 35),
         ]
         for grid_w, ts in samples:
-            logic.update(grid_w, ts, active=True)
+            result = logic.update(grid_w, ts, active=True)
 
         assert not logic.measuring
         assert logic.baseline == 30.0
 
-        # Now filter should output baseline, not raw
+        # Now filter should output +baseline (desired discharge power)
         result = logic.update(1300.0, t + 40, active=True)
         assert result == pytest.approx(30.0, abs=1.0)
+
+    def test_returns_zero_during_measurement(self) -> None:
+        """During measurement, filter returns 0.0 (battery paused)."""
+        cfg = make_config(measurement_duration_s=30.0)
+        logic = PulseLoadFilterLogic(cfg)
+
+        # Activate
+        logic.update(600.0, 0.0, active=True)
+
+        # Samples during measurement should all return 0.0
+        for t in [5.0, 10.0, 15.0, 20.0]:
+            result = logic.update(500.0, t, active=True)
+            assert result == 0.0, f"Expected 0.0 at t={t}, got {result}"
 
     def test_deactivation_resumes_passthrough(self) -> None:
         """After deactivation, filter passes raw value through."""
@@ -250,6 +272,7 @@ class TestPulseLoadFilterLogic:
         assert logic.baseline is None
 
         # Re-activate
-        logic.update(600.0, 30.0, active=True)
+        result = logic.update(600.0, 30.0, active=True)
         assert logic.measuring
         assert logic.baseline is None
+        assert result == 0.0  # battery paused again

@@ -63,6 +63,20 @@ When any guard forces the controller to idle (direction switches, SOC limits, no
 
 ---
 
+## Pulse-Load Inhibit
+
+When `pulse_load_active_entity` is configured and reads `"1"`, the controller **skips computation entirely** — no mode evaluation, no direct calculation, no publishing. The pulse-load filter takes over `sensor.zfi_desired_power` directly.
+
+On the **falling edge** (active → inactive), the controller resets `last_sent_w` and `drift_acc` to zero. This ensures the first post-resume evaluation starts from a clean slate rather than computing corrections against a stale reference.
+
+Configuration:
+```yaml
+zero_feed_in_controller:
+  pulse_load_active_entity: sensor.zfi_pld_active   # optional
+```
+
+---
+
 ## Direct Calculation with Muting
 
 ### Core Algorithm
@@ -116,7 +130,12 @@ Three layers:
 flowchart TD
     A([Grid sensor change]) --> B{Sensors OK?}
     B -- No --> Z([Skip])
-    B -- Yes --> C[Read grid, SOC, battery_power]
+    B -- Yes --> PL{Pulse-load\nactive?}
+
+    PL -- Yes --> Z4([Skip: filter controls])
+    PL -- "Falling edge" --> RST["Reset last_sent_w=0\ndrift_acc=0"]
+    RST --> C
+    PL -- No --> C[Read grid, SOC, battery_power]
 
     C --> MUT{Muted?}
     MUT -- Yes --> Z2([Skip: wait for device])

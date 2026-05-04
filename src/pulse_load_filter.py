@@ -13,11 +13,19 @@ Two stages once activated:
      track slow house-load changes.
 
 Output convention:
-  - When inactive: passes raw grid value through transparently.
-  - When active: outputs the estimated baseline.
+  - When inactive: passes raw grid value through (debug entity only).
+  - When active, measuring: outputs 0 W (battery paused).
+  - When active, baseline ready: outputs +baseline (desired discharge
+    power, same sign convention as the controller).
+
+When not in dry-run mode, the filter writes directly to the
+``desired_power_entity`` (default ``sensor.zfi_desired_power``),
+taking over from the controller.  The controller must be configured
+with the same ``pulse_load_active_entity`` so it yields control.
 
 Published entities:
-  - ``filtered_power_entity`` — the main output (configurable entity ID)
+  - ``filtered_power_entity`` — debug output (always written)
+  - ``desired_power_entity`` — driver input (written when active + not dry_run)
   - ``{sensor_prefix}_measuring`` — 1 during measurement pause, 0 otherwise
   - ``{sensor_prefix}_baseline``  — current baseline estimate (W)
 """
@@ -49,6 +57,9 @@ UNAVAILABLE_STATES = {None, "unknown", "unavailable"}
 
 DEFAULT_FILTERED_POWER_ENTITY = "sensor.zfi_plf_filtered_grid_power"
 """Default entity ID for the filtered grid power output."""
+
+DEFAULT_DESIRED_POWER_ENTITY = "sensor.zfi_desired_power"
+"""Default entity ID for the desired battery power (driver input)."""
 
 DEFAULT_SENSOR_PREFIX = "sensor.zfi_plf"
 """Prefix for HA status/debug entities published by this filter."""
@@ -86,7 +97,13 @@ class FilterConfig:
 
     # Output
     filtered_power_entity: str = DEFAULT_FILTERED_POWER_ENTITY
-    """Entity ID for the filtered grid power output (W)."""
+    """Entity ID for the filtered grid power output (W). Debug/dashboard use."""
+    desired_power_entity: str = DEFAULT_DESIRED_POWER_ENTITY
+    """Entity ID for the desired battery power output (W).
+
+    Written when active and not dry_run.  Same semantics as the
+    controller output: +discharge / -charge.  The driver reads this.
+    """
     sensor_prefix: str = DEFAULT_SENSOR_PREFIX
     """Prefix for status/debug HA entities (measuring, baseline)."""
     dry_run: bool = True
@@ -110,6 +127,9 @@ class FilterConfig:
             drift_cycle_s=float(args.get("drift_cycle_s", cls.drift_cycle_s)),
             filtered_power_entity=args.get(
                 "filtered_power_entity", cls.filtered_power_entity
+            ),
+            desired_power_entity=args.get(
+                "desired_power_entity", cls.desired_power_entity
             ),
             sensor_prefix=args.get("sensor_prefix", cls.sensor_prefix),
             dry_run=bool(args.get("dry_run", cls.dry_run)),
@@ -250,7 +270,13 @@ class PulseLoadFilterLogic:
         return self.estimator.baseline
 
     def update(self, grid_w: float, now: float, active: bool) -> float:
-        """Process one grid sample and return the filtered output.
+        """Process one grid sample and return the desired battery power.
+
+        Output semantics (same as controller: +discharge / -charge):
+          - **Inactive**: returns raw ``grid_w`` (pass-through for debug).
+          - **Active, measuring**: returns ``0.0`` (battery paused).
+          - **Active, baseline ready**: returns ``+baseline`` (discharge
+            at baseline rate to cover house load).
 
         Args:
             grid_w: Raw grid power reading (W).
@@ -258,19 +284,16 @@ class PulseLoadFilterLogic:
             active: Whether the detector considers a pulse load present.
 
         Returns:
-            Filtered grid power — either the raw value (inactive) or
-            the estimated baseline (active).
+            Desired battery power when active, or raw grid pass-through
+            when inactive.
         """
         was_active = self._was_active
 
         # Rising edge: just activated → start measurement pause
-        # Don't feed the activation sample to the estimator — the
-        # battery hasn't been paused yet, so this sample is from the
-        # old (chasing) state.
         if active and not was_active:
             self.estimator.start_measurement(now)
             self._was_active = active
-            return grid_w
+            return 0.0  # pause battery during measurement
 
         # Falling edge: deactivated → reset estimator
         if not active and was_active:
@@ -281,12 +304,12 @@ class PulseLoadFilterLogic:
         if not active:
             return grid_w
 
-        # Active: update estimator and return baseline (or raw if measuring)
+        # Active: update estimator and return desired battery power
         baseline = self.estimator.update(grid_w, now)
         if baseline is not None:
-            return baseline
-        # Still measuring, no baseline yet — pass through raw
-        return grid_w
+            return baseline  # +baseline = discharge at house-load rate
+        # Still measuring, no baseline yet — keep battery paused
+        return 0.0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -323,8 +346,10 @@ class PulseLoadFilter(_HASS_BASE):
             self.cfg.active_entity,
         )
         self.log(
-            "PulseLoadFilter initialized (active_entity=%s, dry_run=%s)",
+            "PulseLoadFilter initialized (active_entity=%s, "
+            "desired_power_entity=%s, dry_run=%s)",
             self.cfg.active_entity,
+            self.cfg.desired_power_entity,
             self.cfg.dry_run,
         )
 
@@ -362,12 +387,20 @@ class PulseLoadFilter(_HASS_BASE):
 
         filtered = self.logic.update(grid_w, now, self._detector_active)
 
-        # Publish filtered output
+        # Publish filtered output (debug/dashboard — always written)
         self._set_entity(
             self.cfg.filtered_power_entity,
             round(filtered, 1),
             unit="W",
         )
+
+        # Write desired_power when active and not dry_run
+        if self._detector_active and not self.cfg.dry_run:
+            self._set_entity(
+                self.cfg.desired_power_entity,
+                round(filtered),
+                unit="W",
+            )
 
         # Publish state sensors
         self._set_sensor("measuring", int(self.logic.measuring))
@@ -382,9 +415,6 @@ class PulseLoadFilter(_HASS_BASE):
                 "Measurement complete — baseline=%.1f W",
                 self.logic.baseline,
             )
-        # TODO: battery pause mechanism for non-dry-run mode.
-        # The controller should read the detector's active entity and
-        # zero its output during measurement.  For now, dry_run only.
 
     def _set_entity(
         self,

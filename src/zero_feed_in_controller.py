@@ -107,6 +107,17 @@ class Config:
     ``[min_soc_pct, max_soc_pct]`` so it can never violate hard limits.
     """
 
+    # Pulse-load inhibit
+    pulse_load_active_entity: str | None = None
+    """HA entity from the pulse-load detector (``1`` = active).
+
+    When this entity reads ``"1"``, the controller skips computation
+    entirely — the pulse-load filter takes over ``desired_power``.
+    On the falling edge (active → inactive), internal state
+    (``last_sent_w``, ``drift_acc``) resets to zero so the first
+    post-resume evaluation starts fresh.
+    """
+
     # Controller tuning
     discharge_target_w: float = 30.0
     """Grid power target when discharging (W). Small positive = slight grid draw."""
@@ -160,6 +171,7 @@ class Config:
             charge_switch=args.get("charge_switch"),
             discharge_switch=args.get("discharge_switch"),
             dynamic_min_soc_entity=args.get("dynamic_min_soc_entity"),
+            pulse_load_active_entity=args.get("pulse_load_active_entity"),
             discharge_target_w=float(
                 args.get("target_grid_power", cls.discharge_target_w)
             ),
@@ -591,6 +603,10 @@ class ZeroFeedInController(_HASS_BASE):
             self.cfg.grid_sensor,
         )
 
+        # Pulse-load inhibit tracking
+        self._pulse_load_was_active: bool = False
+        """Previous pulse-load active state for falling-edge detection."""
+
         # Periodic safety check (in case sensor stops updating)
         self.run_every(self._safety_tick, "now+30", 30)
 
@@ -645,6 +661,8 @@ class ZeroFeedInController(_HASS_BASE):
             entities["charge_switch"] = self.cfg.charge_switch
         if self.cfg.discharge_switch:
             entities["discharge_switch"] = self.cfg.discharge_switch
+        if self.cfg.pulse_load_active_entity:
+            entities["pulse_load_active"] = self.cfg.pulse_load_active_entity
         for label, entity_id in entities.items():
             raw = self.get_state(entity_id)
             if raw in UNAVAILABLE_STATES:
@@ -654,6 +672,31 @@ class ZeroFeedInController(_HASS_BASE):
 
     # --- Event-driven callbacks ----------------------------
 
+    def _is_pulse_load_active(self) -> bool:
+        """Check the pulse-load active entity and handle edge transitions.
+
+        Returns ``True`` when a pulse load is active and the controller
+        should skip computation.  On the falling edge (active → inactive),
+        resets ``last_sent_w`` and ``drift_acc`` to zero so the first
+        post-resume evaluation starts from a clean slate.
+        """
+        entity = self.cfg.pulse_load_active_entity
+        if entity is None:
+            return False
+
+        raw = self.get_state(entity)
+        active = raw == "1"
+        was_active = self._pulse_load_was_active
+        self._pulse_load_was_active = active
+
+        if was_active and not active:
+            # Falling edge: filter released control → reset state
+            self.logic.state.last_sent_w = 0.0
+            self.logic.state.drift_acc = 0.0
+            self.log("Pulse-load ended — controller state reset")
+
+        return active
+
     def _on_grid_change(self, entity: str, attribute: str, old: str, new: str, kwargs: dict) -> None:
         """Called by AppDaemon when the grid sensor state changes."""
         if new in UNAVAILABLE_STATES:
@@ -662,6 +705,15 @@ class ZeroFeedInController(_HASS_BASE):
         try:
             grid_w = float(new)
         except (ValueError, TypeError):
+            return
+
+        # Pulse-load inhibit: skip computation while filter is in control
+        if self._is_pulse_load_active():
+            if self.cfg.debug:
+                self._publish_debug_sensors(
+                    self._read_measurement(grid_w) or Measurement(grid_w, 0.0, 0.0),
+                    0.0,
+                )
             return
 
         m = self._read_measurement(grid_w)

@@ -23,25 +23,35 @@ This tracks slow changes in house load (appliance on/off, solar ramp) without ne
 
 ### Pass-Through
 
-When the detector is inactive, the filter passes the raw grid value through transparently. When deactivated (falling edge), the estimator resets — a fresh measurement will run on the next activation.
+When the detector is inactive, the filter passes the raw grid value through to `filtered_power_entity` (for debug/dashboard). It does **not** write to `desired_power_entity` — the controller is in charge.
+
+When deactivated (falling edge), the estimator resets — a fresh measurement will run on the next activation.
 
 ---
 
 ## Integration with Controller
 
-To close the loop, point the controller's `grid_power_sensor` at the filter's output:
+The filter writes directly to `sensor.zfi_desired_power` when active, taking over from the controller. The controller must be configured with `pulse_load_active_entity` so it yields control:
 
 ```yaml
-# Controller reads filtered output instead of raw sensor
+# Controller yields when pulse-load is active
 zero_feed_in_controller:
-  grid_power_sensor: sensor.zfi_plf_filtered_grid_power
+  pulse_load_active_entity: sensor.zfi_pld_active
 
-# Filter reads raw sensor + detector active
+# Filter takes over desired_power when active
 pulse_load_filter:
   grid_power_sensor: sensor.smart_meter_sum_active_instantaneous_power
   active_entity: sensor.zfi_pld_active
-  filtered_power_entity: sensor.zfi_plf_filtered_grid_power
+  desired_power_entity: sensor.zfi_desired_power
+  dry_run: false
 ```
+
+**Handover sequence:**
+1. Detector publishes `active = 1`
+2. Controller sees `active = 1` → skips computation
+3. Filter starts measurement pause → writes `desired_power = 0` (battery pauses)
+4. After 60 s, baseline is measured → writes `desired_power = +baseline` (discharge)
+5. Detector publishes `active = 0` → filter stops writing, controller resumes with reset state
 
 ---
 
@@ -49,7 +59,8 @@ pulse_load_filter:
 
 | Entity | Type | Unit | Description |
 | --- | --- | --- | --- |
-| `filtered_power_entity` | number | W | Main output (configurable entity ID) |
+| `filtered_power_entity` | number | W | Debug output — raw grid when inactive, desired power when active |
+| `desired_power_entity` | number | W | Driver input — written when active and not dry_run |
 | `sensor.zfi_plf_measuring` | number | — | `1` during measurement pause |
 | `sensor.zfi_plf_baseline` | number | W | Current baseline estimate |
 
@@ -70,9 +81,10 @@ pulse_load_filter:
   drift_ki: 0.3                # correction gain per cycle
   drift_cycle_s: 60            # observation window (s)
 
-  filtered_power_entity: sensor.zfi_plf_filtered_grid_power
+  filtered_power_entity: sensor.zfi_plf_filtered_grid_power   # debug output
+  desired_power_entity: sensor.zfi_desired_power              # driver input
   sensor_prefix: sensor.zfi_plf
-  dry_run: true
+  dry_run: true                # set false to enable writing desired_power
   debug: true
 ```
 

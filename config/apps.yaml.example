@@ -60,6 +60,10 @@ zero_feed_in_controller:
   # Dynamic min SOC — published by the PV Forecast Manager app (below)
   dynamic_min_soc_entity: sensor.zfi_dynamic_min_soc
 
+  # Pulse-load inhibit — controller yields when this entity reads "1".
+  # Requires the Pulse-Load Detector and Filter apps (see below).
+  # pulse_load_active_entity: sensor.zfi_pld_active
+
   # ══════ TUNING — safe defaults, adjust if needed ══════════════════════════
 
   target_grid_power: 30        # discharge target (W), small positive = slight import
@@ -253,11 +257,12 @@ pulse_load_detector:
 #    1. Measurement pause   — pause battery, measure true baseline
 #    2. I-controller        — track slow drift in house load
 #
-#  Start with dry_run: true to observe behaviour on dashboards before
-#  connecting to the controller.
+#  When active, the filter writes directly to desired_power_entity,
+#  taking over from the controller.  The controller must have
+#  pulse_load_active_entity configured to yield during pulse events.
 #
-#  Integration: set the controller's grid_power_sensor to the filter's
-#  filtered_power_entity to close the loop.
+#  Start with dry_run: true to observe behaviour on dashboards before
+#  enabling live control.
 #
 pulse_load_filter:
   module: pulse_load_filter
@@ -283,7 +288,9 @@ pulse_load_filter:
   # drift_cycle_s: 60          # observation window (s)
 
   # Output entities
-  # Main output — controller reads this instead of raw grid sensor
+  # Debug output — always written, shows what the filter computes
   filtered_power_entity: sensor.zfi_plf_filtered_grid_power
+  # Driver input — written when active and not dry_run
+  desired_power_entity: sensor.zfi_desired_power
   # Status/debug sensors use this prefix
   sensor_prefix: sensor.zfi_plf

@@ -601,3 +601,55 @@ class TestControlOutput:
         out = ControlOutput.idle("test reason")
         assert out.desired_power_w == 0.0
         assert out.reason == "test reason"
+
+
+# ═══════════════════════════════════════════════════════════
+#  Pulse-Load Inhibit (Config + state reset)
+# ═══════════════════════════════════════════════════════════
+
+
+class TestPulseLoadInhibit:
+    """Test pulse-load active entity config and state reset semantics."""
+
+    def test_config_default_none(self) -> None:
+        """pulse_load_active_entity defaults to None."""
+        cfg = make_config()
+        assert cfg.pulse_load_active_entity is None
+
+    def test_config_from_args_maps_entity(self) -> None:
+        """from_args correctly maps pulse_load_active_entity."""
+        args = {
+            "grid_power_sensor": "sensor.grid",
+            "soc_sensor": "sensor.soc",
+            "battery_power_sensor": "sensor.bp",
+            "pulse_load_active_entity": "sensor.zfi_pld_active",
+        }
+        cfg = Config.from_args(args)
+        assert cfg.pulse_load_active_entity == "sensor.zfi_pld_active"
+
+    def test_state_reset_on_deactivation(self) -> None:
+        """Simulating a deactivation edge resets last_sent_w and drift_acc.
+
+        This mirrors what _is_pulse_load_active() does on the falling
+        edge — we verify the state object allows this reset cleanly.
+        """
+        logic, now = make_logic()
+        # Simulate controller had been running and accumulated state
+        m = make_measurement(grid_power_w=100.0)
+        out = logic.compute(m, now=now)
+        assert out is not None
+        assert logic.state.last_sent_w != 0.0
+
+        # Accumulate drift
+        logic.state.drift_acc = 5.0
+
+        # Simulate deactivation edge (what _is_pulse_load_active does)
+        logic.state.last_sent_w = 0.0
+        logic.state.drift_acc = 0.0
+
+        # First post-resume evaluation should work from a clean slate
+        m2 = make_measurement(grid_power_w=80.0)
+        out2 = logic.compute(m2, now=now + 20)
+        assert out2 is not None
+        # Correction based on error from 0, not from stale last_sent_w
+        assert out2.desired_power_w == pytest.approx(80.0 - 30.0, abs=1.0)

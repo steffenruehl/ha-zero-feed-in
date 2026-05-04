@@ -65,18 +65,21 @@ PL Detector (event-driven):
 
 PL Filter (event-driven):
   grid_power_sensor ──────┐
-  sensor.zfi_pld_active ──┤──▸ baseline estimation ──▸ filtered_power_entity
-                          │
+  sensor.zfi_pld_active ──┤──▸ baseline estimation ──▸ sensor.zfi_desired_power
+                          │                             (when active + not dry_run)
 
 Controller (event-driven):
   grid_power_sensor ─────────┐
   soc_sensor ────────────────┤──▸ direct calc ──▸ sensor.zfi_desired_power
-  battery_power_sensor───────┤
-  dynamic_min_soc_entity ────┘
+  battery_power_sensor───────┤                    (when pulse-load NOT active)
+  dynamic_min_soc_entity ────┤
+  pulse_load_active_entity ──┘   (yields when "1")
 
 Driver (every 2s):
   sensor.zfi_desired_power ──▸ AC mode + outputLimit + inputLimit
 ```
+
+The controller and filter share `sensor.zfi_desired_power` as their output but never write simultaneously — the controller checks `pulse_load_active_entity` on every cycle and yields when `"1"`. On the falling edge (active → inactive), the controller resets its internal state and resumes normally.
 
 ### Why Two Apps (Controller + Driver)?
 
@@ -130,7 +133,7 @@ src/
 ├── zendure_solarflow_driver.py   # Zendure SolarFlow driver
 ├── pv_forecast_manager.py        # PV forecast → dynamic min SOC
 ├── pulse_load_detector.py        # sign-flip detection (publishes active signal)
-├── pulse_load_filter.py          # baseline mitigation (reads active, outputs filtered)
+├── pulse_load_filter.py          # baseline mitigation (writes desired_power when active)
 ├── relay_switch_counter.py       # relay switch event counter
 ├── csv_logger.py                 # shared daily-rotating CSV file logger
 └── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog
@@ -199,7 +202,7 @@ Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections for 
 | `grid_power_sensor` | Controller | `sensor.smart_meter_*` |
 | `soc_sensor` | Controller | `sensor.*_electriclevel` |
 | `battery_power_sensor` | Controller | `sensor.*_net_power` (template or helper) |
-| `desired_power_sensor` | Driver | `sensor.zfi_desired_power` (from controller) |
+| `desired_power_sensor` | Driver | `sensor.zfi_desired_power` (from controller or filter) |
 | `output_limit_entity` | Driver | `number.*_outputlimit` |
 | `input_limit_entity` | Driver | `number.*_inputlimit` |
 | `ac_mode_entity` | Driver | `select.*_acmode` |
@@ -207,6 +210,7 @@ Edit `zero_feed_in/config/apps.yaml` — fill in the **MANDATORY** sections for 
 | `watch_entity` | Watchdog | `sensor.*_electriclevel` |
 | `grid_power_sensor` | Detector | Same as controller |
 | `active_entity` | Filter | `sensor.zfi_pld_active` (from detector) |
+| `pulse_load_active_entity` | Controller | `sensor.zfi_pld_active` (optional, from detector) |
 
 Optional switches (create as HA helpers → Toggle):
 
