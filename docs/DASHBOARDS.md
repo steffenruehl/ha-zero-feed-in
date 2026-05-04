@@ -198,27 +198,39 @@ The accumulator uses `max(|power|, 25W)`, so very low power levels take much lon
 
 ### What It Shows
 
-- **Raw vs Filtered Grid**: Side-by-side history of raw grid power and filtered output
-- **Detector State**: Active flag and flip count over time
-- **Filter Baseline**: Baseline estimate and measurement pause progress
+- **Raw vs Filtered Grid**: Side-by-side history of raw grid power and filtered output (1h + 6h)
+- **Detector State**: Active flag, flip count, and energy ratio over time (1h + 6h)
+- **Filter Phases**: Settle → Measure → Drift tracking, with baseline and correction history
+- **Handover Timeline**: Detector active → settling → measuring → controller muted sequence
 - **Current Values**: Live entity card with all detector and filter sensors
 
 ### Key Signals Explained
 
 | Signal | Meaning |
 |--------|---------|
-| **PLD Active** | 1 = pulse load detected (≥2 sign flips), 0 = normal |
+| **PLD Active** | 1 = pulse load detected (≥2 sign flips + energy ratio), 0 = normal |
 | **Flip Count** | Sign flips in the 120 s activation window |
+| **Energy Ratio** | Grid export / battery discharge (0–1+). High = futile controller chasing |
+| **Settling** | 1 = inverter ramping down (15 s), samples discarded |
+| **Measuring** | 1 = collecting min(grid) samples (60 s after settle) |
+| **Baseline** | Estimated house load (from measurement, then drift-corrected) |
+| **Drift Correction** | Last correction applied (W). Negative = reduced baseline (export detected) |
 | **Filtered Grid Power** | Raw when inactive, baseline when active |
-| **Baseline** | Estimated house load (from measurement pause, then drift-corrected) |
-| **Measuring** | 1 = battery paused, measuring min(grid) for 60 s |
+
+### Drift Correction Behavior
+
+The baseline drift tracking is **asymmetric**:
+- **Grid < 0 (export)**: Immediate full correction. Battery is unambiguously overshooting — oven pulses never cause export. Shows as a negative drift correction spike.
+- **Grid ≥ 0 (import)**: Cautious cycle-based correction (every 60 s). Uses min(grid) over the cycle to filter out oven-ON spikes. Shows as small, infrequent positive corrections.
 
 ### When to Use
 
 - **Oven sessions**: "Does the detector activate when the oven starts duty-cycling?"
 - **Baseline accuracy**: "Is the measured baseline close to the actual house load?"
-- **False positives**: "Does the detector activate when it shouldn't?"
+- **Settle validation**: "Is 15 s enough for the inverter to ramp down?"
 - **Drift validation**: "Does the baseline track house load changes over time?"
+- **Export investigation**: "Is the asymmetric correction catching overshoot quickly?"
+- **False positives**: "Does the detector activate when it shouldn't?"
 
 ---
 

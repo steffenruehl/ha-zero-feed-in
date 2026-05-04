@@ -1,15 +1,17 @@
 # Zero Feed-In — Pulse-Load Debug Dashboard
 #
 # Detection and mitigation of periodic pulse loads (oven duty-cycling).
-# Shows detector state, filter baseline, measurement pause, and the
-# handover between controller and filter.
+# Shows detector state, filter baseline, measurement phases, drift
+# corrections, and the handover between controller and filter.
 #
 # Handover sequence:
 #   1. Detector activates  → sensor.zfi_pld_active = 1
 #   2. Controller yields   → stops writing desired_power
-#   3. Filter writes 0 W   → measurement pause (battery stops)
-#   4. Filter writes +baseline → discharge at estimated house load
-#   5. Detector deactivates → controller resets and resumes
+#   3. Filter settles      → 15 s inverter ramp-down (samples discarded)
+#   4. Filter measures     → 60 s min(grid) → baseline
+#   5. Filter writes +baseline → discharge at estimated house load
+#   6. Drift tracking      → asymmetric: immediate ↓ on export, cycle-based ↑
+#   7. Detector deactivates → controller resets and resumes
 #
 # Add as a new view in your Lovelace dashboard (raw YAML mode).
 # REQUIRES: debug: true in pulse_load_detector and pulse_load_filter
@@ -33,12 +35,18 @@ cards:
         name: Energy Ratio (export/discharge)
         icon: mdi:scale-balance
       - type: divider
+      - entity: sensor.zfi_plf_settling
+        name: Settling (1 = inverter ramp-down)
+        icon: mdi:timer-sand-paused
       - entity: sensor.zfi_plf_measuring
-        name: Measuring (1 = pause)
+        name: Measuring (1 = collecting samples)
         icon: mdi:timer-sand
       - entity: sensor.zfi_plf_baseline
         name: Baseline Estimate (W)
         icon: mdi:home-lightning-bolt
+      - entity: sensor.zfi_plf_drift_correction
+        name: Last Drift Correction (W)
+        icon: mdi:delta
       - entity: sensor.zfi_plf_filtered_grid_power
         name: Filtered Grid Power (W)
         icon: mdi:flash
@@ -89,17 +97,41 @@ cards:
       - entity: sensor.zfi_pld_energy_ratio
         name: Energy Ratio
 
+  - type: history-graph
+    title: Detector — Active, Flips & Energy Ratio (6h)
+    hours_to_show: 6
+    entities:
+      - entity: sensor.zfi_pld_active
+        name: Active
+      - entity: sensor.zfi_pld_flip_count
+        name: Flip Count
+      - entity: sensor.zfi_pld_energy_ratio
+        name: Energy Ratio
+
   # ─────────────────────────────────────────────────────────
-  #  Row 4: Filter baseline & measurement
+  #  Row 4: Filter phases & baseline
   # ─────────────────────────────────────────────────────────
   - type: history-graph
-    title: Filter — Baseline & Measurement (1h)
+    title: Filter Phases — Settle → Measure → Drift (1h)
     hours_to_show: 1
+    entities:
+      - entity: sensor.zfi_plf_settling
+        name: Settling
+      - entity: sensor.zfi_plf_measuring
+        name: Measuring
+      - entity: sensor.zfi_plf_baseline
+        name: Baseline (W)
+      - entity: sensor.zfi_plf_drift_correction
+        name: Drift Correction (W)
+
+  - type: history-graph
+    title: Baseline & Drift Correction (6h)
+    hours_to_show: 6
     entities:
       - entity: sensor.zfi_plf_baseline
         name: Baseline (W)
-      - entity: sensor.zfi_plf_measuring
-        name: Measuring
+      - entity: sensor.zfi_plf_drift_correction
+        name: Drift Correction (W)
 
   # ─────────────────────────────────────────────────────────
   #  Row 5: Handover timeline
@@ -110,6 +142,8 @@ cards:
     entities:
       - entity: sensor.zfi_pld_active
         name: Detector active
+      - entity: sensor.zfi_plf_settling
+        name: Filter settling
       - entity: sensor.zfi_plf_measuring
         name: Filter measuring
       - entity: sensor.zfi_muting
@@ -121,6 +155,8 @@ cards:
     entities:
       - entity: sensor.zfi_pld_active
         name: Detector active
+      - entity: sensor.zfi_plf_settling
+        name: Filter settling
       - entity: sensor.zfi_plf_measuring
         name: Filter measuring
       - entity: sensor.zfi_muting

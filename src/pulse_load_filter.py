@@ -29,7 +29,9 @@ Published entities:
   - ``filtered_power_entity`` — debug output (always written)
   - ``desired_power_entity`` — driver input (written when active + not dry_run)
   - ``{sensor_prefix}_measuring`` — 1 during measurement pause, 0 otherwise
+  - ``{sensor_prefix}_settling`` — 1 during settle delay, 0 otherwise
   - ``{sensor_prefix}_baseline``  — current baseline estimate (W)
+  - ``{sensor_prefix}_drift_correction`` — last drift correction applied (W)
 """
 
 from __future__ import annotations
@@ -171,8 +173,12 @@ class BaselineEstimator:
         self._cfg = cfg
         self.measuring: bool = False
         """True during the measurement pause phase."""
+        self.settling: bool = False
+        """True during the settle delay (inverter ramp-down)."""
         self.baseline: float | None = None
         """Current baseline estimate (W). None before first measurement."""
+        self.last_drift_correction: float = 0.0
+        """Last drift correction applied (W). Positive = increased baseline."""
         self._measure_start_t: float = 0.0
         """Monotonic time when measurement pause began."""
         self._measure_samples: list[float] = []
@@ -209,6 +215,7 @@ class BaselineEstimator:
         if self.measuring:
             elapsed = now - self._measure_start_t
             settle = self._cfg.settle_duration_s
+            self.settling = elapsed < settle
             # Only collect samples after the settle phase
             if elapsed >= settle:
                 self._measure_samples.append(grid_w)
@@ -230,6 +237,7 @@ class BaselineEstimator:
         # filter out pulse-load spikes before correcting upward.
         if grid_w < 0:
             error = grid_w - self._cfg.drift_target_w
+            self.last_drift_correction = error
             self.baseline += error
             # Reset cycle so we don't double-count this sample
             self._drift_cycle_start_t = now
@@ -239,7 +247,9 @@ class BaselineEstimator:
             elapsed = now - self._drift_cycle_start_t
             if elapsed >= self._cfg.drift_cycle_s:
                 error = self._drift_cycle_min - self._cfg.drift_target_w
-                self.baseline += self._cfg.drift_ki * error
+                correction = self._cfg.drift_ki * error
+                self.last_drift_correction = correction
+                self.baseline += correction
                 # Reset cycle
                 self._drift_cycle_start_t = now
                 self._drift_cycle_min = float("inf")
@@ -249,7 +259,9 @@ class BaselineEstimator:
     def reset(self) -> None:
         """Reset estimator state (called on filter deactivation)."""
         self.measuring = False
+        self.settling = False
         self.baseline = None
+        self.last_drift_correction = 0.0
         self._measure_samples = []
         self._drift_cycle_start_t = 0.0
         self._drift_cycle_min = float("inf")
@@ -302,6 +314,16 @@ class PulseLoadFilterLogic:
     def baseline(self) -> float | None:
         """Current baseline estimate, or None if not yet measured."""
         return self.estimator.baseline
+
+    @property
+    def settling(self) -> bool:
+        """Whether the filter is in the settle delay phase."""
+        return self.estimator.settling
+
+    @property
+    def last_drift_correction(self) -> float:
+        """Last drift correction applied to the baseline (W)."""
+        return self.estimator.last_drift_correction
 
     def update(self, grid_w: float, now: float, active: bool) -> float:
         """Process one grid sample and return the desired battery power.
@@ -438,8 +460,14 @@ class PulseLoadFilter(_HASS_BASE):
 
         # Publish state sensors
         self._set_sensor("measuring", int(self.logic.measuring))
+        self._set_sensor("settling", int(self.logic.settling))
         if self.logic.baseline is not None:
             self._set_sensor("baseline", round(self.logic.baseline, 1), unit="W")
+            self._set_sensor(
+                "drift_correction",
+                round(self.logic.last_drift_correction, 1),
+                unit="W",
+            )
 
         # Log state transitions
         if self.logic.measuring and not was_measuring:
