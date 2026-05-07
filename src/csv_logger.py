@@ -16,6 +16,7 @@ Files are named ``<prefix>_YYYY-MM-DD.csv``.
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ class CsvLogger:
         self.prefix = prefix
         self.columns = columns
         self._current_date: str = ""
+        self._current_path: Path | None = None
         self._file: io.TextIOWrapper | None = None
         self._writer: csv.writer | None = None
 
@@ -80,8 +82,14 @@ class CsvLogger:
     # ─── Internal ────────────────────────────────────────
 
     def _rotate(self, today: str) -> None:
-        """Close the old file (if any) and open a new one for *today*."""
+        """Close the old file (if any) and open a new one for *today*.
+
+        The previous day's file is gzip-compressed to save disk space.
+        """
+        prev_path = self._current_path
         self.close()
+        if prev_path is not None and prev_path.exists():
+            self._compress(prev_path)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         path = self.log_dir / f"{self.prefix}_{today}.csv"
         file_exists = path.exists() and path.stat().st_size > 0
@@ -91,3 +99,12 @@ class CsvLogger:
             self._writer.writerow(["timestamp"] + self.columns)
             self._file.flush()
         self._current_date = today
+        self._current_path = path
+
+    @staticmethod
+    def _compress(path: Path) -> None:
+        """Gzip-compress *path* in place, replacing it with ``<path>.gz``."""
+        gz_path = path.with_suffix(path.suffix + ".gz")
+        with open(path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+            f_out.writelines(f_in)
+        path.unlink()

@@ -20,7 +20,7 @@ src/                          # Application source code
   pulse_load_detector.py      # Pulse-load detection (sign-flip algorithm)
   pulse_load_filter.py        # Pulse-load mitigation (baseline estimation)
   pv_forecast_manager.py      # PV forecast and time-of-day rules
-  csv_logger.py               # CSV logging utility
+  csv_logger.py               # Daily-rotating CSV logger (gzip-compresses previous day)
   solarflow_mqtt_watchdog.py  # MQTT reconnect watchdog (HTTP API trigger)
   zfi_watchdog.esphome        # ESPHome package: independent ESP watchdog (.esphome to avoid AppDaemon scan)
 config/

@@ -12,7 +12,7 @@ AppDaemon apps for the Zendure SolarFlow 2400 AC+ that keep the grid meter at ~0
 6. **MQTT Watchdog** (`solarflow_mqtt_watchdog.py`) — Reconnects SolarFlow when MQTT goes stale.
 
 Supporting modules:
-- `csv_logger.py` — Shared daily-rotating CSV file logger
+- `csv_logger.py` — Shared daily-rotating CSV file logger (gzip-compresses previous day on rotation)
 - `relay_switch_counter.py` — Relay switch event counter
 
 ---
@@ -137,7 +137,7 @@ src/
 ├── pulse_load_detector.py        # sign-flip detection (publishes active signal)
 ├── pulse_load_filter.py          # baseline mitigation (writes desired_power when active)
 ├── relay_switch_counter.py       # relay switch event counter
-├── csv_logger.py                 # shared daily-rotating CSV file logger
+├── csv_logger.py                 # shared daily-rotating CSV file logger (gzip on rotate)
 └── solarflow_mqtt_watchdog.py    # MQTT reconnect watchdog
 config/
 ├── apps.yaml.example             # documented configuration template

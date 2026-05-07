@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import gzip
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -108,3 +110,55 @@ class TestCsvLogger:
         # Should look like 2026-04-19T12:34:56
         assert "T" in ts
         assert len(ts) == 19
+
+    def test_rotate_compresses_previous_day(self, log_dir: Path):
+        """When the date changes, the previous day's CSV is gzip-compressed."""
+        logger = CsvLogger(str(log_dir), "test", ["x"])
+
+        # Day 1
+        with patch("src.csv_logger.datetime") as mock_dt:
+            mock_dt.now.return_value = _make_utc(2026, 5, 1, 12, 0, 0)
+            logger.log_row({"x": 1})
+
+        day1_csv = log_dir / "test_2026-05-01.csv"
+        assert day1_csv.exists()
+
+        # Day 2 — triggers rotation
+        with patch("src.csv_logger.datetime") as mock_dt:
+            mock_dt.now.return_value = _make_utc(2026, 5, 2, 0, 0, 1)
+            logger.log_row({"x": 2})
+
+        # Day 1 file should now be compressed
+        assert not day1_csv.exists()
+        gz_path = log_dir / "test_2026-05-01.csv.gz"
+        assert gz_path.exists()
+
+        # Verify compressed content is valid CSV
+        with gzip.open(gz_path, "rt") as f:
+            rows = list(csv.reader(f))
+        assert rows[0] == ["timestamp", "x"]
+        assert rows[1][1] == "1"
+
+        # Day 2 file is plain CSV
+        day2_csv = log_dir / "test_2026-05-02.csv"
+        assert day2_csv.exists()
+        logger.close()
+
+    def test_close_does_not_compress_current_file(self, log_dir: Path):
+        """Closing the logger without rotation should NOT compress the file."""
+        logger = CsvLogger(str(log_dir), "test", ["x"])
+        logger.log_row({"x": 1})
+        logger.close()
+
+        csv_files = list(log_dir.glob("test_*.csv"))
+        gz_files = list(log_dir.glob("test_*.csv.gz"))
+        assert len(csv_files) == 1
+        assert len(gz_files) == 0
+
+
+from datetime import datetime, timezone
+
+
+def _make_utc(y: int, m: int, d: int, h: int, mi: int, s: int) -> datetime:
+    """Helper to create a timezone-aware UTC datetime."""
+    return datetime(y, m, d, h, mi, s, tzinfo=timezone.utc)

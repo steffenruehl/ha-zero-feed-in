@@ -48,7 +48,8 @@ When no `|grid| > flip_thresh_w` for `deactivate_quiet_s` (default 120 s), the d
 
 ## CSV Logging
 
-When `log_dir` is set, the detector writes a CSV file per day (`zfi_pld_YYYY-MM-DD.csv`) with columns:
+When `log_dir` is set, the detector writes a CSV file per day (`zfi_pld_YYYY-MM-DD.csv`) with columns.
+At midnight UTC the previous day's file is gzip-compressed to `zfi_pld_YYYY-MM-DD.csv.gz`.
 
 | Column | Unit | Description |
 | --- | --- | --- |
