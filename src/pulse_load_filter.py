@@ -238,7 +238,7 @@ class BaselineEstimator:
         if grid_w < 0:
             error = grid_w - self._cfg.drift_target_w
             self.last_drift_correction = error
-            self.baseline += error
+            self.baseline = max(0.0, self.baseline + error)
             # Reset cycle so we don't double-count this sample
             self._drift_cycle_start_t = now
             self._drift_cycle_min = float("inf")
@@ -249,7 +249,7 @@ class BaselineEstimator:
                 error = self._drift_cycle_min - self._cfg.drift_target_w
                 correction = self._cfg.drift_ki * error
                 self.last_drift_correction = correction
-                self.baseline += correction
+                self.baseline = max(0.0, self.baseline + correction)
                 # Reset cycle
                 self._drift_cycle_start_t = now
                 self._drift_cycle_min = float("inf")

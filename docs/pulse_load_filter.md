@@ -18,7 +18,7 @@ After the settle delay, the filter collects grid samples for `measurement_durati
 
 After the initial measurement, the baseline is corrected asymmetrically:
 
-**Downward (grid < 0 — export):** Immediate full correction. Negative grid means the battery is definitely overshooting — oven pulses only cause positive spikes (import), never export. The correction is `baseline += (grid_w - drift_target_w)` applied on the same sample.
+**Downward (grid < 0 — export):** Immediate full correction. Negative grid means the battery is definitely overshooting — oven pulses only cause positive spikes (import), never export. The correction is `baseline = max(0, baseline + (grid_w - drift_target_w))` applied on the same sample. The floor at 0 prevents runaway: sustained export cannot drive the baseline negative (which would cause the driver to charge from grid).
 
 **Upward (grid ≥ 0 — import):** Cautious cycle-based correction. Positive grid could be either a genuine increase in house load or an oven-ON spike. Uses `min(grid)` over `drift_cycle_s` (default 60 s) to filter out pulse spikes:
 

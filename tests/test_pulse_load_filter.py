@@ -256,6 +256,33 @@ class TestBaselineEstimator:
         est.update(60.0, 19.0)
         assert est.baseline == pytest.approx(119.0)
 
+    def test_negative_drift_cannot_go_below_zero(self) -> None:
+        """Repeated negative grid samples must not drive baseline negative.
+
+        Regression: when the battery was overshooting and generating
+        sustained export, each negative grid sample applied the full
+        error to the baseline with no floor.  This caused a runaway
+        to -33,000 W in production.
+        """
+        cfg = make_config(
+            settle_duration_s=0.0,
+            measurement_duration_s=5.0,
+            drift_target_w=30.0,
+            drift_ki=0.3,
+            drift_cycle_s=60.0,
+        )
+        est = BaselineEstimator(cfg)
+        est.start_measurement(0.0)
+        est.update(200.0, 5.0)  # baseline=200
+        assert est.baseline == 200.0
+
+        # Sustained export: 50 samples at -300W (simulates ~4 minutes)
+        for i in range(50):
+            est.update(-300.0, 10.0 + i * 5.0)
+
+        assert est.baseline is not None
+        assert est.baseline >= 0.0  # must never go negative
+
 
 # ═══════════════════════════════════════════════════════════
 #  PulseLoadFilterLogic (integration)
